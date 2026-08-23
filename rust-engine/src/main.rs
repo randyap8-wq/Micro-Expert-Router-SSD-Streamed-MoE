@@ -143,6 +143,7 @@ mod gpu_native_residency;
 pub(crate) mod gpu_native_diagnostics;
 pub(crate) mod gpu_native_greedy_parity;
 pub(crate) mod gpu_native_layer0_diagnostics;
+pub(crate) mod gpu_native_router_cutoff_diagnostics;
 
 pub(crate) mod gpu_native_token_loop;
 #[cfg(feature = "grpc")]
@@ -960,6 +961,29 @@ enum Cmd {
         #[arg(long)]
         report_out: Option<PathBuf>,
     },
+    /// Diagnose an exact GPU-native selected-expert cutoff divergence with
+    /// raw router logits and CPU/GPU counterfactual routing.
+    #[command(name = "diagnose-gpu-native-router-cutoff")]
+    DiagnoseGpuNativeRouterCutoff {
+        /// Strict GPU-native Q4 configuration.
+        #[arg(long)]
+        config: PathBuf,
+        /// Expected GPU adapter name (for example, "NVIDIA L4").
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Fixed-corpus case to reproduce.
+        #[arg(long)]
+        case: String,
+        /// Zero-based generated-token evaluation to diagnose.
+        #[arg(long)]
+        generated_position: usize,
+        /// Zero-based transformer layer whose router cutoff is reported.
+        #[arg(long)]
+        focus_layer: usize,
+        /// Required typed diagnostic report output path.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
     /// Diagnose first internal mathematical divergence inside layer-0 attention between CPU reference and GPU-native execution.
     #[command(name = "diagnose-gpu-native-layer0-attention-first-divergence")]
     DiagnoseGpuNativeLayer0AttentionFirstDivergence {
@@ -1652,6 +1676,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::QualifyGpuNativeQ4GreedyParity { config, .. }
         | Cmd::DiagnoseHybridQ4GreedyDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeQ4FirstDivergence { config, .. }
+        | Cmd::DiagnoseGpuNativeRouterCutoff { config, .. }
         | Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence { config, .. }
         | Cmd::GreedyParityHybridWorkerInternal { config }
         | Cmd::GreedyParityLogitWorkerInternal { config } => Some(config.as_path()),
@@ -2181,6 +2206,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
+        Cmd::DiagnoseGpuNativeRouterCutoff {
+            config,
+            expected_adapter_name,
+            case,
+            generated_position,
+            focus_layer,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_diagnose_gpu_native_router_cutoff(
+                DiagnoseGpuNativeRouterCutoffArgs {
+                    config,
+                    parsed_config: startup_config
+                        .take()
+                        .ok_or("diagnose-gpu-native-router-cutoff startup config was not parsed")?,
+                    expected_adapter_name,
+                    case,
+                    generated_position,
+                    focus_layer,
+                    report_out,
+                },
+            ))
+        }
         Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence {
             config: _,
             expected_adapter_name,
@@ -2469,6 +2519,16 @@ struct DiagnoseGpuNativeQ4FirstDivergenceArgs {
     case: String,
     report_out: Option<PathBuf>,
     progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+}
+
+struct DiagnoseGpuNativeRouterCutoffArgs {
+    config: PathBuf,
+    parsed_config: crate::config::Config,
+    expected_adapter_name: String,
+    case: String,
+    generated_position: usize,
+    focus_layer: usize,
+    report_out: PathBuf,
 }
 
 struct DiagnoseGpuNativeLayer0AttentionFirstDivergenceArgs {
@@ -5713,6 +5773,535 @@ async fn cmd_diagnose_gpu_native_q4_first_divergence(
     report.qualification_pass = false;
 
     emit_gpu_native_first_divergence_report(&report, args.report_out.as_deref())
+}
+
+fn emit_gpu_native_router_cutoff_report(
+    report: &crate::gpu_native_router_cutoff_diagnostics::GpuNativeRouterCutoffReport,
+    out_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let json = serde_json::to_string_pretty(report)?;
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out_path, json)?;
+    info!(
+        report = %out_path.display(),
+        "GPU-native router-cutoff diagnostic report written"
+    );
+    if let Some(failure) = report.failure.as_ref() {
+        Err(failure.clone().into())
+    } else {
+        Ok(())
+    }
+}
+
+async fn cmd_diagnose_gpu_native_router_cutoff(
+    args: DiagnoseGpuNativeRouterCutoffArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::gpu_native_router_cutoff_diagnostics as cutoff;
+
+    if args.expected_adapter_name.trim().is_empty() {
+        return Err("--expected-adapter-name must be non-empty".into());
+    }
+    let fixed_case = crate::greedy_parity::fixed_case(&args.case).ok_or_else(|| {
+        format!(
+            "unknown corpus case: {}; expected one of: rust-generation, rust-debugging, json-transformation, multilingual-spanish",
+            args.case
+        )
+    })?;
+    let cfg = args.parsed_config.clone();
+    if !cfg.real_transformer.enabled
+        || !cfg.real_transformer.strict_weights
+        || cfg.real_transformer.allow_seeded_fallback
+        || cfg.real_transformer.allow_degraded_experts
+        || cfg.real_transformer.allow_nonfinite_attention_fallback
+        || cfg.real_transformer.allow_truncated_expert_payloads
+        || cfg.model.dtype != crate::inference::WeightDtype::Q4_0
+    {
+        return Err("router-cutoff diagnostic requires strict real Q4_0 weights with all seeded, degraded, nonfinite, and truncated fallback paths disabled".into());
+    }
+    let (artifacts, artifact_errors) = qualification_artifacts(&args.config, &cfg);
+    if !artifact_errors.is_empty() {
+        return Err(format!(
+            "router-cutoff artifact preflight failed: {}",
+            artifact_errors.join("; ")
+        )
+        .into());
+    }
+    let metadata_path = cfg.model.data_dir.join("metadata.json");
+    let expert_metadata = crate::qualification::read_expert_metadata(&metadata_path)
+        .map_err(|error| format!("failed to read strict expert metadata: {error}"))?;
+    if expert_metadata.explicitly_synthetic
+        || expert_metadata.q4_0_layout.as_deref() != Some(crate::inference::Q4_0_LAYOUT_STANDARD_V1)
+    {
+        return Err(
+            "router-cutoff diagnostic requires canonical nonsynthetic Q4_0 expert metadata".into(),
+        );
+    }
+
+    let provenance = crate::qualification::BuildProvenance::embedded();
+    let build_git_sha = provenance
+        .git_sha
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let (_, executable_sha256) = current_executable_identity()?;
+
+    let mut gpu_spec = resolve_real_cli_spec_from_config(
+        cfg.clone(),
+        RealCliRuntimeMode::IsolatedGpuNativeDiagnostic,
+    )?;
+    gpu_spec.cfg.real_transformer.gpu_native = true;
+    gpu_spec.cfg.real_transformer.compute_offload = crate::backend::ComputeOffload::Gpu;
+    gpu_spec.cfg.real_transformer.strict_weights = true;
+    gpu_spec.cfg.real_transformer.allow_seeded_fallback = false;
+    gpu_spec.cfg.real_transformer.allow_degraded_experts = false;
+    gpu_spec
+        .cfg
+        .real_transformer
+        .allow_nonfinite_attention_fallback = false;
+    let resolved_config_sha256 = resolved_real_cli_spec_sha256(&gpu_spec)?;
+
+    let mut reference_spec =
+        resolve_real_cli_spec_from_config(cfg, RealCliRuntimeMode::IsolatedGreedyParityCpu)?;
+    reference_spec.cfg.real_transformer.gpu_native = false;
+    reference_spec.cfg.real_transformer.compute_offload = crate::backend::ComputeOffload::Cpu;
+    reference_spec.cfg.real_transformer.strict_weights = true;
+    reference_spec.cfg.real_transformer.allow_seeded_fallback = false;
+    reference_spec.cfg.real_transformer.allow_degraded_experts = false;
+    reference_spec
+        .cfg
+        .real_transformer
+        .allow_nonfinite_attention_fallback = false;
+
+    let attention_fallbacks_before = crate::transformer::nonfinite_softmax_fallbacks();
+
+    // Authoritative CPU reference with the production Hybrid F16 routed-expert
+    // boundary. Every prompt-prefix and preceding decode position is executed.
+    let reference_context =
+        resolve_isolated_real_cli_context(&reference_spec, crate::backend::ComputeOffload::Cpu)?;
+    let reference_runtime = build_real_cli_runtime_from_spec(
+        &reference_spec,
+        RealCliRuntimeMode::IsolatedGreedyParityCpu,
+        reference_context,
+        None,
+    )
+    .await?;
+    reference_runtime
+        .engine
+        .enable_cpu_q4_boundary_emulation()?;
+    if !reference_runtime.model.load_status.strict
+        || reference_runtime.model.load_status.seeded_fallback_remained
+        || reference_runtime.model.load_status.loaded_tensors
+            != reference_runtime.model.load_status.required_tensors
+    {
+        return Err("authoritative reference did not load a complete strict checkpoint".into());
+    }
+    let prompt_token_ids = reference_runtime.tokenizer.encode(fixed_case.prompt)?;
+    if prompt_token_ids.is_empty() {
+        return Err("fixed-corpus prompt tokenized to zero tokens".into());
+    }
+    cutoff::validate_target(
+        fixed_case.name,
+        args.generated_position,
+        args.focus_layer,
+        reference_runtime.model.config.num_layers,
+        crate::greedy_parity::OUTPUT_TOKEN_LIMIT,
+    )?;
+    if reference_runtime.model.config.top_k != 8
+        || reference_runtime.model.config.num_experts <= cutoff::CUTOFF_EXPERT_B as usize
+    {
+        return Err(
+            "router-cutoff diagnostic requires top_k=8 and expert ids 56/108 to exist".into(),
+        );
+    }
+
+    let reference_routed_before = reference_runtime.engine.routed_expert_execution_snapshot();
+    let mut reference_kv = reference_runtime.model.fresh_kv_caches();
+    let prompt_prefix_count = prompt_token_ids.len() - 1;
+    for (position, &token_id) in prompt_token_ids[..prompt_prefix_count].iter().enumerate() {
+        reference_runtime
+            .model
+            .forward_token_hidden(
+                &reference_runtime.engine,
+                token_id,
+                position,
+                &mut reference_kv,
+            )
+            .await?;
+    }
+    let mut reference_input_token = prompt_token_ids[prompt_prefix_count];
+    let mut reference_preceding_generated_ids = Vec::with_capacity(args.generated_position);
+    let mut reference_trace = None;
+    for generated_position in 0..=args.generated_position {
+        let position = prompt_prefix_count
+            .checked_add(generated_position)
+            .ok_or("reference diagnostic position overflowed")?;
+        let trace = reference_runtime
+            .model
+            .forward_token_diagnostic_trace(
+                &reference_runtime.engine,
+                reference_input_token,
+                position,
+                &mut reference_kv,
+                None,
+            )
+            .await?;
+        if generated_position == args.generated_position {
+            reference_trace = Some(trace);
+        } else {
+            reference_preceding_generated_ids.push(trace.sampled_token);
+            reference_input_token = trace.sampled_token;
+        }
+    }
+    let reference_trace = reference_trace.ok_or("reference diagnostic trace was not captured")?;
+    let reference_kv_sequence_lengths_after_diagnostic = reference_kv
+        .iter()
+        .map(|cache| cache.seq_len)
+        .collect::<Vec<_>>();
+    let gates_through_focus = reference_runtime.model.layers[..=args.focus_layer]
+        .iter()
+        .map(|layer| layer.gate.clone())
+        .collect::<Vec<_>>();
+    let reference_num_layers = reference_runtime.model.config.num_layers;
+    let reference_d_model = reference_runtime.model.config.d_model;
+    let reference_num_experts = reference_runtime.model.config.num_experts;
+    let reference_boundary = reference_runtime
+        .engine
+        .cpu_q4_boundary_emulation_snapshot();
+    let reference_routed_delta = crate::qualification::routed_execution_delta(
+        reference_routed_before,
+        reference_runtime.engine.routed_expert_execution_snapshot(),
+    )
+    .map_err(|failure| failure.detail)?;
+    reference_runtime.shutdown_isolated().await?;
+
+    // Full production GPU-native token loop with diagnostic-only copies of
+    // already-existing router logits after each unmodified router dispatch.
+    let gpu_context =
+        resolve_isolated_real_cli_context(&gpu_spec, crate::backend::ComputeOffload::Gpu)?;
+    let gpu_runtime = build_real_cli_runtime_from_spec(
+        &gpu_spec,
+        RealCliRuntimeMode::IsolatedGpuNativeDiagnostic,
+        gpu_context,
+        None,
+    )
+    .await?;
+    if !gpu_runtime.model.load_status.strict
+        || gpu_runtime.model.load_status.seeded_fallback_remained
+        || gpu_runtime.model.load_status.loaded_tensors
+            != gpu_runtime.model.load_status.required_tensors
+    {
+        return Err("GPU-native runtime did not load a complete strict checkpoint".into());
+    }
+    let actual_adapter = gpu_runtime
+        .engine
+        .gpu_device_identity()
+        .ok_or("GPU-native runtime has no authoritative adapter identity")?;
+    if actual_adapter.name != args.expected_adapter_name
+        || actual_adapter.software_adapter
+        || actual_adapter.device_type.eq_ignore_ascii_case("cpu")
+    {
+        return Err(format!(
+            "GPU-native runtime selected adapter {:?} ({:?}), expected exact hardware adapter {:?}",
+            actual_adapter.name, actual_adapter.device_type, args.expected_adapter_name
+        )
+        .into());
+    }
+    let gpu_prompt_token_ids = gpu_runtime.tokenizer.encode(fixed_case.prompt)?;
+    if gpu_prompt_token_ids != prompt_token_ids {
+        return Err(
+            "CPU and GPU fixed-corpus tokenizer paths produced different prompt ids".into(),
+        );
+    }
+    let token_loop = gpu_runtime
+        .gpu_native_token_loop
+        .clone()
+        .ok_or("GPU-native token loop was not initialized")?;
+    let model_geometry = token_loop.model_geometry();
+    if model_geometry.num_layers != reference_num_layers
+        || model_geometry.d_model != reference_d_model
+        || model_geometry.num_experts != reference_num_experts
+    {
+        return Err("CPU and GPU diagnostic model geometry differs".into());
+    }
+    let counters_before = token_loop.snapshot();
+    if counters_before != crate::gpu_native_token_loop::GpuNativeTokenLoopSnapshot::default() {
+        return Err("GPU-native token-loop counters did not start at zero".into());
+    }
+    let gpu_routed_before = gpu_runtime.engine.routed_expert_execution_snapshot();
+    let mut request = token_loop.create_diagnostic_request_state()?;
+    for (position, &token_id) in prompt_token_ids[..prompt_prefix_count].iter().enumerate() {
+        token_loop
+            .step_token(&gpu_runtime.engine, &mut request, token_id, position, false)
+            .await?;
+    }
+    let trace_layout =
+        crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout::try_new_with_router_logits(
+            model_geometry.num_layers,
+            model_geometry.d_model,
+            model_geometry.num_experts,
+            model_geometry.top_k,
+            model_geometry.vocab_size,
+        )?;
+    let diagnostic_staging = token_loop.create_diagnostic_staging_buffer(&trace_layout)?;
+    let mut gpu_input_token = prompt_token_ids[prompt_prefix_count];
+    let mut gpu_preceding_generated_ids = Vec::with_capacity(args.generated_position);
+    let mut gpu_trace = None;
+    let mut diagnostic_attempt_count = 0usize;
+    let mut gpu_committed_position_before_diagnostic = request.committed_position();
+    for generated_position in 0..=args.generated_position {
+        let position = prompt_prefix_count
+            .checked_add(generated_position)
+            .ok_or("GPU diagnostic position overflowed")?;
+        if generated_position == args.generated_position {
+            gpu_committed_position_before_diagnostic = request.committed_position();
+            let (trace, attempts) = token_loop
+                .step_token_diagnostic(
+                    &gpu_runtime.engine,
+                    &mut request,
+                    gpu_input_token,
+                    position,
+                    true,
+                    &trace_layout,
+                    &diagnostic_staging,
+                )
+                .await?;
+            diagnostic_attempt_count = attempts;
+            gpu_trace = Some(trace);
+        } else {
+            let sampled = token_loop
+                .step_token(
+                    &gpu_runtime.engine,
+                    &mut request,
+                    gpu_input_token,
+                    position,
+                    true,
+                )
+                .await?
+                .ok_or("GPU preceding decode step produced no sampled token")?;
+            gpu_preceding_generated_ids.push(sampled);
+            gpu_input_token = sampled;
+        }
+    }
+    let gpu_trace = gpu_trace.ok_or("GPU diagnostic trace was not captured")?;
+    let gpu_committed_position_after_diagnostic = request.committed_position();
+
+    let gpu_shadow_trace = token_loop
+        .run_gpu_router_shadow_on_input(
+            args.focus_layer,
+            &reference_trace.layer_router_input[args.focus_layer],
+        )
+        .await?;
+    let token_loop_counters_delta = token_loop.snapshot();
+    let gpu_routed_delta = crate::qualification::routed_execution_delta(
+        gpu_routed_before,
+        gpu_runtime.engine.routed_expert_execution_snapshot(),
+    )
+    .map_err(|failure| failure.detail)?;
+
+    let cpu_shadow_ids = gates_through_focus
+        .iter()
+        .enumerate()
+        .map(|(layer, gate)| gate.route(&gpu_trace.layer_router_input[layer]).experts)
+        .collect::<Vec<_>>();
+    let focus_gate = &gates_through_focus[args.focus_layer];
+    let cpu_shadow_raw_logits = focus_gate
+        .weights
+        .matvec(&gpu_trace.layer_router_input[args.focus_layer]);
+    let cpu_shadow_decision = focus_gate.route(&gpu_trace.layer_router_input[args.focus_layer]);
+
+    let reference_router = cutoff::build_router_evaluation(
+        &reference_trace.layer_router_logits[args.focus_layer],
+        &reference_trace.layer_selected_ids[args.focus_layer],
+        Some(&reference_trace.layer_selected_weights[args.focus_layer]),
+        "diagnostic replay of the authoritative CPU gate GEMV on the captured reference router input",
+        "host stable softmax reconstructed from diagnostic CPU GEMV replay logits",
+        "authoritative CPU LinearGate selection",
+        cutoff::DEFAULT_TOP_N,
+    )?;
+    let gpu_router = cutoff::build_router_evaluation(
+        &gpu_trace.layer_router_logits[args.focus_layer],
+        &gpu_trace.layer_selected_ids[args.focus_layer],
+        Some(&gpu_trace.layer_selected_weights[args.focus_layer]),
+        "actual production GPU dense-GEMV router logits copied before scratch reuse",
+        "host stable softmax reconstructed from actual GPU raw logits; unselected production GPU shader probabilities are not retained",
+        "actual production GPU router shader selection",
+        cutoff::DEFAULT_TOP_N,
+    )?;
+    let cpu_shadow_router = cutoff::build_router_evaluation(
+        &cpu_shadow_raw_logits,
+        &cpu_shadow_decision.experts,
+        Some(&cpu_shadow_decision.weights),
+        "authoritative CPU gate GEMV on the actual captured GPU router input",
+        "host stable softmax reconstructed from CPU-shadow raw logits",
+        "authoritative CPU LinearGate shadow selection",
+        cutoff::DEFAULT_TOP_N,
+    )?;
+    let gpu_shadow_router = cutoff::build_router_evaluation(
+        &gpu_shadow_trace.raw_logits,
+        &gpu_shadow_trace.selected_ids,
+        Some(&gpu_shadow_trace.selected_weights),
+        "production GPU dense-GEMV router logits on the reference router input",
+        "host stable softmax reconstructed from GPU-shadow raw logits; unselected production GPU shader probabilities are not retained",
+        "production GPU router shader shadow selection",
+        cutoff::DEFAULT_TOP_N,
+    )?;
+
+    let reference_vs_gpu_raw_logits = cutoff::compare_vector_drift(
+        &reference_router.raw_logits_all_experts,
+        &gpu_router.raw_logits_all_experts,
+    )?;
+    let reference_vs_cpu_shadow_raw_logits = cutoff::compare_vector_drift(
+        &reference_router.raw_logits_all_experts,
+        &cpu_shadow_router.raw_logits_all_experts,
+    )?;
+    let cpu_shadow_vs_gpu_raw_logits = cutoff::compare_vector_drift(
+        &cpu_shadow_router.raw_logits_all_experts,
+        &gpu_router.raw_logits_all_experts,
+    )?;
+    let mut classification = cutoff::classify_divergence(
+        &reference_router,
+        &gpu_router,
+        &cpu_shadow_router,
+        &reference_vs_cpu_shadow_raw_logits,
+        &cpu_shadow_vs_gpu_raw_logits,
+    )?;
+    if reference_input_token != gpu_input_token {
+        classification.upstream_state_drift = false;
+        classification.gpu_router_math_drift = false;
+        classification.mixed_or_ambiguous = true;
+        classification.reason = format!(
+            "reference and GPU input tokens differ at generated position {} ({} vs {}), so router causality is ambiguous",
+            args.generated_position, reference_input_token, gpu_input_token
+        );
+    }
+
+    let layerwise_drift = cutoff::build_layerwise_drift(
+        &reference_trace,
+        &gpu_trace,
+        &cpu_shadow_ids,
+        args.focus_layer,
+    )?;
+    let focus_state = cutoff::FocusStateEvidence {
+        reference_router_input: reference_trace.layer_router_input[args.focus_layer].clone(),
+        gpu_router_input: gpu_trace.layer_router_input[args.focus_layer].clone(),
+        router_input_comparison: cutoff::compare_vector_drift(
+            &reference_trace.layer_router_input[args.focus_layer],
+            &gpu_trace.layer_router_input[args.focus_layer],
+        )?,
+        reference_post_moe: reference_trace.layer_post_moe[args.focus_layer].clone(),
+        gpu_post_moe: gpu_trace.layer_post_moe[args.focus_layer].clone(),
+        post_moe_comparison: cutoff::compare_vector_drift(
+            &reference_trace.layer_post_moe[args.focus_layer],
+            &gpu_trace.layer_post_moe[args.focus_layer],
+        )?,
+    };
+    let final_effect = cutoff::FinalEffectEvidence {
+        final_norm_comparison: cutoff::compare_vector_drift(
+            &reference_trace.final_norm,
+            &gpu_trace.final_norm,
+        )?,
+        final_logits_comparison: cutoff::compare_vector_drift(
+            &reference_trace.logits,
+            &gpu_trace.logits,
+        )?,
+        reference_greedy_token_id: reference_trace.sampled_token,
+        gpu_greedy_token_id: gpu_trace.sampled_token,
+        token_equal: reference_trace.sampled_token == gpu_trace.sampled_token,
+        reference_lm_head_margin: cutoff::greedy_logit_margin(&reference_trace.logits)?,
+        gpu_lm_head_margin: cutoff::greedy_logit_margin(&gpu_trace.logits)?,
+    };
+    let focus_router = cutoff::FocusRouterEvidence {
+        reference_cutoff_margin: cutoff::cutoff_margin(&reference_router)?,
+        gpu_cutoff_margin: cutoff::cutoff_margin(&gpu_router)?,
+        cpu_shadow_cutoff_margin: cutoff::cutoff_margin(&cpu_shadow_router)?,
+        gpu_shadow_cutoff_margin: Some(cutoff::cutoff_margin(&gpu_shadow_router)?),
+        reference_vs_gpu_raw_logits,
+        reference_vs_cpu_shadow_raw_logits,
+        cpu_shadow_vs_gpu_raw_logits,
+        reference: reference_router,
+        gpu_native: gpu_router,
+        cpu_shadow_on_gpu_input: cpu_shadow_router,
+        gpu_shadow_on_reference_input: Some(gpu_shadow_router),
+    };
+
+    let attention_nonfinite_fallbacks = crate::transformer::nonfinite_softmax_fallbacks()
+        .saturating_sub(attention_fallbacks_before);
+    let no_unserviced_residency_failure = token_loop_counters_delta.residency_miss_attempts
+        == token_loop_counters_delta.residency_services
+        && token_loop_counters_delta.residency_services
+            == token_loop_counters_delta.replay_attempts;
+    let safety = cutoff::SafetyEvidence {
+        reference_cpu_q4_boundary_emulation: reference_boundary,
+        reference_routed_execution_delta: reference_routed_delta,
+        gpu_routed_execution_delta: gpu_routed_delta,
+        gpu_layer_statuses: gpu_trace.layer_statuses.clone(),
+        gpu_final_status: gpu_trace.final_status,
+        attention_nonfinite_fallbacks,
+        no_fatal_failure: token_loop_counters_delta.fatal_failures == 0
+            && token_loop_counters_delta.no_progress_failures == 0,
+        no_gpu_cpu_fallback: gpu_routed_delta.gpu_cpu_fallbacks == 0,
+        no_degraded_expert_substitution: reference_routed_delta.degraded_expert_substitutions == 0
+            && gpu_routed_delta.degraded_expert_substitutions == 0,
+        no_unserviced_residency_failure,
+    };
+    let diagnostic_position = prompt_prefix_count
+        .checked_add(args.generated_position)
+        .ok_or("diagnostic position overflowed")?;
+    let position_accounting = cutoff::PositionAccountingEvidence {
+        prompt_token_ids: prompt_token_ids.clone(),
+        prompt_token_count: prompt_token_ids.len(),
+        reference_preceding_generated_ids,
+        gpu_preceding_generated_ids,
+        reference_input_token_id: reference_input_token,
+        gpu_input_token_id: gpu_input_token,
+        generated_position: args.generated_position,
+        diagnostic_position,
+        gpu_committed_position_before_diagnostic,
+        gpu_committed_position_after_diagnostic,
+        reference_kv_sequence_lengths_after_diagnostic,
+    };
+
+    drop(request);
+    drop(diagnostic_staging);
+    gpu_runtime.shutdown_isolated().await?;
+
+    let mut report = cutoff::GpuNativeRouterCutoffReport {
+        schema_version: cutoff::SCHEMA_VERSION.to_string(),
+        mode: cutoff::MODE.to_string(),
+        diagnostic_complete: false,
+        qualification_pass: false,
+        failure: None,
+        build_provenance: provenance,
+        build_git_sha,
+        executable_sha256,
+        resolved_config_sha256,
+        artifacts,
+        expert_metadata,
+        model_geometry,
+        expected_adapter_name: args.expected_adapter_name,
+        actual_adapter,
+        case: cutoff::DiagnosticCaseEvidence {
+            name: fixed_case.name.to_string(),
+            prompt: fixed_case.prompt.to_string(),
+            prompt_sha256: crate::greedy_parity::sha256_hex(fixed_case.prompt.as_bytes()),
+        },
+        generated_position: args.generated_position,
+        focus_layer: args.focus_layer,
+        position_accounting,
+        focus_state,
+        layerwise_drift,
+        focus_router,
+        classification,
+        final_effect,
+        safety,
+        token_loop_counters_delta,
+        diagnostic_attempt_count,
+    };
+    if let Err(reason) = report.finish() {
+        report.failure = Some(reason);
+    }
+    emit_gpu_native_router_cutoff_report(&report, &args.report_out)
 }
 
 fn emit_layer0_attention_first_divergence_report(
@@ -14010,6 +14599,67 @@ mod tests {
             super::startup_config_path(&cli.cmd),
             Some(Path::new("config.toml"))
         );
+    }
+
+    #[test]
+    fn gpu_native_router_cutoff_cli_parses_target_selection() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "diagnose-gpu-native-router-cutoff",
+            "--config",
+            "config.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--case",
+            "rust-debugging",
+            "--generated-position",
+            "0",
+            "--focus-layer",
+            "24",
+            "--report-out",
+            "router-cutoff.json",
+        ])
+        .unwrap();
+
+        match &cli.cmd {
+            Cmd::DiagnoseGpuNativeRouterCutoff {
+                config,
+                expected_adapter_name,
+                case,
+                generated_position,
+                focus_layer,
+                report_out,
+            } => {
+                assert_eq!(config, &PathBuf::from("config.toml"));
+                assert_eq!(expected_adapter_name, "NVIDIA L4");
+                assert_eq!(case, "rust-debugging");
+                assert_eq!(*generated_position, 0);
+                assert_eq!(*focus_layer, 24);
+                assert_eq!(report_out, &PathBuf::from("router-cutoff.json"));
+            }
+            _ => panic!("unexpected command variant"),
+        }
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new("config.toml"))
+        );
+    }
+
+    #[test]
+    fn gpu_native_router_cutoff_cli_requires_generated_position_and_focus_layer() {
+        let result = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "diagnose-gpu-native-router-cutoff",
+            "--config",
+            "config.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--case",
+            "rust-debugging",
+            "--report-out",
+            "router-cutoff.json",
+        ]);
+        assert!(result.is_err());
     }
 
     #[test]

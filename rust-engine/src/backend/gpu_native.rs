@@ -3761,15 +3761,34 @@ impl GpuNativeRouterScratchLayout {
         wgpu::BufferUsages::STORAGE
     }
 
+    pub(crate) fn diagnostic_logits_usage() -> wgpu::BufferUsages {
+        Self::logits_usage() | wgpu::BufferUsages::COPY_SRC
+    }
+
     pub(crate) fn result_usage() -> wgpu::BufferUsages {
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC
     }
 
     fn validate_for_limits(self, limits: &wgpu::Limits) -> Result<(), GpuNativeBootstrapError> {
+        self.validate_for_limits_with_logits_usage(limits, Self::logits_usage())
+    }
+
+    fn validate_for_diagnostic_limits(
+        self,
+        limits: &wgpu::Limits,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        self.validate_for_limits_with_logits_usage(limits, Self::diagnostic_logits_usage())
+    }
+
+    fn validate_for_limits_with_logits_usage(
+        self,
+        limits: &wgpu::Limits,
+        logits_usage: wgpu::BufferUsages,
+    ) -> Result<(), GpuNativeBootstrapError> {
         super::validate_startup_buffer(
             "gpu_native_router_logits",
             self.logits_bytes,
-            Self::logits_usage(),
+            logits_usage,
             limits,
         )?;
         super::validate_startup_buffer(
@@ -6184,6 +6203,24 @@ impl GpuNativeExecutorContext {
         &self,
         geometry: GpuNativeRouterGeometry,
     ) -> Result<GpuNativeRouterScratch, GpuNativeBootstrapError> {
+        self.create_router_scratch_internal(geometry, false)
+    }
+
+    /// Allocate router scratch whose already-produced raw logits may be copied
+    /// into diagnostic staging. Production router scratch keeps its narrower
+    /// STORAGE-only usage.
+    pub(crate) fn create_diagnostic_router_scratch(
+        &self,
+        geometry: GpuNativeRouterGeometry,
+    ) -> Result<GpuNativeRouterScratch, GpuNativeBootstrapError> {
+        self.create_router_scratch_internal(geometry, true)
+    }
+
+    fn create_router_scratch_internal(
+        &self,
+        geometry: GpuNativeRouterGeometry,
+        diagnostic_logits_copy: bool,
+    ) -> Result<GpuNativeRouterScratch, GpuNativeBootstrapError> {
         if geometry.d_model != self.layout.d_model {
             return Err(GpuNativeBootstrapError::RouterDModelMismatch {
                 expected: self.layout.d_model,
@@ -6192,14 +6229,22 @@ impl GpuNativeExecutorContext {
         }
         let gpu = self.authoritative_gpu()?;
         let layout = GpuNativeRouterScratchLayout::try_new(geometry)?;
-        layout.validate_for_limits(&gpu.device.limits())?;
+        if diagnostic_logits_copy {
+            layout.validate_for_diagnostic_limits(&gpu.device.limits())?;
+        } else {
+            layout.validate_for_limits(&gpu.device.limits())?;
+        }
         validate_router_dispatch(&gpu.device.limits())?;
         let scratch_id = next_nonzero_id(&NEXT_GPU_NATIVE_SCRATCH_ID, "router scratch");
         let logits = create_startup_buffer(
             &gpu.device,
             &format!("gpu_native_router_scratch_{scratch_id}_logits"),
             layout.logits_bytes,
-            GpuNativeRouterScratchLayout::logits_usage(),
+            if diagnostic_logits_copy {
+                GpuNativeRouterScratchLayout::diagnostic_logits_usage()
+            } else {
+                GpuNativeRouterScratchLayout::logits_usage()
+            },
         )?;
         let selected_ids = create_startup_buffer(
             &gpu.device,

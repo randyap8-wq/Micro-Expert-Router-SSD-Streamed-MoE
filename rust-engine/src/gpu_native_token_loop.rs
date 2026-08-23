@@ -931,6 +931,21 @@ impl GpuNativeTokenLoop {
 
     /// Allocate request-local device resources for one GPU-native sequence.
     pub fn create_request_state(&self) -> Result<GpuNativeRequestState, GpuNativeTokenLoopError> {
+        self.create_request_state_internal(false)
+    }
+
+    /// Allocate request-local resources for a diagnostic sequence whose real
+    /// router logits are copied after each production router dispatch.
+    pub fn create_diagnostic_request_state(
+        &self,
+    ) -> Result<GpuNativeRequestState, GpuNativeTokenLoopError> {
+        self.create_request_state_internal(true)
+    }
+
+    fn create_request_state_internal(
+        &self,
+        diagnostic_router_logits: bool,
+    ) -> Result<GpuNativeRequestState, GpuNativeTokenLoopError> {
         let token_state = self.executor.create_token_state()?;
         let kv_width = self.model_geometry.num_kv_heads * self.model_geometry.head_dim;
         let kv_state = self.executor.create_kv_state(
@@ -953,7 +968,12 @@ impl GpuNativeTokenLoop {
             self.model_geometry.num_experts,
             self.model_geometry.top_k,
         )?;
-        let router_scratch = self.executor.create_router_scratch(router_geom)?;
+        let router_scratch = if diagnostic_router_logits {
+            self.executor
+                .create_diagnostic_router_scratch(router_geom)?
+        } else {
+            self.executor.create_router_scratch(router_geom)?
+        };
 
         let expert_geom = GpuNativeQ4ExpertGeometry::try_new(
             self.model_geometry.d_model,
@@ -1161,6 +1181,132 @@ impl GpuNativeTokenLoop {
         });
         Ok(staging_buffer)
     }
+
+    /// Run the exact registered production router for `layer_index` against a
+    /// caller-supplied F32 input and read back its existing logits/selection
+    /// buffers. This does not execute attention, experts, combine, or sampling.
+    pub async fn run_gpu_router_shadow_on_input(
+        &self,
+        layer_index: usize,
+        input: &[f32],
+    ) -> Result<crate::gpu_native_diagnostics::GpuNativeRouterShadowTrace, GpuNativeTokenLoopError>
+    {
+        if layer_index >= self.layers.len() {
+            return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: format!(
+                    "router shadow layer {layer_index} is out of range for {} layers",
+                    self.layers.len()
+                ),
+            });
+        }
+        if input.len() != self.model_geometry.d_model
+            || input.iter().any(|value| !value.is_finite())
+        {
+            return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: format!(
+                    "router shadow input must contain {} finite values, got {}",
+                    self.model_geometry.d_model,
+                    input.len()
+                ),
+            });
+        }
+
+        let _guard = self.execution_guard.lock().await;
+        let gpu = self.executor.authoritative_gpu()?;
+        let state = self.executor.create_token_state()?;
+        let geometry = GpuNativeRouterGeometry::try_new(
+            self.model_geometry.d_model,
+            self.model_geometry.num_experts,
+            self.model_geometry.top_k,
+        )?;
+        let scratch = self.executor.create_diagnostic_router_scratch(geometry)?;
+        gpu.queue
+            .write_buffer(state.hidden_buffer(), 0, bytemuck::cast_slice(input));
+        gpu.queue.write_buffer(state.status_buffer(), 0, &[0; 4]);
+
+        let logits_bytes = self.model_geometry.num_experts * 4;
+        let ids_bytes = self.model_geometry.top_k * 4;
+        let weights_bytes = self.model_geometry.top_k * 4;
+        let status_offset = logits_bytes + ids_bytes + weights_bytes;
+        let total_bytes = status_offset + 4;
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_native_router_shadow_staging"),
+            size: total_bytes as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gpu_native_router_shadow_diagnostic"),
+            });
+        self.executor.encode_router(
+            &mut encoder,
+            &self.layers[layer_index].router_plan,
+            &state,
+            &scratch,
+        )?;
+        encoder.copy_buffer_to_buffer(scratch.logits_buffer(), 0, &staging, 0, logits_bytes as u64);
+        encoder.copy_buffer_to_buffer(
+            scratch.selected_ids_buffer(),
+            0,
+            &staging,
+            logits_bytes as u64,
+            ids_bytes as u64,
+        );
+        encoder.copy_buffer_to_buffer(
+            scratch.selected_weights_buffer(),
+            0,
+            &staging,
+            (logits_bytes + ids_bytes) as u64,
+            weights_bytes as u64,
+        );
+        encoder.copy_buffer_to_buffer(state.status_buffer(), 0, &staging, status_offset as u64, 4);
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..total_bytes as u64);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|error| GpuNativeTokenLoopError::MapFailed(error.to_string()))?
+            .map_err(|error| GpuNativeTokenLoopError::MapFailed(format!("{error:?}")))?;
+        let mapped = slice.get_mapped_range();
+        let parse_f32 = |start: usize, count: usize| {
+            mapped[start..start + count * 4]
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+                .collect::<Vec<_>>()
+        };
+        let raw_logits = parse_f32(0, self.model_geometry.num_experts);
+        let selected_ids = mapped[logits_bytes..logits_bytes + ids_bytes]
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+            .collect();
+        let selected_weights = parse_f32(logits_bytes + ids_bytes, self.model_geometry.top_k);
+        let status = u32::from_le_bytes(
+            mapped[status_offset..status_offset + 4]
+                .try_into()
+                .expect("four-byte status"),
+        );
+        drop(mapped);
+        staging.unmap();
+        if status != 0 {
+            return Err(GpuNativeTokenLoopError::FatalNumericalFailure {
+                layer_index: Some(layer_index),
+                status_bits: status,
+            });
+        }
+        Ok(crate::gpu_native_diagnostics::GpuNativeRouterShadowTrace {
+            raw_logits,
+            selected_ids,
+            selected_weights,
+            status,
+        })
+    }
+
     /// Diagnostic variant for layer-0 attention only. Bypasses router, MoE, and later layers.
     /// Executes one prompt position and captures all layer-0 attention intermediates.
     pub async fn step_layer0_attention_diagnostic(
@@ -1664,6 +1810,23 @@ impl GpuNativeTokenLoop {
             )?;
 
             if let Some(sink) = diagnostic_sink {
+                if sink.layout.num_experts > 0 {
+                    if sink.layout.num_experts != self.model_geometry.num_experts {
+                        return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                            detail: format!(
+                                "diagnostic router-logit layout has {} experts, model has {}",
+                                sink.layout.num_experts, self.model_geometry.num_experts
+                            ),
+                        });
+                    }
+                    encoder.copy_buffer_to_buffer(
+                        request.router_scratch.logits_buffer(),
+                        0,
+                        sink.staging_buffer,
+                        sink.layout.layer_router_logits_offset(layer_idx),
+                        (self.model_geometry.num_experts * 4) as u64,
+                    );
+                }
                 encoder.copy_buffer_to_buffer(
                     request.router_scratch.selected_ids_buffer(),
                     0,
@@ -2983,11 +3146,15 @@ pub(crate) mod tests {
     #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
     fn live_l4_gpu_native_diagnostic_smoke() {
         let harness = setup_live_l4_harness("diag_smoke");
-        let mut request_state = harness.token_loop.create_request_state().unwrap();
+        let mut request_state = harness
+            .token_loop
+            .create_diagnostic_request_state()
+            .unwrap();
 
-        let trace_layout = crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout::try_new(
+        let trace_layout = crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout::try_new_with_router_logits(
             LIVE_L4_NUM_LAYERS,
             LIVE_L4_D_MODEL,
+            LIVE_L4_NUM_EXPERTS,
             LIVE_L4_TOP_K,
             LIVE_L4_VOCAB_SIZE,
         )
@@ -3012,6 +3179,7 @@ pub(crate) mod tests {
         assert_eq!(trace.embedding.len(), LIVE_L4_D_MODEL);
         assert_eq!(trace.layer_post_attn.len(), LIVE_L4_NUM_LAYERS);
         assert_eq!(trace.layer_router_input.len(), LIVE_L4_NUM_LAYERS);
+        assert_eq!(trace.layer_router_logits.len(), LIVE_L4_NUM_LAYERS);
         assert_eq!(trace.layer_selected_ids.len(), LIVE_L4_NUM_LAYERS);
         assert_eq!(trace.layer_selected_weights.len(), LIVE_L4_NUM_LAYERS);
         assert_eq!(trace.layer_post_moe.len(), LIVE_L4_NUM_LAYERS);

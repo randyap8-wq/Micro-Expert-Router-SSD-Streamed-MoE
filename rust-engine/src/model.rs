@@ -2816,6 +2816,7 @@ impl RealModel {
 
         let mut layer_post_attn = Vec::with_capacity(self.layers.len());
         let mut layer_router_input = Vec::with_capacity(self.layers.len());
+        let mut layer_router_logits = Vec::with_capacity(self.layers.len());
         let mut layer_selected_ids = Vec::with_capacity(self.layers.len());
         let mut layer_selected_weights = Vec::with_capacity(self.layers.len());
         let mut layer_post_moe = Vec::with_capacity(self.layers.len());
@@ -2874,6 +2875,11 @@ impl RealModel {
                 );
             let normed = &layer_scratch.moe_normed;
             layer_router_input.push(normed.clone());
+            // Diagnostic-only replay of the same authoritative CPU gate GEMV.
+            // The production routing decision above remains the source of the
+            // selected ids and weights; this copy preserves the pre-softmax
+            // logits needed to explain cutoff drift.
+            layer_router_logits.push(layer.gate.weights.matvec(normed));
             layer_selected_ids.push(routing.experts.clone());
             layer_selected_weights.push(routing.weights.clone());
 
@@ -2941,6 +2947,7 @@ impl RealModel {
             embedding: embedding_trace,
             layer_post_attn,
             layer_router_input,
+            layer_router_logits,
             layer_selected_ids,
             layer_selected_weights,
             layer_post_moe,

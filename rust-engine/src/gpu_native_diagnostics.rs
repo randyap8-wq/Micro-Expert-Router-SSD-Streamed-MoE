@@ -69,6 +69,7 @@ pub const Q4_EXPERT_F16_BOUNDARY_TOLERANCE: ErrorTolerance = ErrorTolerance {
 pub struct GpuNativeDiagnosticTraceLayout {
     pub num_layers: usize,
     pub d_model: usize,
+    pub num_experts: usize,
     pub top_k: usize,
     pub vocab_size: usize,
     pub embedding_offset: usize,
@@ -77,6 +78,8 @@ pub struct GpuNativeDiagnosticTraceLayout {
     pub layer_post_attn_bytes: usize,
     pub layer_router_input_offset: usize,
     pub layer_router_input_bytes: usize,
+    pub layer_router_logits_offset: usize,
+    pub layer_router_logits_bytes: usize,
     pub layer_selected_ids_offset: usize,
     pub layer_selected_ids_bytes: usize,
     pub layer_selected_weights_offset: usize,
@@ -100,6 +103,31 @@ impl GpuNativeDiagnosticTraceLayout {
     pub fn try_new(
         num_layers: usize,
         d_model: usize,
+        top_k: usize,
+        vocab_size: usize,
+    ) -> Result<Self, GpuNativeTokenLoopError> {
+        Self::try_new_internal(num_layers, d_model, 0, top_k, vocab_size)
+    }
+
+    pub fn try_new_with_router_logits(
+        num_layers: usize,
+        d_model: usize,
+        num_experts: usize,
+        top_k: usize,
+        vocab_size: usize,
+    ) -> Result<Self, GpuNativeTokenLoopError> {
+        if num_experts == 0 || top_k > num_experts {
+            return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: "num_experts must be > 0 and >= top_k".into(),
+            });
+        }
+        Self::try_new_internal(num_layers, d_model, num_experts, top_k, vocab_size)
+    }
+
+    fn try_new_internal(
+        num_layers: usize,
+        d_model: usize,
+        num_experts: usize,
         top_k: usize,
         vocab_size: usize,
     ) -> Result<Self, GpuNativeTokenLoopError> {
@@ -156,8 +184,24 @@ impl GpuNativeDiagnosticTraceLayout {
                 })?;
         let layer_router_input_bytes = layer_post_attn_bytes;
 
-        let layer_selected_ids_offset = layer_router_input_offset
+        let layer_router_logits_offset = layer_router_input_offset
             .checked_add(layer_router_input_bytes)
+            .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: "layer_router_logits_offset overflow".into(),
+            })?;
+        let single_router_logits_bytes = num_experts.checked_mul(f32_bytes).ok_or_else(|| {
+            GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: "single router logits bytes overflow".into(),
+            }
+        })?;
+        let layer_router_logits_bytes = num_layers
+            .checked_mul(single_router_logits_bytes)
+            .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: "layer_router_logits_bytes overflow".into(),
+            })?;
+
+        let layer_selected_ids_offset = layer_router_logits_offset
+            .checked_add(layer_router_logits_bytes)
             .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
                 detail: "layer_selected_ids_offset overflow".into(),
             })?;
@@ -254,6 +298,7 @@ impl GpuNativeDiagnosticTraceLayout {
         Ok(Self {
             num_layers,
             d_model,
+            num_experts,
             top_k,
             vocab_size,
             embedding_offset,
@@ -262,6 +307,8 @@ impl GpuNativeDiagnosticTraceLayout {
             layer_post_attn_bytes,
             layer_router_input_offset,
             layer_router_input_bytes,
+            layer_router_logits_offset,
+            layer_router_logits_bytes,
             layer_selected_ids_offset,
             layer_selected_ids_bytes,
             layer_selected_weights_offset,
@@ -290,6 +337,11 @@ impl GpuNativeDiagnosticTraceLayout {
     #[inline]
     pub fn layer_router_input_offset(&self, layer: usize) -> u64 {
         (self.layer_router_input_offset + layer * self.d_model * 4) as u64
+    }
+
+    #[inline]
+    pub fn layer_router_logits_offset(&self, layer: usize) -> u64 {
+        (self.layer_router_logits_offset + layer * self.num_experts * 4) as u64
     }
 
     #[inline]
@@ -343,6 +395,7 @@ impl GpuNativeDiagnosticTraceLayout {
 
         let mut layer_post_attn = Vec::with_capacity(self.num_layers);
         let mut layer_router_input = Vec::with_capacity(self.num_layers);
+        let mut layer_router_logits = Vec::with_capacity(self.num_layers);
         let mut layer_selected_ids = Vec::with_capacity(self.num_layers);
         let mut layer_selected_weights = Vec::with_capacity(self.num_layers);
         let mut layer_post_moe = Vec::with_capacity(self.num_layers);
@@ -356,6 +409,10 @@ impl GpuNativeDiagnosticTraceLayout {
             layer_router_input.push(parse_f32_vec(
                 self.layer_router_input_offset(l) as usize,
                 self.d_model,
+            ));
+            layer_router_logits.push(parse_f32_vec(
+                self.layer_router_logits_offset(l) as usize,
+                self.num_experts,
             ));
             layer_selected_ids.push(parse_u32_vec(
                 self.layer_selected_ids_offset(l) as usize,
@@ -392,6 +449,7 @@ impl GpuNativeDiagnosticTraceLayout {
             embedding,
             layer_post_attn,
             layer_router_input,
+            layer_router_logits,
             layer_selected_ids,
             layer_selected_weights,
             layer_post_moe,
@@ -410,6 +468,7 @@ pub struct GpuNativeDiagnosticTrace {
     pub embedding: Vec<f32>,
     pub layer_post_attn: Vec<Vec<f32>>,
     pub layer_router_input: Vec<Vec<f32>>,
+    pub layer_router_logits: Vec<Vec<f32>>,
     pub layer_selected_ids: Vec<Vec<u32>>,
     pub layer_selected_weights: Vec<Vec<f32>>,
     pub layer_post_moe: Vec<Vec<f32>>,
@@ -420,12 +479,23 @@ pub struct GpuNativeDiagnosticTrace {
     pub sampled_token: u32,
 }
 
+/// Diagnostic-only output from running the unmodified production GPU router
+/// against a caller-supplied router input.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuNativeRouterShadowTrace {
+    pub raw_logits: Vec<f32>,
+    pub selected_ids: Vec<u32>,
+    pub selected_weights: Vec<f32>,
+    pub status: u32,
+}
+
 /// Captured boundaries from the authoritative reference model forward.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelDiagnosticTrace {
     pub embedding: Vec<f32>,
     pub layer_post_attn: Vec<Vec<f32>>,
     pub layer_router_input: Vec<Vec<f32>>,
+    pub layer_router_logits: Vec<Vec<f32>>,
     pub layer_selected_ids: Vec<Vec<u32>>,
     pub layer_selected_weights: Vec<Vec<f32>>,
     pub layer_post_moe: Vec<Vec<f32>>,
@@ -876,6 +946,9 @@ mod tests {
         assert_eq!(layout.layer_router_input_bytes, 32);
         assert_eq!(layout.layer_router_input_offset(0), 48);
         assert_eq!(layout.layer_router_input_offset(1), 64);
+        // Frozen trace layout does not include raw router logits.
+        assert_eq!(layout.layer_router_logits_offset, 80);
+        assert_eq!(layout.layer_router_logits_bytes, 0);
         // layer_selected_ids: 80..96 (2 * 2 * 4 = 16)
         assert_eq!(layout.layer_selected_ids_offset, 80);
         assert_eq!(layout.layer_selected_ids_bytes, 16);
@@ -913,6 +986,27 @@ mod tests {
     }
 
     #[test]
+    fn router_logit_extension_is_explicit_and_contiguous() {
+        let layout =
+            GpuNativeDiagnosticTraceLayout::try_new_with_router_logits(2, 4, 4, 2, 8).unwrap();
+        assert_eq!(layout.layer_router_logits_offset, 80);
+        assert_eq!(layout.layer_router_logits_bytes, 32);
+        assert_eq!(layout.layer_router_logits_offset(0), 80);
+        assert_eq!(layout.layer_router_logits_offset(1), 96);
+        assert_eq!(layout.layer_selected_ids_offset, 112);
+        assert_eq!(layout.total_bytes, 240);
+
+        let mut bytes = vec![0u8; layout.total_bytes as usize];
+        let captured = [1.0f32, 2.0, 3.0, 4.0];
+        let offset = layout.layer_router_logits_offset(1) as usize;
+        for (index, value) in captured.iter().enumerate() {
+            bytes[offset + index * 4..offset + index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let trace = layout.parse(&bytes).unwrap();
+        assert_eq!(trace.layer_router_logits[1], captured);
+    }
+
+    #[test]
     fn trace_layout_overflow_rejections() {
         assert!(GpuNativeDiagnosticTraceLayout::try_new(0, 4, 2, 8).is_err());
         assert!(GpuNativeDiagnosticTraceLayout::try_new(2, 0, 2, 8).is_err());
@@ -920,6 +1014,8 @@ mod tests {
         assert!(GpuNativeDiagnosticTraceLayout::try_new(2, 4, 9999, 8).is_err());
         assert!(GpuNativeDiagnosticTraceLayout::try_new(2, 4, 2, 0).is_err());
         assert!(GpuNativeDiagnosticTraceLayout::try_new(usize::MAX, 4, 2, 8).is_err());
+        assert!(GpuNativeDiagnosticTraceLayout::try_new_with_router_logits(2, 4, 0, 2, 8).is_err());
+        assert!(GpuNativeDiagnosticTraceLayout::try_new_with_router_logits(2, 4, 1, 2, 8).is_err());
     }
 
     #[test]
@@ -981,6 +1077,7 @@ mod tests {
             embedding: vec![1.0; d_model],
             layer_post_attn: vec![vec![2.0; d_model]; layers],
             layer_router_input: vec![vec![3.0; d_model]; layers],
+            layer_router_logits: vec![vec![0.25; top_k]; layers],
             layer_selected_ids: vec![vec![0; top_k]; layers],
             layer_selected_weights: vec![vec![0.5; top_k]; layers],
             layer_post_moe: vec![vec![4.0; d_model]; layers],
@@ -995,6 +1092,7 @@ mod tests {
             embedding: m.embedding.clone(),
             layer_post_attn: m.layer_post_attn.clone(),
             layer_router_input: m.layer_router_input.clone(),
+            layer_router_logits: m.layer_router_logits.clone(),
             layer_selected_ids: m.layer_selected_ids.clone(),
             layer_selected_weights: m.layer_selected_weights.clone(),
             layer_post_moe: m.layer_post_moe.clone(),
