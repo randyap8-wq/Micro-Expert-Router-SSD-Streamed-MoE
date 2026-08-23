@@ -6813,6 +6813,7 @@ async fn cmd_qualify_gpu_native_q4_greedy_parity(
             crate::greedy_parity::OUTPUT_TOKEN_LIMIT,
             gpu_native.model_geometry.num_layers,
             gpu_native.model_geometry.top_k,
+            Some(gpu_native.model_geometry.num_experts),
         ) {
             Ok(comparison) => comparison,
             Err(detail) => {

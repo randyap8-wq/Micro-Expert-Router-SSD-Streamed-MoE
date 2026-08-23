@@ -17,7 +17,7 @@ use crate::qualification::{
 };
 use serde::Serialize;
 
-pub const SCHEMA_VERSION: &str = "mer.gpu-native-q4-greedy-parity.v1";
+pub const SCHEMA_VERSION: &str = "mer.gpu-native-q4-greedy-parity.v2";
 pub const MODE: &str = "gpu-native-q4-greedy-parity-qualification";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -130,15 +130,28 @@ pub struct TokenMismatchEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ExpertIdMismatchEvidence {
+pub struct ExpertIdSetMismatchEvidence {
     pub case: String,
     pub generated_position: usize,
     pub layer: usize,
-    pub expert_slot: usize,
-    pub reference_expert_id: Option<u32>,
-    pub gpu_native_expert_id: Option<u32>,
     pub reference_selected_expert_ids: Vec<u32>,
     pub gpu_native_selected_expert_ids: Vec<u32>,
+    pub canonical_reference_expert_ids: Vec<u32>,
+    pub canonical_gpu_native_expert_ids: Vec<u32>,
+    pub reference_only_expert_ids: Vec<u32>,
+    pub gpu_native_only_expert_ids: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ExpertIdRankOrderDriftEvidence {
+    pub case: String,
+    pub generated_position: usize,
+    pub layer: usize,
+    pub first_differing_rank_slot: usize,
+    pub reference_selected_expert_ids: Vec<u32>,
+    pub gpu_native_selected_expert_ids: Vec<u32>,
+    pub canonical_reference_expert_ids: Vec<u32>,
+    pub canonical_gpu_native_expert_ids: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -146,10 +159,13 @@ pub struct CaseComparisonEvidence {
     pub exact_token_matches: usize,
     pub token_ids_match: bool,
     pub first_token_mismatch: Option<TokenMismatchEvidence>,
-    pub expert_id_topology_match: bool,
+    pub expert_id_selection_set_match: bool,
+    pub first_expert_id_set_mismatch: Option<ExpertIdSetMismatchEvidence>,
+    pub expert_id_rank_order_match: bool,
+    pub rank_order_drift_count: usize,
+    pub first_expert_id_rank_order_drift: Option<ExpertIdRankOrderDriftEvidence>,
     pub routing_positions_compared: usize,
     pub routing_layer_comparisons: usize,
-    pub first_expert_id_mismatch: Option<ExpertIdMismatchEvidence>,
 }
 
 pub fn compare_case_outputs(
@@ -162,6 +178,7 @@ pub fn compare_case_outputs(
     tokens_per_case: usize,
     num_layers: usize,
     top_k: usize,
+    num_experts: Option<usize>,
 ) -> Result<CaseComparisonEvidence, String> {
     if tokens_per_case == 0 {
         return Err("tokens_per_case must be greater than zero".to_string());
@@ -181,6 +198,7 @@ pub fn compare_case_outputs(
         tokens_per_case,
         num_layers,
         top_k,
+        num_experts,
     )?;
     validate_route_shape(
         case,
@@ -189,6 +207,7 @@ pub fn compare_case_outputs(
         tokens_per_case,
         num_layers,
         top_k,
+        num_experts,
     )?;
 
     let exact_token_matches = reference_token_ids
@@ -209,27 +228,65 @@ pub fn compare_case_outputs(
             preceding_generated_ids: reference_token_ids[..generated_position].to_vec(),
         });
 
-    let mut first_expert_id_mismatch = None;
-    'positions: for generated_position in 0..tokens_per_case {
+    let mut first_expert_id_set_mismatch = None;
+    let mut first_expert_id_rank_order_drift = None;
+    let mut rank_order_drift_count = 0usize;
+    let mut expert_id_rank_order_match = true;
+    for generated_position in 0..tokens_per_case {
         for layer in 0..num_layers {
             let reference = &reference_routes[generated_position][layer];
             let gpu_native = &gpu_native_routes[generated_position][layer];
-            if let Some(expert_slot) = reference
-                .iter()
-                .zip(gpu_native)
-                .position(|(reference_id, gpu_id)| reference_id != gpu_id)
-            {
-                first_expert_id_mismatch = Some(ExpertIdMismatchEvidence {
+            if reference == gpu_native {
+                continue;
+            }
+            expert_id_rank_order_match = false;
+            let mut canonical_reference = reference.clone();
+            canonical_reference.sort_unstable();
+            let mut canonical_gpu_native = gpu_native.clone();
+            canonical_gpu_native.sort_unstable();
+            if canonical_reference == canonical_gpu_native {
+                rank_order_drift_count = rank_order_drift_count
+                    .checked_add(1)
+                    .ok_or("rank_order_drift_count overflowed")?;
+                if first_expert_id_rank_order_drift.is_none() {
+                    let first_differing_rank_slot = reference
+                        .iter()
+                        .zip(gpu_native)
+                        .position(|(reference_id, gpu_id)| reference_id != gpu_id)
+                        .expect("different equal-length route lists have a differing slot");
+                    first_expert_id_rank_order_drift = Some(ExpertIdRankOrderDriftEvidence {
+                        case: case.to_string(),
+                        generated_position,
+                        layer,
+                        first_differing_rank_slot,
+                        reference_selected_expert_ids: reference.clone(),
+                        gpu_native_selected_expert_ids: gpu_native.clone(),
+                        canonical_reference_expert_ids: canonical_reference,
+                        canonical_gpu_native_expert_ids: canonical_gpu_native,
+                    });
+                }
+            } else if first_expert_id_set_mismatch.is_none() {
+                let reference_only_expert_ids = canonical_reference
+                    .iter()
+                    .copied()
+                    .filter(|id| canonical_gpu_native.binary_search(id).is_err())
+                    .collect();
+                let gpu_native_only_expert_ids = canonical_gpu_native
+                    .iter()
+                    .copied()
+                    .filter(|id| canonical_reference.binary_search(id).is_err())
+                    .collect();
+                first_expert_id_set_mismatch = Some(ExpertIdSetMismatchEvidence {
                     case: case.to_string(),
                     generated_position,
                     layer,
-                    expert_slot,
-                    reference_expert_id: reference.get(expert_slot).copied(),
-                    gpu_native_expert_id: gpu_native.get(expert_slot).copied(),
                     reference_selected_expert_ids: reference.clone(),
                     gpu_native_selected_expert_ids: gpu_native.clone(),
+                    canonical_reference_expert_ids: canonical_reference,
+                    canonical_gpu_native_expert_ids: canonical_gpu_native,
+                    reference_only_expert_ids,
+                    gpu_native_only_expert_ids,
                 });
-                break 'positions;
             }
         }
     }
@@ -238,12 +295,15 @@ pub fn compare_case_outputs(
         exact_token_matches,
         token_ids_match: first_token_mismatch.is_none(),
         first_token_mismatch,
-        expert_id_topology_match: first_expert_id_mismatch.is_none(),
+        expert_id_selection_set_match: first_expert_id_set_mismatch.is_none(),
+        first_expert_id_set_mismatch,
+        expert_id_rank_order_match,
+        rank_order_drift_count,
+        first_expert_id_rank_order_drift,
         routing_positions_compared: tokens_per_case,
         routing_layer_comparisons: tokens_per_case
             .checked_mul(num_layers)
             .ok_or("routing comparison count overflowed")?,
-        first_expert_id_mismatch,
     })
 }
 
@@ -254,6 +314,7 @@ fn validate_route_shape(
     tokens_per_case: usize,
     num_layers: usize,
     top_k: usize,
+    num_experts: Option<usize>,
 ) -> Result<(), String> {
     if routes.len() != tokens_per_case {
         return Err(format!(
@@ -274,6 +335,28 @@ fn validate_route_shape(
                     "case {case} {plane} position {position} layer {layer} selected {} experts, expected {top_k}",
                     selected.len()
                 ));
+            }
+            let mut canonical_selected = selected.clone();
+            canonical_selected.sort_unstable();
+            if let Some(duplicate) = canonical_selected
+                .windows(2)
+                .find(|pair| pair[0] == pair[1])
+                .map(|pair| pair[0])
+            {
+                return Err(format!(
+                    "case {case} {plane} position {position} layer {layer} selected duplicate expert ID {duplicate}"
+                ));
+            }
+            if let Some(num_experts) = num_experts {
+                if let Some(invalid) = canonical_selected
+                    .iter()
+                    .copied()
+                    .find(|&id| id as usize >= num_experts)
+                {
+                    return Err(format!(
+                        "case {case} {plane} position {position} layer {layer} selected expert ID {invalid}, outside num_experts={num_experts}"
+                    ));
+                }
             }
         }
     }
@@ -367,7 +450,7 @@ pub struct QualificationChecks {
     pub hardware_adapter: bool,
     pub exact_case_and_token_totals: bool,
     pub exact_generated_token_ids: bool,
-    pub expert_id_topology_match: bool,
+    pub expert_id_selection_set_match: bool,
     pub reference_routing_replays_match: bool,
     pub residency_misses_fully_serviced: bool,
     pub zero_fallback_degraded_or_fatal_evidence: bool,
@@ -386,7 +469,7 @@ impl QualificationChecks {
             && self.hardware_adapter
             && self.exact_case_and_token_totals
             && self.exact_generated_token_ids
-            && self.expert_id_topology_match
+            && self.expert_id_selection_set_match
             && self.reference_routing_replays_match
             && self.residency_misses_fully_serviced
             && self.zero_fallback_degraded_or_fatal_evidence
@@ -418,10 +501,13 @@ pub struct GpuNativeGreedyParityReport {
     pub total_tokens_compared: usize,
     pub exact_token_matches: usize,
     pub first_token_mismatch: Option<TokenMismatchEvidence>,
-    pub expert_id_topology_match: bool,
+    pub expert_id_selection_set_match: bool,
+    pub first_expert_id_set_mismatch: Option<ExpertIdSetMismatchEvidence>,
+    pub expert_id_rank_order_match: bool,
+    pub rank_order_drift_count: usize,
+    pub first_expert_id_rank_order_drift: Option<ExpertIdRankOrderDriftEvidence>,
     pub routing_positions_compared: usize,
     pub routing_layer_comparisons: usize,
-    pub first_expert_id_mismatch: Option<ExpertIdMismatchEvidence>,
     pub fallback_degraded_evidence: FallbackDegradedEvidence,
     pub token_loop_counter_deltas: GpuNativeTokenLoopSnapshot,
     pub residency: ResidencyEvidence,
@@ -461,10 +547,13 @@ impl GpuNativeGreedyParityReport {
             total_tokens_compared: 0,
             exact_token_matches: 0,
             first_token_mismatch: None,
-            expert_id_topology_match: true,
+            expert_id_selection_set_match: true,
+            first_expert_id_set_mismatch: None,
+            expert_id_rank_order_match: true,
+            rank_order_drift_count: 0,
+            first_expert_id_rank_order_drift: None,
             routing_positions_compared: 0,
             routing_layer_comparisons: 0,
-            first_expert_id_mismatch: None,
             fallback_degraded_evidence: FallbackDegradedEvidence {
                 all_model_loads_strict_complete: true,
                 all_requests_completed_expected_tokens: true,
@@ -477,6 +566,7 @@ impl GpuNativeGreedyParityReport {
     }
 
     pub fn fail(&mut self, failure: QualificationFailure) {
+        self.derive_checks();
         self.qualification_pass = false;
         self.failure = Some(failure);
     }
@@ -533,6 +623,7 @@ impl GpuNativeGreedyParityReport {
             self.tokens_per_case,
             geometry.num_layers,
             geometry.top_k,
+            Some(geometry.num_experts),
         )?;
         if recomputed_comparison != case.comparison {
             return Err(format!(
@@ -559,10 +650,20 @@ impl GpuNativeGreedyParityReport {
         if self.first_token_mismatch.is_none() {
             self.first_token_mismatch = case.comparison.first_token_mismatch.clone();
         }
-        if self.first_expert_id_mismatch.is_none() {
-            self.first_expert_id_mismatch = case.comparison.first_expert_id_mismatch.clone();
+        if self.first_expert_id_set_mismatch.is_none() {
+            self.first_expert_id_set_mismatch =
+                case.comparison.first_expert_id_set_mismatch.clone();
         }
-        self.expert_id_topology_match &= case.comparison.expert_id_topology_match;
+        self.expert_id_selection_set_match &= case.comparison.expert_id_selection_set_match;
+        if self.first_expert_id_rank_order_drift.is_none() {
+            self.first_expert_id_rank_order_drift =
+                case.comparison.first_expert_id_rank_order_drift.clone();
+        }
+        self.expert_id_rank_order_match &= case.comparison.expert_id_rank_order_match;
+        self.rank_order_drift_count = self
+            .rank_order_drift_count
+            .checked_add(case.comparison.rank_order_drift_count)
+            .ok_or("rank_order_drift_count overflowed")?;
         self.accumulate_fallback_evidence(&case)?;
         self.token_loop_counter_deltas = checked_add_snapshots(
             self.token_loop_counter_deltas,
@@ -665,25 +766,24 @@ impl GpuNativeGreedyParityReport {
                 ),
             ));
         }
-        if let Some(mismatch) = &self.first_expert_id_mismatch {
+        if let Some(mismatch) = &self.first_expert_id_set_mismatch {
             return Some(QualificationFailure::new(
                 FailureStage::Postcondition,
-                "expert-id-topology-mismatch",
+                "expert-id-selection-set-mismatch",
                 format!(
-                    "case {} generated position {} layer {} expert slot {}: reference={:?} gpu_native={:?}",
+                    "case {} generated position {} layer {}: reference_only={:?} gpu_native_only={:?}",
                     mismatch.case,
                     mismatch.generated_position,
                     mismatch.layer,
-                    mismatch.expert_slot,
-                    mismatch.reference_expert_id,
-                    mismatch.gpu_native_expert_id
+                    mismatch.reference_only_expert_ids,
+                    mismatch.gpu_native_only_expert_ids
                 ),
             ));
         }
         None
     }
 
-    pub fn finalize(&mut self) -> Result<(), QualificationFailure> {
+    fn derive_checks(&mut self) {
         let clean_build_provenance = self
             .build_provenance
             .git_sha
@@ -715,8 +815,8 @@ impl GpuNativeGreedyParityReport {
             exact_case_and_token_totals,
             exact_generated_token_ids: self.exact_token_matches == self.total_tokens_expected
                 && self.first_token_mismatch.is_none(),
-            expert_id_topology_match: self.expert_id_topology_match
-                && self.first_expert_id_mismatch.is_none()
+            expert_id_selection_set_match: self.expert_id_selection_set_match
+                && self.first_expert_id_set_mismatch.is_none()
                 && self.routing_positions_compared == self.total_tokens_expected
                 && self.model_geometry.is_some_and(|geometry| {
                     self.routing_layer_comparisons
@@ -725,17 +825,21 @@ impl GpuNativeGreedyParityReport {
                             .checked_mul(geometry.num_layers)
                             .unwrap_or(usize::MAX)
                 }),
-            reference_routing_replays_match: self.cases.iter().all(|case| {
-                case.reference_routing_replay
-                    .matches_authoritative_reference
-            }),
-            residency_misses_fully_serviced: self.residency.miss_attempts
-                == self.residency.services
+            reference_routing_replays_match: !self.cases.is_empty()
+                && self.cases.iter().all(|case| {
+                    case.reference_routing_replay
+                        .matches_authoritative_reference
+                }),
+            residency_misses_fully_serviced: !self.cases.is_empty()
+                && self.residency.miss_attempts == self.residency.services
                 && self.residency.replay_attempts == self.residency.miss_attempts,
-            zero_fallback_degraded_or_fatal_evidence: self
-                .fallback_degraded_evidence
-                .passes(&self.source_config),
+            zero_fallback_degraded_or_fatal_evidence: !self.cases.is_empty()
+                && self.fallback_degraded_evidence.passes(&self.source_config),
         };
+    }
+
+    pub fn finalize(&mut self) -> Result<(), QualificationFailure> {
+        self.derive_checks();
 
         if let Some(failure) = self.semantic_failure() {
             self.fail(failure.clone());
@@ -847,6 +951,7 @@ mod tests {
         let report = test_report();
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["schema_version"], SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, "mer.gpu-native-q4-greedy-parity.v2");
         assert_eq!(value["mode"], MODE);
         assert_eq!(value["tokens_per_case"], 16);
         assert_eq!(value["total_tokens_expected"], 64);
@@ -866,6 +971,39 @@ mod tests {
             report.failure.as_ref().map(|failure| failure.code.as_str()),
             Some("candidate-failed")
         );
+    }
+
+    #[test]
+    fn failed_report_derives_known_checks_without_passing_incomplete_totals() {
+        let mut report = test_report();
+        report.actual_adapter = Some(GpuDeviceIdentity {
+            name: "NVIDIA L4".to_string(),
+            vendor_id: 0x10de,
+            device_id: 0,
+            device_type: "DiscreteGpu".to_string(),
+            wgpu_backend: "Vulkan".to_string(),
+            driver: "NVIDIA".to_string(),
+            driver_info: "test".to_string(),
+            compute_plane: "gpu-native".to_string(),
+            software_adapter: false,
+        });
+        report.fail(QualificationFailure::new(
+            FailureStage::Postcondition,
+            "candidate-failed",
+            "test failure after adapter selection",
+        ));
+
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["checks"]["clean_build_provenance"], true);
+        assert_eq!(value["checks"]["source_config_strict"], true);
+        assert_eq!(value["checks"]["fixed_corpus_identity"], true);
+        assert_eq!(value["checks"]["fixed_greedy_sampling"], true);
+        assert_eq!(value["checks"]["adapter_exact_match"], true);
+        assert_eq!(value["checks"]["hardware_adapter"], true);
+        assert_eq!(value["checks"]["exact_case_and_token_totals"], false);
+        assert_eq!(value["checks"]["exact_generated_token_ids"], false);
+        assert_eq!(value["checks"]["expert_id_selection_set_match"], false);
+        assert_eq!(value["qualification_pass"], false);
     }
 
     fn test_report() -> GpuNativeGreedyParityReport {
@@ -895,11 +1033,14 @@ mod tests {
             16,
             2,
             2,
+            Some(10_000),
         )
         .unwrap();
         assert_eq!(comparison.exact_token_matches, 16);
         assert!(comparison.token_ids_match);
-        assert!(comparison.expert_id_topology_match);
+        assert!(comparison.expert_id_selection_set_match);
+        assert!(comparison.expert_id_rank_order_match);
+        assert_eq!(comparison.rank_order_drift_count, 0);
         assert_eq!(comparison.routing_layer_comparisons, 32);
     }
 
@@ -919,6 +1060,7 @@ mod tests {
             16,
             1,
             2,
+            Some(10_000),
         )
         .unwrap();
         let mismatch = comparison.first_token_mismatch.unwrap();
@@ -931,29 +1073,140 @@ mod tests {
     }
 
     #[test]
-    fn first_expert_id_mismatch_is_selected_in_token_layer_slot_order() {
-        let tokens: Vec<u32> = (0..16).collect();
-        let reference_routes = routes(16, 3, 2);
-        let mut gpu_routes = reference_routes.clone();
-        gpu_routes[4][2][1] ^= 1;
-        gpu_routes[8][0][0] ^= 1;
+    fn pure_rank_permutation_is_informational_and_not_a_semantic_failure() {
+        let tokens = vec![42];
+        let reference_routes = vec![vec![vec![30, 37, 114, 86, 29, 68, 113, 35]]];
+        let gpu_routes = vec![vec![vec![30, 37, 114, 86, 29, 113, 68, 35]]];
         let comparison = compare_case_outputs(
-            "json-transformation",
+            "rust-generation",
             &[1],
             &tokens,
             &tokens,
             &reference_routes,
             &gpu_routes,
-            16,
-            3,
-            2,
+            1,
+            1,
+            8,
+            Some(128),
         )
         .unwrap();
-        let mismatch = comparison.first_expert_id_mismatch.unwrap();
-        assert_eq!(mismatch.generated_position, 4);
-        assert_eq!(mismatch.layer, 2);
-        assert_eq!(mismatch.expert_slot, 1);
-        assert!(!comparison.expert_id_topology_match);
+        assert!(comparison.token_ids_match);
+        assert!(comparison.expert_id_selection_set_match);
+        assert!(comparison.first_expert_id_set_mismatch.is_none());
+        assert!(!comparison.expert_id_rank_order_match);
+        assert_eq!(comparison.rank_order_drift_count, 1);
+        let drift = comparison
+            .first_expert_id_rank_order_drift
+            .as_ref()
+            .unwrap();
+        assert_eq!(drift.generated_position, 0);
+        assert_eq!(drift.layer, 0);
+        assert_eq!(drift.first_differing_rank_slot, 5);
+        assert_eq!(
+            drift.canonical_reference_expert_ids,
+            vec![29, 30, 35, 37, 68, 86, 113, 114]
+        );
+        assert_eq!(
+            drift.canonical_gpu_native_expert_ids,
+            drift.canonical_reference_expert_ids
+        );
+
+        let mut report = test_report();
+        report.first_token_mismatch = comparison.first_token_mismatch.clone();
+        report.first_expert_id_set_mismatch = comparison.first_expert_id_set_mismatch.clone();
+        assert!(report.semantic_failure().is_none());
+    }
+
+    #[test]
+    fn true_membership_change_fails_closed_with_set_difference_evidence() {
+        let tokens = vec![42];
+        let reference_routes = vec![vec![vec![30, 37, 114, 86, 29, 68, 113, 35]]];
+        let gpu_routes = vec![vec![vec![30, 37, 114, 86, 29, 64, 113, 35]]];
+        let comparison = compare_case_outputs(
+            "rust-generation",
+            &[1],
+            &tokens,
+            &tokens,
+            &reference_routes,
+            &gpu_routes,
+            1,
+            1,
+            8,
+            Some(128),
+        )
+        .unwrap();
+        assert!(!comparison.expert_id_selection_set_match);
+        assert_eq!(comparison.rank_order_drift_count, 0);
+        let mismatch = comparison.first_expert_id_set_mismatch.as_ref().unwrap();
+        assert_eq!(mismatch.reference_only_expert_ids, vec![68]);
+        assert_eq!(mismatch.gpu_native_only_expert_ids, vec![64]);
+
+        let mut report = test_report();
+        report.first_expert_id_set_mismatch = comparison.first_expert_id_set_mismatch.clone();
+        let failure = report.semantic_failure().unwrap();
+        assert_eq!(failure.code, "expert-id-selection-set-mismatch");
+    }
+
+    #[test]
+    fn duplicate_and_out_of_range_expert_ids_are_rejected() {
+        let tokens = vec![42];
+        let duplicate_routes = vec![vec![vec![30, 30]]];
+        let duplicate_error = compare_case_outputs(
+            "case",
+            &[1],
+            &tokens,
+            &tokens,
+            &duplicate_routes,
+            &duplicate_routes,
+            1,
+            1,
+            2,
+            Some(128),
+        )
+        .unwrap_err();
+        assert!(duplicate_error.contains("duplicate expert ID 30"));
+
+        let out_of_range_routes = vec![vec![vec![30, 128]]];
+        let range_error = compare_case_outputs(
+            "case",
+            &[1],
+            &tokens,
+            &tokens,
+            &out_of_range_routes,
+            &out_of_range_routes,
+            1,
+            1,
+            2,
+            Some(128),
+        )
+        .unwrap_err();
+        assert!(range_error.contains("outside num_experts=128"));
+    }
+
+    #[test]
+    fn token_mismatch_fails_even_when_expert_membership_matches() {
+        let reference_routes = vec![vec![vec![30, 37]]];
+        let gpu_routes = vec![vec![vec![37, 30]]];
+        let comparison = compare_case_outputs(
+            "case",
+            &[1],
+            &[42],
+            &[43],
+            &reference_routes,
+            &gpu_routes,
+            1,
+            1,
+            2,
+            Some(128),
+        )
+        .unwrap();
+        assert!(comparison.expert_id_selection_set_match);
+
+        let mut report = test_report();
+        report.first_token_mismatch = comparison.first_token_mismatch.clone();
+        report.first_expert_id_set_mismatch = comparison.first_expert_id_set_mismatch.clone();
+        let failure = report.semantic_failure().unwrap();
+        assert_eq!(failure.code, "generated-token-mismatch");
     }
 
     #[test]
@@ -985,11 +1238,20 @@ mod tests {
     #[test]
     fn zero_or_incomplete_token_configuration_fails_closed() {
         let route = routes(16, 1, 1);
-        assert!(compare_case_outputs("case", &[1], &[], &[], &[], &[], 0, 1, 1).is_err());
-        assert!(
-            compare_case_outputs("case", &[1], &[1; 15], &[1; 16], &route, &route, 16, 1, 1,)
-                .is_err()
-        );
+        assert!(compare_case_outputs("case", &[1], &[], &[], &[], &[], 0, 1, 1, None).is_err());
+        assert!(compare_case_outputs(
+            "case",
+            &[1],
+            &[1; 15],
+            &[1; 16],
+            &route,
+            &route,
+            16,
+            1,
+            1,
+            None,
+        )
+        .is_err());
     }
 
     #[test]
