@@ -845,6 +845,30 @@ fn classify_gpu_native_status(
     }
 }
 
+fn authoritative_actual_routes<'a>(
+    report: &'a GpuNativeBoundaryReport,
+    segment: &GpuNativeExecutionSegment,
+) -> Result<Option<&'a [Vec<u32>]>, GpuNativeTokenLoopError> {
+    if report
+        .first_failure_layer_in(segment.attempted_layers.clone())?
+        .is_some()
+        || !segment.completes_token
+    {
+        return Ok(None);
+    }
+
+    match classify_gpu_native_status(report.final_status, None) {
+        Ok(GpuNativeStatusDisposition::Clean) => Ok(Some(&report.selected_ids)),
+        Ok(GpuNativeStatusDisposition::RetryableResidencyMiss) => {
+            Err(GpuNativeTokenLoopError::FatalNumericalFailure {
+                layer_index: None,
+                status_bits: report.final_status,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Persistent per-layer plans and handles for one Qwen3-MoE transformer layer.
 pub struct GpuNativeLayerPlan {
     pub layer_index: usize,
@@ -2324,24 +2348,18 @@ impl GpuNativeTokenLoop {
                 }
             }
 
-            if !segment.completes_token {
-                continue;
-            }
-
-            match classify_gpu_native_status(report.final_status, None) {
-                Ok(GpuNativeStatusDisposition::Clean) => {}
-                Ok(GpuNativeStatusDisposition::RetryableResidencyMiss) => {
-                    self.counters.fatal_failures.fetch_add(1, Ordering::Relaxed);
-                    return Err(GpuNativeTokenLoopError::FatalNumericalFailure {
-                        layer_index: None,
-                        status_bits: report.final_status,
-                    });
-                }
+            let selected_ids = match authoritative_actual_routes(report, &segment) {
+                Ok(Some(selected_ids)) => selected_ids,
+                Ok(None) => continue,
                 Err(error) => {
                     self.counters.fatal_failures.fetch_add(1, Ordering::Relaxed);
                     return Err(error);
                 }
-            }
+            };
+
+            engine
+                .record_gpu_native_actual_routes(selected_ids)
+                .map_err(GpuNativeTokenLoopError::ResidencyServiceFailed)?;
 
             request.committed_position += 1;
             self.counters
@@ -2352,8 +2370,6 @@ impl GpuNativeTokenLoop {
                     .warm_tokens_completed
                     .fetch_add(1, Ordering::Relaxed);
             }
-
-            engine.record_gpu_native_actual_routes(&report.selected_ids);
 
             return Ok(GpuNativeStepOutput {
                 sampled_token: if sample {
@@ -3697,6 +3713,53 @@ pub(crate) mod tests {
         assert_eq!(report.first_failure_layer_in(1..3).unwrap(), None);
         assert_eq!(report.first_failure_layer_in(2..4).unwrap(), Some(3));
         assert!(report.first_failure_layer_in(4..4).is_err());
+    }
+
+    #[test]
+    fn only_one_completed_clean_attempt_authorizes_actual_route_recency() {
+        let failed_attempt = GpuNativeBoundaryReport {
+            layer_statuses: vec![GPU_NATIVE_STATUS_RETRYABLE_MASK, 0, 0, 0],
+            selected_ids: vec![vec![0, 1]; 4],
+            final_status: GPU_NATIVE_STATUS_RETRYABLE_MASK,
+            sampled_token: 9,
+        };
+        let incomplete_attempt = GpuNativeBoundaryReport {
+            layer_statuses: vec![0; 4],
+            selected_ids: vec![vec![1, 0]; 4],
+            final_status: 0,
+            sampled_token: 10,
+        };
+        let completed_attempt = GpuNativeBoundaryReport {
+            layer_statuses: vec![0; 4],
+            selected_ids: vec![vec![2, 3]; 4],
+            final_status: 0,
+            sampled_token: 11,
+        };
+        let fresh = GpuNativeExecutionSegment::fresh(4).unwrap();
+        let incomplete = GpuNativeRecoveryCursor::after_serviced_miss(4, recovery_miss(0))
+            .unwrap()
+            .plan(4)
+            .unwrap();
+        assert!(!incomplete.completes_token);
+
+        let mut recency_invocations = 0;
+        for (report, segment) in [
+            (&failed_attempt, &fresh),
+            (&incomplete_attempt, &incomplete),
+            (&completed_attempt, &fresh),
+        ] {
+            if authoritative_actual_routes(report, segment)
+                .unwrap()
+                .is_some()
+            {
+                recency_invocations += 1;
+            }
+        }
+        assert_eq!(recency_invocations, 1);
+        assert_eq!(
+            authoritative_actual_routes(&completed_attempt, &fresh).unwrap(),
+            Some(completed_attempt.selected_ids.as_slice())
+        );
     }
 
     #[test]

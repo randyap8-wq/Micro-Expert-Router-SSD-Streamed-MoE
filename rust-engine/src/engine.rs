@@ -2958,12 +2958,21 @@ impl Engine {
             .map(|manager| manager.snapshot())
     }
 
-    /// Record actual GPU-native route selections across layers into the engine's
-    /// route observation and prefetch infrastructure without requiring CPU hidden state.
+    /// Record exact routes from one successfully completed GPU-native token.
+    /// Physical residency recency is touched synchronously before the existing
+    /// route observation and prefetch infrastructure is updated. The touch path
+    /// never loads or installs an expert and does not mutate logical-cache
+    /// recency.
     pub(crate) fn record_gpu_native_actual_routes(
         self: &Arc<Self>,
         selected_ids_by_layer: &[Vec<u32>],
-    ) {
+    ) -> Result<(), GpuNativeDemandResidencyError> {
+        self.core
+            .gpu_native_residency
+            .as_ref()
+            .ok_or(GpuNativeDemandResidencyError::ManagerNotInstalled)?
+            .touch_actual_routes(selected_ids_by_layer)?;
+
         self.core.governor.refresh();
         let per_layer_opt = self.core.storage.config().num_experts_per_layer;
 
@@ -3034,6 +3043,7 @@ impl Engine {
                 };
             }
         }
+        Ok(())
     }
 
     /// Attach the logical GPU-admission cache — Phase 2 hierarchy policy.
@@ -7024,6 +7034,19 @@ mod tests {
         let engine = build_engine(&dir.path, 4, 8, 8, 2, 1, 1, 17);
         assert!(engine.core.gpu_native_residency.is_none());
         assert!(engine.gpu_native_residency_snapshot().is_none());
+    }
+
+    #[test]
+    fn gpu_native_actual_route_recording_fails_before_observers_without_manager() {
+        let dir = TempDir::new("gpu-native-actual-route-manager-required");
+        let engine = build_engine(&dir.path, 4, 8, 8, 2, 1, 1, 19);
+        let before = engine.routed_expert_execution_snapshot();
+
+        assert_eq!(
+            engine.record_gpu_native_actual_routes(&[vec![0]]),
+            Err(GpuNativeDemandResidencyError::ManagerNotInstalled)
+        );
+        assert_eq!(engine.routed_expert_execution_snapshot(), before);
     }
 
     fn rebuild_with_speculator(

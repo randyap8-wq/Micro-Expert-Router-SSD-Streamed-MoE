@@ -50,6 +50,28 @@ pub(crate) enum GpuNativeTieredResidencyError {
     DuplicateDemandExpert {
         global_id: u32,
     },
+    ActualRouteLayerCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    ActualRouteTopKCountMismatch {
+        layer_index: usize,
+        expected: usize,
+        actual: usize,
+    },
+    DuplicateActualRouteExpert {
+        layer_index: usize,
+        local_expert_id: u32,
+    },
+    ActualRouteIdentityMismatch {
+        layer_index: usize,
+        local_expert_id: u32,
+        global_id: u32,
+        expected_global_id: u32,
+    },
+    ActualRoutePhysicalIdentityMismatch {
+        global_id: u32,
+    },
     DemandLayerMismatch {
         requested_layer: usize,
         global_id: u32,
@@ -99,6 +121,11 @@ impl fmt::Display for GpuNativeTieredResidencyError {
             Self::ModelBudgetOverflow => f.write_str("model-wide GPU-native expert budget arithmetic overflowed"),
             Self::ModelBudgetTooSmall { requested_bytes, minimum_bytes } => write!(f, "model-wide expert budget {requested_bytes} bytes is below the executable minimum {minimum_bytes} bytes"),
             Self::DuplicateDemandExpert { global_id } => write!(f, "demand set repeats global expert {global_id}"),
+            Self::ActualRouteLayerCountMismatch { expected, actual } => write!(f, "actual routes contain {actual} layers, expected {expected}"),
+            Self::ActualRouteTopKCountMismatch { layer_index, expected, actual } => write!(f, "actual routes for layer {layer_index} contain {actual} experts, expected {expected}"),
+            Self::DuplicateActualRouteExpert { layer_index, local_expert_id } => write!(f, "actual routes for layer {layer_index} repeat local expert {local_expert_id}"),
+            Self::ActualRouteIdentityMismatch { layer_index, local_expert_id, global_id, expected_global_id } => write!(f, "actual-route identity layer={layer_index} local={local_expert_id} supplied global expert {global_id}, expected {expected_global_id}"),
+            Self::ActualRoutePhysicalIdentityMismatch { global_id } => write!(f, "physical residency metadata does not match actual-route global expert {global_id}"),
             Self::DemandLayerMismatch { requested_layer, global_id, actual_layer } => write!(f, "demand for layer {requested_layer} contains global expert {global_id} from layer {actual_layer}"),
             Self::DemandSetExceedsLayerCapacity { requested, capacity } => write!(f, "demand set of {requested} experts exceeds physical layer capacity {capacity}"),
             Self::DemandSourceMissing { global_id } => write!(f, "physical miss for global expert {global_id} has no RAM/logical-admission source"),
@@ -427,6 +454,10 @@ struct TieredResidencyCounters {
     speculative_vram_hits: AtomicU64,
     speculative_ram_to_vram_installs: AtomicU64,
     speculative_dropped_capacity_or_pressure: AtomicU64,
+    actual_route_touch_requests: AtomicU64,
+    actual_route_physical_touches: AtomicU64,
+    actual_route_physical_misses: AtomicU64,
+    actual_route_stale_rejections: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -455,7 +486,18 @@ pub(crate) struct GpuNativeTieredResidencySnapshot {
     pub(crate) speculative_vram_hits: u64,
     pub(crate) speculative_ram_to_vram_installs: u64,
     pub(crate) speculative_dropped_capacity_or_pressure: u64,
+    pub(crate) actual_route_touch_requests: u64,
+    pub(crate) actual_route_physical_touches: u64,
+    pub(crate) actual_route_physical_misses: u64,
+    pub(crate) actual_route_stale_rejections: u64,
     pub(crate) layers: Vec<GpuNativeTieredLayerSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActualRoutePhysicalTouch {
+    Touched,
+    Miss,
+    StaleRejected,
 }
 
 /// Model-scoped owner of the preallocated per-layer Q4 expert arenas.
@@ -729,6 +771,55 @@ impl GpuNativeTieredResidencyManager {
         Ok(GpuNativeSpeculativeInstall::Installed(residency))
     }
 
+    /// Touch only the exact physical experts selected by one successfully
+    /// completed GPU-native token. The full route shape and every
+    /// layer/local/global identity are validated before the first LRU change.
+    ///
+    /// This path never acquires a source, admits a logical resident, installs
+    /// physical bytes, changes a generation, or invokes speculative policy.
+    /// Missing and stale physical identities are observations only. Within a
+    /// layer, routes are touched in reverse selected order because `LruCache`
+    /// makes the last touch most-recent; rank 0 therefore remains the MRU of
+    /// the exact top-k set.
+    pub(crate) fn touch_actual_routes(
+        &self,
+        selected_ids_by_layer: &[Vec<u32>],
+    ) -> Result<(), GpuNativeTieredResidencyError> {
+        let global_ids_by_layer = validate_actual_routes(
+            selected_ids_by_layer,
+            self.plan.num_layers(),
+            self.plan.geometry().num_experts() as u32,
+            self.plan.geometry().top_k(),
+        )?;
+
+        for (layer_index, global_ids) in global_ids_by_layer.iter().enumerate() {
+            let layer = &self.layers[layer_index];
+            let local_ids = &selected_ids_by_layer[layer_index];
+            let mut state = layer.state.lock();
+            for rank in (0..global_ids.len()).rev() {
+                let global_id = global_ids[rank];
+                let local_expert_id = local_ids[rank];
+                let outcome = touch_lru_record(&mut state.residents, global_id, |record| {
+                    if record.key.layer_index() != layer_index
+                        || record.key.expert_id() != local_expert_id
+                        || record.residency.key() != record.key
+                    {
+                        return Err(
+                            GpuNativeTieredResidencyError::ActualRoutePhysicalIdentityMismatch {
+                                global_id,
+                            },
+                        );
+                    }
+                    Ok(self
+                        .gpu_cache
+                        .contains_generation(global_id, record.key.logical_generation()))
+                })?;
+                self.record_actual_route_touch(outcome);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn snapshot(&self) -> GpuNativeTieredResidencySnapshot {
         let layers = self
             .layers
@@ -769,6 +860,22 @@ impl GpuNativeTieredResidencyManager {
             speculative_dropped_capacity_or_pressure: self
                 .counters
                 .speculative_dropped_capacity_or_pressure
+                .load(Ordering::Relaxed),
+            actual_route_touch_requests: self
+                .counters
+                .actual_route_touch_requests
+                .load(Ordering::Relaxed),
+            actual_route_physical_touches: self
+                .counters
+                .actual_route_physical_touches
+                .load(Ordering::Relaxed),
+            actual_route_physical_misses: self
+                .counters
+                .actual_route_physical_misses
+                .load(Ordering::Relaxed),
+            actual_route_stale_rejections: self
+                .counters
+                .actual_route_stale_rejections
                 .load(Ordering::Relaxed),
             layers,
         }
@@ -955,6 +1062,129 @@ impl GpuNativeTieredResidencyManager {
             .speculative_dropped_capacity_or_pressure
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    fn record_actual_route_touch(&self, outcome: ActualRoutePhysicalTouch) {
+        self.counters
+            .actual_route_touch_requests
+            .fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            ActualRoutePhysicalTouch::Touched => {
+                self.counters
+                    .actual_route_physical_touches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ActualRoutePhysicalTouch::Miss => {
+                self.counters
+                    .actual_route_physical_misses
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ActualRoutePhysicalTouch::StaleRejected => {
+                self.counters
+                    .actual_route_stale_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .stale_generation_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn validate_actual_route_identity(
+    layer_index: usize,
+    local_expert_id: u32,
+    global_id: u32,
+    num_layers: usize,
+    experts_per_layer: u32,
+) -> Result<(), GpuNativeTieredResidencyError> {
+    let expected_global_id =
+        layer_local_to_global(layer_index, local_expert_id, num_layers, experts_per_layer)?;
+    if global_id != expected_global_id {
+        return Err(GpuNativeTieredResidencyError::ActualRouteIdentityMismatch {
+            layer_index,
+            local_expert_id,
+            global_id,
+            expected_global_id,
+        });
+    }
+    let identity = global_to_layer_local(global_id, num_layers, experts_per_layer)?;
+    if identity.layer_index != layer_index || identity.local_expert_id != local_expert_id {
+        return Err(GpuNativeTieredResidencyError::ActualRouteIdentityMismatch {
+            layer_index,
+            local_expert_id,
+            global_id,
+            expected_global_id,
+        });
+    }
+    Ok(())
+}
+
+fn validate_actual_routes(
+    selected_ids_by_layer: &[Vec<u32>],
+    num_layers: usize,
+    experts_per_layer: u32,
+    top_k: usize,
+) -> Result<Vec<Vec<u32>>, GpuNativeTieredResidencyError> {
+    if selected_ids_by_layer.len() != num_layers {
+        return Err(
+            GpuNativeTieredResidencyError::ActualRouteLayerCountMismatch {
+                expected: num_layers,
+                actual: selected_ids_by_layer.len(),
+            },
+        );
+    }
+
+    let mut global_ids_by_layer = Vec::with_capacity(num_layers);
+    for (layer_index, local_ids) in selected_ids_by_layer.iter().enumerate() {
+        if local_ids.len() != top_k {
+            return Err(
+                GpuNativeTieredResidencyError::ActualRouteTopKCountMismatch {
+                    layer_index,
+                    expected: top_k,
+                    actual: local_ids.len(),
+                },
+            );
+        }
+        let mut seen = HashSet::with_capacity(local_ids.len());
+        let mut global_ids = Vec::with_capacity(local_ids.len());
+        for &local_expert_id in local_ids {
+            if !seen.insert(local_expert_id) {
+                return Err(GpuNativeTieredResidencyError::DuplicateActualRouteExpert {
+                    layer_index,
+                    local_expert_id,
+                });
+            }
+            let global_id =
+                layer_local_to_global(layer_index, local_expert_id, num_layers, experts_per_layer)?;
+            validate_actual_route_identity(
+                layer_index,
+                local_expert_id,
+                global_id,
+                num_layers,
+                experts_per_layer,
+            )?;
+            global_ids.push(global_id);
+        }
+        global_ids_by_layer.push(global_ids);
+    }
+    Ok(global_ids_by_layer)
+}
+
+fn touch_lru_record<T, E>(
+    residents: &mut LruCache<u32, T>,
+    global_id: u32,
+    is_current: impl FnOnce(&T) -> Result<bool, E>,
+) -> Result<ActualRoutePhysicalTouch, E> {
+    let Some(record) = residents.peek(&global_id) else {
+        return Ok(ActualRoutePhysicalTouch::Miss);
+    };
+    if !is_current(record)? {
+        return Ok(ActualRoutePhysicalTouch::StaleRejected);
+    }
+    residents
+        .get(&global_id)
+        .expect("peeked actual-route physical record remains in the synchronous LRU");
+    Ok(ActualRoutePhysicalTouch::Touched)
 }
 
 fn oldest_unprotected<T>(cache: &LruCache<u32, T>, protected: &HashSet<u32>) -> Option<u32> {
@@ -1186,6 +1416,142 @@ mod tests {
         assert_eq!(
             other_layer.iter().map(|(&id, _)| id).collect::<Vec<_>>(),
             other_before
+        );
+    }
+
+    #[test]
+    fn actual_route_touch_promotes_existing_resident_and_preserves_rank_order() {
+        let mut residents = LruCache::unbounded();
+        residents.put(0, 10u64);
+        residents.put(1, 11u64);
+        residents.put(2, 12u64);
+
+        // Selected order is rank 0 then rank 1. Production reverses the touch
+        // iteration so rank 0 is the last touch and therefore the layer MRU.
+        for global_id in [0, 1].into_iter().rev() {
+            assert_eq!(
+                touch_lru_record(&mut residents, global_id, |_| Ok::<_, ()>(true)).unwrap(),
+                ActualRoutePhysicalTouch::Touched
+            );
+        }
+        assert_eq!(
+            residents.iter().map(|(&id, _)| id).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(residents.peek(&0), Some(&10));
+        assert_eq!(residents.peek(&1), Some(&11));
+    }
+
+    #[test]
+    fn actual_route_touch_keeps_used_resident_ahead_of_untouched_victim() {
+        let mut residents = LruCache::unbounded();
+        residents.put(0, 10u64);
+        residents.put(1, 11u64);
+        assert_eq!(oldest_unprotected(&residents, &HashSet::new()), Some(0));
+
+        assert_eq!(
+            touch_lru_record(&mut residents, 0, |_| Ok::<_, ()>(true)).unwrap(),
+            ActualRoutePhysicalTouch::Touched
+        );
+        assert_eq!(oldest_unprotected(&residents, &HashSet::new()), Some(1));
+        residents.pop(&1);
+        residents.put(2, 12);
+        assert!(residents.peek(&0).is_some());
+        assert!(residents.peek(&1).is_none());
+    }
+
+    #[test]
+    fn actual_route_miss_never_allocates_or_acquires_a_source() {
+        let mut residents = LruCache::unbounded();
+        residents.put(7, 70u64);
+        let before = residents
+            .iter()
+            .map(|(&id, &gen)| (id, gen))
+            .collect::<Vec<_>>();
+        let mut source_probes = 0;
+
+        assert_eq!(
+            touch_lru_record(&mut residents, 8, |_| {
+                source_probes += 1;
+                Ok::<_, ()>(true)
+            })
+            .unwrap(),
+            ActualRoutePhysicalTouch::Miss
+        );
+        assert_eq!(source_probes, 0);
+        assert_eq!(residents.len(), 1);
+        assert_eq!(
+            residents
+                .iter()
+                .map(|(&id, &gen)| (id, gen))
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn actual_route_stale_identity_is_not_touched_or_resurrected() {
+        let mut residents = LruCache::unbounded();
+        residents.put(7, 41u64);
+        residents.put(8, 42u64);
+        let before = residents
+            .iter()
+            .map(|(&id, &gen)| (id, gen))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            touch_lru_record(&mut residents, 7, |&physical_generation| {
+                Ok::<_, ()>(physical_generation == 99)
+            })
+            .unwrap(),
+            ActualRoutePhysicalTouch::StaleRejected
+        );
+        assert_eq!(residents.peek(&7), Some(&41));
+        assert_eq!(
+            residents
+                .iter()
+                .map(|(&id, &gen)| (id, gen))
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn actual_route_validation_fails_closed_for_layer_local_global_and_duplicates() {
+        assert!(matches!(
+            validate_actual_routes(&[vec![0, 1]], 2, 4, 2),
+            Err(GpuNativeTieredResidencyError::ActualRouteLayerCountMismatch { .. })
+        ));
+        assert!(matches!(
+            validate_actual_routes(&[vec![0, 4], vec![0, 1]], 2, 4, 2),
+            Err(GpuNativeTieredResidencyError::LocalExpertOutOfRange { .. })
+        ));
+        assert!(matches!(
+            validate_actual_route_identity(1, 2, 2, 2, 4),
+            Err(GpuNativeTieredResidencyError::ActualRouteIdentityMismatch {
+                expected_global_id: 6,
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_actual_routes(&[vec![0, 0], vec![0, 1]], 2, 4, 2),
+            Err(GpuNativeTieredResidencyError::DuplicateActualRouteExpert { .. })
+        ));
+
+        let mut residents = LruCache::unbounded();
+        residents.put(0, 10u64);
+        let before = residents
+            .iter()
+            .map(|(&id, &gen)| (id, gen))
+            .collect::<Vec<_>>();
+        let invalid = validate_actual_routes(&[vec![0, 0], vec![0, 1]], 2, 4, 2);
+        assert!(invalid.is_err());
+        assert_eq!(
+            residents
+                .iter()
+                .map(|(&id, &gen)| (id, gen))
+                .collect::<Vec<_>>(),
+            before
         );
     }
 }
