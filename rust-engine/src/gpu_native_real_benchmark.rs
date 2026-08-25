@@ -20,10 +20,11 @@ use crate::qualification::{
 use serde::Serialize;
 use std::path::PathBuf;
 
-pub(crate) const SCHEMA: &str = "mer.gpu-native-real-benchmark.v2";
+pub(crate) const SCHEMA: &str = "mer.gpu-native-real-benchmark.v3";
 pub(crate) const MODE: &str = "gpu-native-real-benchmark";
-pub(crate) const OPTIMIZATION: &str = "gpu-native-resumable-recovery-pr1";
+pub(crate) const OPTIMIZATION: &str = "gpu-native-actual-route-recency-pr1b";
 pub(crate) const BASELINE_COMMIT: &str = "db0664159fe4a57e5b630984b9229e233fa21487";
+pub(crate) const COMPARISON_COMMIT: &str = "a39c58062ce167773248d3fa5618ac5fd55e54ba";
 
 const EXPECTED_NUM_LAYERS: usize = 48;
 const EXPECTED_NUM_EXPERTS: usize = 128;
@@ -86,7 +87,7 @@ pub(crate) struct ProductionSemantics {
 }
 
 impl ProductionSemantics {
-    pub(crate) const fn resumable_recovery_pr1() -> Self {
+    pub(crate) const fn actual_route_recency_pr1b() -> Self {
         Self {
             production_inference_math_changed: false,
             production_q4_changed: false,
@@ -94,7 +95,7 @@ impl ProductionSemantics {
             production_attention_changed: false,
             production_rmsnorm_changed: false,
             production_lm_head_changed: false,
-            production_residency_policy_changed: false,
+            production_residency_policy_changed: true,
             production_replay_policy_changed: true,
             production_prefetch_policy_changed: false,
             diagnostic_trace_enabled: false,
@@ -729,6 +730,10 @@ pub(crate) struct GpuNativeResidencyDelta {
     pub(crate) speculative_vram_hits: u64,
     pub(crate) speculative_ram_to_vram_installs: u64,
     pub(crate) speculative_dropped_capacity_or_pressure: u64,
+    pub(crate) actual_route_touch_requests: u64,
+    pub(crate) actual_route_physical_touches: u64,
+    pub(crate) actual_route_physical_misses: u64,
+    pub(crate) actual_route_stale_rejections: u64,
 }
 
 fn gpu_native_residency_delta(
@@ -787,7 +792,86 @@ fn gpu_native_residency_delta(
             speculative_dropped_capacity_or_pressure,
             "gpu-native-residency"
         ),
+        actual_route_touch_requests: checked_delta!(
+            after,
+            before,
+            actual_route_touch_requests,
+            "gpu-native-residency"
+        ),
+        actual_route_physical_touches: checked_delta!(
+            after,
+            before,
+            actual_route_physical_touches,
+            "gpu-native-residency"
+        ),
+        actual_route_physical_misses: checked_delta!(
+            after,
+            before,
+            actual_route_physical_misses,
+            "gpu-native-residency"
+        ),
+        actual_route_stale_rejections: checked_delta!(
+            after,
+            before,
+            actual_route_stale_rejections,
+            "gpu-native-residency"
+        ),
     })
+}
+
+fn validate_actual_route_residency_postconditions(
+    completed_positions: u64,
+    residency: GpuNativeResidencyDelta,
+    storage: EngineStorageSnapshot,
+) -> Result<(), BenchmarkFailure> {
+    let expected_requests = completed_positions
+        .checked_mul(EXPECTED_NUM_LAYERS as u64)
+        .and_then(|value| value.checked_mul(EXPECTED_TOP_K as u64))
+        .ok_or_else(|| {
+            BenchmarkFailure::new(
+                "postcondition",
+                "actual-route-request-overflow",
+                "expected actual-route request count overflowed",
+            )
+        })?;
+    let classified_requests = residency
+        .actual_route_physical_touches
+        .checked_add(residency.actual_route_physical_misses)
+        .and_then(|value| value.checked_add(residency.actual_route_stale_rejections))
+        .ok_or_else(|| {
+            BenchmarkFailure::new(
+                "postcondition",
+                "actual-route-counter-overflow",
+                "actual-route touch outcome arithmetic overflowed",
+            )
+        })?;
+    if residency.actual_route_touch_requests != expected_requests
+        || residency.actual_route_touch_requests != classified_requests
+    {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "actual-route-counter-mismatch",
+            format!(
+                "expected {expected_requests} actual-route requests and exact request=touch+miss+stale arithmetic; observed {residency:?}"
+            ),
+        ));
+    }
+    if residency.speculative_requests != 0
+        || residency.speculative_vram_hits != 0
+        || residency.speculative_ram_to_vram_installs != 0
+        || residency.speculative_dropped_capacity_or_pressure != 0
+        || storage.prefetch_completed != 0
+    {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "speculative-prefetch-observed",
+            format!(
+                "PR1B-A benchmark requires zero speculative residency/prefetch activity; residency={residency:?} prefetch_completed={}",
+                storage.prefetch_completed
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1121,6 +1205,7 @@ pub(crate) struct BenchmarkReport {
     pub(crate) mode: &'static str,
     pub(crate) optimization: &'static str,
     pub(crate) baseline_commit: &'static str,
+    pub(crate) comparison_commit: &'static str,
     pub(crate) benchmark_complete: bool,
     pub(crate) failure: Option<BenchmarkFailure>,
     pub(crate) qualification_pass: bool,
@@ -1159,6 +1244,7 @@ impl BenchmarkReport {
             mode: MODE,
             optimization: OPTIMIZATION,
             baseline_commit: BASELINE_COMMIT,
+            comparison_commit: COMPARISON_COMMIT,
             benchmark_complete: false,
             failure: None,
             qualification_pass: false,
@@ -1178,7 +1264,7 @@ impl BenchmarkReport {
             aggregate: None,
             runtime_contract: None,
             production_configuration,
-            production_semantics: ProductionSemantics::resumable_recovery_pr1(),
+            production_semantics: ProductionSemantics::actual_route_recency_pr1b(),
         }
     }
 
@@ -1421,6 +1507,12 @@ impl RequestSnapshotStart {
             })?;
         let gpu_native_residency_delta =
             gpu_native_residency_delta(&self.gpu_native_residency, &gpu_native_residency_after)?;
+        let engine_storage_delta = engine_storage_after.checked_delta(self.engine_storage)?;
+        validate_actual_route_residency_postconditions(
+            token_loop_delta.tokens_completed,
+            gpu_native_residency_delta,
+            engine_storage_delta,
+        )?;
         Ok(RequestSnapshots {
             token_loop_before: self.token_loop,
             token_loop_after,
@@ -1440,7 +1532,7 @@ impl RequestSnapshotStart {
             runtime_cache_after: crate::greedy_parity_runtime_cache_snapshot(runtime),
             engine_storage_before: self.engine_storage,
             engine_storage_after,
-            engine_storage_delta: engine_storage_after.checked_delta(self.engine_storage)?,
+            engine_storage_delta,
             gpu_expert_io_before: self.gpu_expert_io,
             gpu_expert_io_after,
             gpu_expert_io_delta: gpu_io_delta(self.gpu_expert_io, gpu_expert_io_after)?,
@@ -2406,6 +2498,65 @@ mod tests {
     }
 
     #[test]
+    fn actual_route_counter_arithmetic_and_zero_speculation_are_exact() {
+        let residency = GpuNativeResidencyDelta {
+            actual_route_touch_requests: 768,
+            actual_route_physical_touches: 700,
+            actual_route_physical_misses: 60,
+            actual_route_stale_rejections: 8,
+            ..GpuNativeResidencyDelta::default()
+        };
+        assert!(validate_actual_route_residency_postconditions(
+            2,
+            residency,
+            EngineStorageSnapshot::default(),
+        )
+        .is_ok());
+
+        let mut bad_arithmetic = residency;
+        bad_arithmetic.actual_route_physical_misses -= 1;
+        assert_eq!(
+            validate_actual_route_residency_postconditions(
+                2,
+                bad_arithmetic,
+                EngineStorageSnapshot::default(),
+            )
+            .unwrap_err()
+            .code,
+            "actual-route-counter-mismatch"
+        );
+
+        let failed_attempt_was_touched = GpuNativeResidencyDelta {
+            actual_route_touch_requests: 1_152,
+            actual_route_physical_touches: 1_152,
+            ..GpuNativeResidencyDelta::default()
+        };
+        assert_eq!(
+            validate_actual_route_residency_postconditions(
+                2,
+                failed_attempt_was_touched,
+                EngineStorageSnapshot::default(),
+            )
+            .unwrap_err()
+            .code,
+            "actual-route-counter-mismatch"
+        );
+
+        let mut speculative = residency;
+        speculative.speculative_requests = 1;
+        assert_eq!(
+            validate_actual_route_residency_postconditions(
+                2,
+                speculative,
+                EngineStorageSnapshot::default(),
+            )
+            .unwrap_err()
+            .code,
+            "speculative-prefetch-observed"
+        );
+    }
+
+    #[test]
     fn recovery_delta_and_ratios_are_exact() {
         let before = GpuNativeRecoverySnapshot {
             resume_attempts: 2,
@@ -2795,7 +2946,7 @@ mod tests {
         assert!(!report.production_semantics.production_rmsnorm_changed);
         assert!(!report.production_semantics.production_lm_head_changed);
         assert!(
-            !report
+            report
                 .production_semantics
                 .production_residency_policy_changed
         );
@@ -2811,6 +2962,7 @@ mod tests {
         assert_eq!(json["schema"], SCHEMA);
         assert_eq!(json["optimization"], OPTIMIZATION);
         assert_eq!(json["baseline_commit"], BASELINE_COMMIT);
+        assert_eq!(json["comparison_commit"], COMPARISON_COMMIT);
         assert_eq!(
             json["production_semantics"]["production_replay_policy_changed"],
             true
