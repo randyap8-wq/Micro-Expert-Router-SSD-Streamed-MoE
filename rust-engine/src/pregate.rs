@@ -57,6 +57,14 @@ pub const PREGATE_PREFETCH_PROB: f64 = 0.9;
 /// Per-source frequency table over next-layer targets.
 type TargetTable = Mutex<HashMap<u32, u64>>;
 
+/// One read-only pre-gate candidate. `score` is an accumulated transition
+/// count, not a calibrated probability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreGatePrediction {
+    pub expert_id: u32,
+    pub score: u64,
+}
+
 /// Online layer-to-layer conditional expert predictor. See the module
 /// docs for the model.
 #[derive(Debug)]
@@ -115,7 +123,7 @@ impl PerLayerPreGate {
                 // linking an unrelated first layer onto a stale final-layer
                 // observation.
                 if prev.layer != u32::MAX && layer == prev.layer.wrapping_add(1) {
-                    self.record_transition(prev.layer, &prev.routed, routed);
+                    self.observe_transition(prev.layer, &prev.routed, routed);
                     self.score_prediction(&prev.predicted_next, routed);
                 }
             }
@@ -124,7 +132,11 @@ impl PerLayerPreGate {
             drop(last);
         }
 
-        let predicted = self.predict(layer, routed);
+        let predicted = self
+            .predict_ranked(layer, routed, self.top_n)
+            .into_iter()
+            .map(|candidate| candidate.expert_id)
+            .collect::<Vec<_>>();
 
         let mut last = self.last.lock();
         *last = Some(LastStep {
@@ -135,9 +147,11 @@ impl PerLayerPreGate {
         predicted
     }
 
-    /// Record `source_set` (layer `src_layer`) → `target_set`
-    /// (layer `src_layer + 1`) co-occurrences.
-    fn record_transition(&self, src_layer: u32, source_set: &[u32], target_set: &[u32]) {
+    /// Record one causally observed `src_layer -> src_layer + 1`
+    /// transition. This method performs no prediction, scoring, prefetch, or
+    /// external state change, which lets diagnostic callers enforce an
+    /// explicit predict -> score -> update order.
+    pub fn observe_transition(&self, src_layer: u32, source_set: &[u32], target_set: &[u32]) {
         let Some(layer_map) = self.transitions.get(src_layer as usize) else {
             return;
         };
@@ -153,7 +167,19 @@ impl PerLayerPreGate {
     /// Predict layer `layer + 1`'s experts from the current routed set by
     /// summing each source expert's learned target frequencies and
     /// taking the `top_n` highest.
-    fn predict(&self, layer: u32, routed: &[u32]) -> Vec<u32> {
+    /// Return a deterministic read-only ranking for `layer + 1` from the
+    /// already-observed routed set at `layer`. Ties break by ascending expert
+    /// id. The returned score is the summed transition count and therefore is
+    /// deliberately not represented as a probability.
+    pub fn predict_ranked(
+        &self,
+        layer: u32,
+        routed: &[u32],
+        limit: usize,
+    ) -> Vec<PreGatePrediction> {
+        if limit == 0 {
+            return Vec::new();
+        }
         let Some(layer_map) = self.transitions.get(layer as usize) else {
             return Vec::new();
         };
@@ -172,8 +198,11 @@ impl PerLayerPreGate {
         let mut ranked: Vec<(u32, u64)> = scores.into_iter().collect();
         // Highest score first; ties break by ascending id for determinism.
         ranked.sort_unstable_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
-        ranked.truncate(self.top_n);
-        ranked.into_iter().map(|(id, _)| id).collect()
+        ranked.truncate(limit);
+        ranked
+            .into_iter()
+            .map(|(expert_id, score)| PreGatePrediction { expert_id, score })
+            .collect()
     }
 
     /// Update hit/miss telemetry for a prediction against the actual set.
@@ -257,5 +286,46 @@ mod tests {
         let (hits, misses) = pg.stats();
         assert_eq!((hits, misses), (1, 0), "one correctly-scored prediction");
         assert!((pg.accuracy() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ranked_prediction_is_deterministic_and_breaks_equal_scores_by_id() {
+        let pg = PerLayerPreGate::new(2, 8);
+        pg.observe_transition(0, &[3], &[9, 2, 7]);
+        pg.observe_transition(0, &[4], &[7, 2, 9]);
+
+        let first = pg.predict_ranked(0, &[4, 3], 8);
+        let second = pg.predict_ranked(0, &[3, 4], 8);
+        assert_eq!(first, second);
+        assert_eq!(
+            first
+                .iter()
+                .map(|prediction| prediction.expert_id)
+                .collect::<Vec<_>>(),
+            vec![2, 7, 9]
+        );
+        assert!(first.iter().all(|prediction| prediction.score == 2));
+    }
+
+    #[test]
+    fn target_route_cannot_enter_its_own_frozen_prediction() {
+        let pg = PerLayerPreGate::new(2, 8);
+        pg.observe_transition(0, &[1], &[9]);
+
+        let frozen = pg.predict_ranked(0, &[1], 8);
+        assert_eq!(frozen[0].expert_id, 9);
+        assert!(!frozen.iter().any(|prediction| prediction.expert_id == 4));
+
+        // Scoring uses `frozen`; only afterward may the just-observed target
+        // update the transition table used by later predictions.
+        let scored_target = [4];
+        let frozen_hit = frozen
+            .iter()
+            .any(|prediction| scored_target.contains(&prediction.expert_id));
+        assert!(!frozen_hit);
+        pg.observe_transition(0, &[1], &scored_target);
+
+        let later = pg.predict_ranked(0, &[1], 8);
+        assert!(later.iter().any(|prediction| prediction.expert_id == 4));
     }
 }

@@ -146,6 +146,7 @@ pub(crate) mod gpu_native_f32_reference_boundary_audit;
 pub(crate) mod gpu_native_greedy_parity;
 pub(crate) mod gpu_native_layer0_diagnostics;
 pub(crate) mod gpu_native_q4_expert_stage_attribution;
+pub(crate) mod gpu_native_prefetch_shadow;
 pub(crate) mod gpu_native_real_benchmark;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;

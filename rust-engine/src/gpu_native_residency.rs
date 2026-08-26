@@ -466,6 +466,19 @@ pub(crate) struct GpuNativeTieredLayerSnapshot {
     pub(crate) physical_evictions: u64,
 }
 
+/// Read-only copy of one layer's physical metadata for shadow analysis.
+///
+/// `resident_global_ids_mru_to_lru` preserves the production physical LRU
+/// ordering but is collected with `LruCache::iter`, which does not promote an
+/// entry or update any residency counter.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct GpuNativePhysicalLayerShadowSnapshot {
+    pub(crate) layer_index: usize,
+    pub(crate) slot_capacity: usize,
+    pub(crate) resident_global_ids_mru_to_lru: Vec<u32>,
+    pub(crate) free_slots: usize,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct GpuNativeTieredResidencySnapshot {
     pub(crate) model_expert_budget_bytes: u64,
@@ -830,6 +843,34 @@ impl GpuNativeTieredResidencyManager {
                 .load(Ordering::Relaxed),
             layers,
         }
+    }
+
+    /// Copy one layer's physical capacity, resident ids, and exact LRU order
+    /// without acquiring payloads, touching recency, or changing counters.
+    pub(crate) fn shadow_layer_snapshot(
+        &self,
+        layer_index: usize,
+    ) -> Result<GpuNativePhysicalLayerShadowSnapshot, GpuNativeTieredResidencyError> {
+        let layer =
+            self.layers
+                .get(layer_index)
+                .ok_or(GpuNativeTieredResidencyError::LayerOutOfRange {
+                    layer_index,
+                    num_layers: self.layers.len(),
+                })?;
+        let state = layer.state.lock();
+        let resident_global_ids_mru_to_lru = state
+            .residents
+            .iter()
+            .map(|(&global_id, _)| global_id)
+            .collect::<Vec<_>>();
+        let slot_capacity = layer.arena.slot_capacity();
+        Ok(GpuNativePhysicalLayerShadowSnapshot {
+            layer_index,
+            slot_capacity,
+            free_slots: slot_capacity.saturating_sub(resident_global_ids_mru_to_lru.len()),
+            resident_global_ids_mru_to_lru,
+        })
     }
 
     fn validate_source(
@@ -1288,5 +1329,32 @@ mod tests {
         assert_eq!(oldest_unprotected(&residents, &HashSet::new()), Some(8));
         assert_eq!(residents.peek(&7), Some(&70));
         assert_eq!(residents.peek(&8), Some(&80));
+    }
+
+    #[test]
+    fn shadow_metadata_iteration_does_not_touch_physical_lru() {
+        let mut residents = LruCache::unbounded();
+        for id in 128..136 {
+            residents.put(id, id * 10);
+        }
+        let before = residents
+            .iter()
+            .map(|(&global_id, _)| global_id)
+            .collect::<Vec<_>>();
+
+        let copied_mru_to_lru = residents
+            .iter()
+            .map(|(&global_id, _)| global_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(copied_mru_to_lru, before);
+        assert_eq!(
+            residents
+                .iter()
+                .map(|(&global_id, _)| global_id)
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(oldest_unprotected(&residents, &HashSet::new()), Some(128));
     }
 }

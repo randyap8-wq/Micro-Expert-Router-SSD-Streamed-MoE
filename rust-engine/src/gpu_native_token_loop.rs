@@ -162,6 +162,7 @@ pub enum GpuNativeTokenLoopError {
         unknown_bits: u32,
     },
     ResidencyServiceFailed(GpuNativeDemandResidencyError),
+    PrefetchShadowObserverFailed(crate::gpu_native_prefetch_shadow::ShadowObserverError),
     UnsupportedSampling {
         reason: String,
     },
@@ -233,6 +234,9 @@ impl fmt::Display for GpuNativeTokenLoopError {
                 "unknown GPU-native status bits 0x{unknown_bits:08x} on {layer_index:?} in status 0x{status_bits:08x}"
             ),
             Self::ResidencyServiceFailed(err) => write!(f, "residency service failed: {err}"),
+            Self::PrefetchShadowObserverFailed(err) => {
+                write!(f, "prefetch shadow observer failed: {err}")
+            }
             Self::UnsupportedSampling { reason } => write!(f, "unsupported sampling: {reason}"),
             Self::Bootstrap(err) => write!(f, "GPU-native bootstrap error: {err}"),
             Self::InvalidBoundaryReport { detail } => {
@@ -977,6 +981,9 @@ pub struct GpuNativeTokenLoop {
     report_layout: GpuNativeBoundaryReportLayout,
     counters: GpuNativeTokenLoopCounters,
     recovery_counters: GpuNativeRecoveryCounters,
+    prefetch_shadow_observer: parking_lot::RwLock<
+        Option<Arc<crate::gpu_native_prefetch_shadow::GpuNativePrefetchShadowObserver>>,
+    >,
     execution_guard: TokioMutex<()>,
 }
 
@@ -1299,6 +1306,7 @@ impl GpuNativeTokenLoop {
             report_layout,
             counters: GpuNativeTokenLoopCounters::default(),
             recovery_counters: GpuNativeRecoveryCounters::default(),
+            prefetch_shadow_observer: parking_lot::RwLock::new(None),
             execution_guard: TokioMutex::new(()),
         }))
     }
@@ -1321,6 +1329,22 @@ impl GpuNativeTokenLoop {
 
     pub fn recovery_snapshot(&self) -> GpuNativeRecoverySnapshot {
         self.recovery_counters.snapshot()
+    }
+
+    /// Install the diagnostic-only shadow observer. Ordinary runtimes leave
+    /// this slot empty and retain the exact canonical token-loop path.
+    pub(crate) fn install_prefetch_shadow_observer(
+        &self,
+        observer: Arc<crate::gpu_native_prefetch_shadow::GpuNativePrefetchShadowObserver>,
+    ) -> Result<(), crate::gpu_native_prefetch_shadow::ShadowObserverError> {
+        let mut slot = self.prefetch_shadow_observer.write();
+        if slot.is_some() {
+            return Err(crate::gpu_native_prefetch_shadow::ShadowObserverError::new(
+                "GPU-native prefetch shadow observer is already installed",
+            ));
+        }
+        *slot = Some(observer);
+        Ok(())
     }
 
     /// Allocate request-local device resources for one GPU-native sequence.
@@ -2154,6 +2178,12 @@ impl GpuNativeTokenLoop {
                 Some(cursor) => cursor.plan(self.layers.len())?,
                 None => GpuNativeExecutionSegment::fresh(self.layers.len())?,
             };
+            let prefetch_shadow_observer = self.prefetch_shadow_observer.read().clone();
+            if let Some(observer) = prefetch_shadow_observer.as_ref() {
+                observer
+                    .before_segment(position, segment.ordinary_layers.start)
+                    .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
+            }
             let sink = diagnostic_sink.map(|(layout, buf)| GpuNativeDiagnosticSink {
                 layout,
                 staging_buffer: buf,
@@ -2291,6 +2321,19 @@ impl GpuNativeTokenLoop {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
+                if segment.ordinary_layers.start <= fail_layer {
+                    if let Some(observer) = prefetch_shadow_observer.as_ref() {
+                        observer
+                            .observe_boundary(
+                                position,
+                                segment.ordinary_layers.start..=fail_layer,
+                                &report.selected_ids,
+                                self.residency_manager.as_ref(),
+                            )
+                            .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
+                    }
+                }
+
                 let residency_started = Instant::now();
                 engine
                     .ensure_gpu_native_demand_residency(fail_layer, &global_ids)
@@ -2325,6 +2368,18 @@ impl GpuNativeTokenLoop {
             }
 
             if !segment.completes_token {
+                if segment.ordinary_layers.start < segment.ordinary_layers.end {
+                    if let Some(observer) = prefetch_shadow_observer.as_ref() {
+                        observer
+                            .observe_boundary(
+                                position,
+                                segment.ordinary_layers.start..=segment.ordinary_layers.end - 1,
+                                &report.selected_ids,
+                                self.residency_manager.as_ref(),
+                            )
+                            .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
+                    }
+                }
                 continue;
             }
 
@@ -2340,6 +2395,19 @@ impl GpuNativeTokenLoop {
                 Err(error) => {
                     self.counters.fatal_failures.fetch_add(1, Ordering::Relaxed);
                     return Err(error);
+                }
+            }
+
+            if segment.ordinary_layers.start < segment.ordinary_layers.end {
+                if let Some(observer) = prefetch_shadow_observer.as_ref() {
+                    observer
+                        .observe_boundary(
+                            position,
+                            segment.ordinary_layers.start..=segment.ordinary_layers.end - 1,
+                            &report.selected_ids,
+                            self.residency_manager.as_ref(),
+                        )
+                        .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
                 }
             }
 

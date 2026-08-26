@@ -566,6 +566,7 @@ pub(crate) fn map_gpu_native_token_loop_error(
         | GpuNativeTokenLoopError::InvalidSelectedExpertId { .. }
         | GpuNativeTokenLoopError::DuplicateSelectedExpertId { .. }
         | GpuNativeTokenLoopError::InvalidTopKCount { .. }
+        | GpuNativeTokenLoopError::PrefetchShadowObserverFailed(_)
         | GpuNativeTokenLoopError::MapFailed(_) => GenerateError::Inference(err.to_string()),
     }
 }
