@@ -908,6 +908,41 @@ enum Cmd {
         report_out: Option<PathBuf>,
     },
 
+    /// Measure causal GPU-native predictor usefulness without speculative
+    /// I/O, cache admission, physical mutation, or production prefetch.
+    QualifyGpuNativePrefetchShadow {
+        /// Path to the strict production GPU-native TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Prompt text to tokenize once for every run.
+        #[arg(long, conflicts_with = "request_json")]
+        prompt: Option<String>,
+        /// OpenAI-style request JSON containing `prompt` or chat `messages`.
+        #[arg(long, conflicts_with = "prompt")]
+        request_json: Option<PathBuf>,
+        /// Exact number of generated tokens; must be at least two.
+        #[arg(long)]
+        output_tokens: Option<usize>,
+        /// Warmup requests, trained causally but excluded from measured metrics.
+        #[arg(long, default_value_t = 1)]
+        warmup_runs: usize,
+        /// Measured requests retained individually in the report.
+        #[arg(long, default_value_t = 3)]
+        measured_runs: usize,
+        /// Frozen v1 cache schedule; only `keep` is accepted.
+        #[arg(long, value_enum, default_value_t = BenchRealCacheReset::Keep)]
+        cache_reset: BenchRealCacheReset,
+        /// Required deterministic greedy decoding contract.
+        #[arg(long, required = true)]
+        greedy: bool,
+        /// Exact authoritative adapter name expected at runtime.
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Write the typed JSON shadow report here instead of stdout.
+        #[arg(long)]
+        report_out: Option<PathBuf>,
+    },
+
     /// Qualify strict real-checkpoint inference with CPU dense/attention/KV/
     /// router/head planes and native-Q4_0 routed experts on a hardware GPU.
     QualifyHybridQ4 {
@@ -1858,6 +1893,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         Cmd::Serve { config }
         | Cmd::BenchReal { config, .. }
         | Cmd::BenchGpuNativeReal { config, .. }
+        | Cmd::QualifyGpuNativePrefetchShadow { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
@@ -2270,6 +2306,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build()?;
             rt.block_on(crate::gpu_native_real_benchmark::run_command(
                 crate::gpu_native_real_benchmark::CommandArgs {
+                    config,
+                    prompt,
+                    request_json,
+                    output_tokens,
+                    warmup_runs,
+                    measured_runs,
+                    cache_reset,
+                    greedy,
+                    expected_adapter_name,
+                    report_out,
+                    progress_watchdog,
+                },
+            ))
+        }
+        Cmd::QualifyGpuNativePrefetchShadow {
+            config,
+            prompt,
+            request_json,
+            output_tokens,
+            warmup_runs,
+            measured_runs,
+            cache_reset,
+            greedy,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_prefetch_shadow::run_command(
+                crate::gpu_native_prefetch_shadow::CommandArgs {
                     config,
                     prompt,
                     request_json,
