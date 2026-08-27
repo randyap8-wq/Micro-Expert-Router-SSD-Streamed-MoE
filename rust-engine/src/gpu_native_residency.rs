@@ -471,12 +471,32 @@ pub(crate) struct GpuNativeTieredLayerSnapshot {
 /// `resident_global_ids_mru_to_lru` preserves the production physical LRU
 /// ordering but is collected with `LruCache::iter`, which does not promote an
 /// entry or update any residency counter.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct GpuNativePhysicalLayerShadowSnapshot {
     pub(crate) layer_index: usize,
     pub(crate) slot_capacity: usize,
     pub(crate) resident_global_ids_mru_to_lru: Vec<u32>,
     pub(crate) free_slots: usize,
+}
+
+/// Read-only observer-window evidence for one relevant physical layer.
+///
+/// The metadata snapshot preserves exact host MRU-to-LRU ordering while the
+/// arena snapshot includes physical install, retire, reuse, and mapping
+/// counters. Both are copied and released before an observer callback runs.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GpuNativeObserverLayerGuardSnapshot {
+    pub(crate) metadata: GpuNativePhysicalLayerShadowSnapshot,
+    pub(crate) arena: crate::backend::gpu_native::GpuNativeQ4ExpertResidencySnapshot,
+}
+
+/// Complete read-only production-residency evidence captured on one side of
+/// a shadow-observer callback. No lock represented here remains held after
+/// construction.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GpuNativeObserverResidencyGuardSnapshot {
+    pub(crate) tiered: GpuNativeTieredResidencySnapshot,
+    pub(crate) relevant_layers: Vec<GpuNativeObserverLayerGuardSnapshot>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -574,7 +594,9 @@ impl GpuNativeTieredResidencyManager {
     /// Read-only physical tier-selection probe for the engine's async demand
     /// path. Host logical-admission LRU state is intentionally not consulted:
     /// an exact, internally current arena residency owns immutable executable
-    /// bytes for the lifetime of this manager.
+    /// bytes for the lifetime of this manager. The `touch=false` lookup does
+    /// not promote physical LRU recency or update any residency counter, and
+    /// exact arena-identity disagreement propagates as `PhysicalIdentityCorrupt`.
     pub(crate) fn has_current_for_demand(
         &self,
         global_id: u32,
@@ -870,6 +892,37 @@ impl GpuNativeTieredResidencyManager {
             slot_capacity,
             free_slots: slot_capacity.saturating_sub(resident_global_ids_mru_to_lru.len()),
             resident_global_ids_mru_to_lru,
+        })
+    }
+
+    /// Capture the runtime state that must remain exactly unchanged across a
+    /// shadow-observer callback. The range is validated and every lock is
+    /// released before this function returns, so callers never hold a
+    /// production lock across diagnostic work.
+    pub(crate) fn shadow_observer_guard_snapshot(
+        &self,
+        relevant_layers: &[usize],
+    ) -> Result<GpuNativeObserverResidencyGuardSnapshot, GpuNativeTieredResidencyError> {
+        let tiered = self.snapshot();
+        let relevant_layers = relevant_layers
+            .iter()
+            .copied()
+            .map(|layer_index| {
+                let layer = self.layers.get(layer_index).ok_or(
+                    GpuNativeTieredResidencyError::LayerOutOfRange {
+                        layer_index,
+                        num_layers: self.layers.len(),
+                    },
+                )?;
+                Ok(GpuNativeObserverLayerGuardSnapshot {
+                    metadata: self.shadow_layer_snapshot(layer_index)?,
+                    arena: layer.arena.residency_snapshot(),
+                })
+            })
+            .collect::<Result<Vec<_>, GpuNativeTieredResidencyError>>()?;
+        Ok(GpuNativeObserverResidencyGuardSnapshot {
+            tiered,
+            relevant_layers,
         })
     }
 

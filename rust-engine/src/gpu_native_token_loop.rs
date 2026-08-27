@@ -25,6 +25,7 @@ use crate::backend::gpu_native::{
 use crate::dense_tensor::DenseDType;
 use crate::engine::{Engine, GpuNativeDemandResidencyError};
 use crate::gating::ScoringFunc;
+use crate::gpu_native_prefetch_shadow::{with_observer_runtime_guard, ShadowObserverCallbackKind};
 use crate::gpu_native_residency::GpuNativeTieredResidencyManager;
 use crate::model::RealModel;
 use crate::sampling::SamplingParams;
@@ -2180,9 +2181,21 @@ impl GpuNativeTokenLoop {
             };
             let prefetch_shadow_observer = self.prefetch_shadow_observer.read().clone();
             if let Some(observer) = prefetch_shadow_observer.as_ref() {
-                observer
-                    .before_segment(position, segment.ordinary_layers.start)
-                    .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
+                let first_new_layer = segment.ordinary_layers.start;
+                let guard_layers = if first_new_layer < self.layers.len() {
+                    vec![first_new_layer]
+                } else {
+                    Vec::new()
+                };
+                with_observer_runtime_guard(
+                    observer,
+                    engine.as_ref(),
+                    self.residency_manager.as_ref(),
+                    ShadowObserverCallbackKind::BeforeSegment,
+                    &guard_layers,
+                    || observer.before_segment(position, first_new_layer),
+                )
+                .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
             }
             let sink = diagnostic_sink.map(|(layout, buf)| GpuNativeDiagnosticSink {
                 layout,
@@ -2323,14 +2336,24 @@ impl GpuNativeTokenLoop {
 
                 if segment.ordinary_layers.start <= fail_layer {
                     if let Some(observer) = prefetch_shadow_observer.as_ref() {
-                        observer
-                            .observe_boundary(
-                                position,
-                                segment.ordinary_layers.start..=fail_layer,
-                                &report.selected_ids,
-                                self.residency_manager.as_ref(),
-                            )
-                            .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
+                        let observed_layers = segment.ordinary_layers.start..=fail_layer;
+                        let guard_layers = observed_layers.clone().collect::<Vec<_>>();
+                        with_observer_runtime_guard(
+                            observer,
+                            engine.as_ref(),
+                            self.residency_manager.as_ref(),
+                            ShadowObserverCallbackKind::ObserveBoundary,
+                            &guard_layers,
+                            || {
+                                observer.observe_boundary(
+                                    position,
+                                    observed_layers,
+                                    &report.selected_ids,
+                                    self.residency_manager.as_ref(),
+                                )
+                            },
+                        )
+                        .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
                     }
                 }
 
@@ -2370,14 +2393,25 @@ impl GpuNativeTokenLoop {
             if !segment.completes_token {
                 if segment.ordinary_layers.start < segment.ordinary_layers.end {
                     if let Some(observer) = prefetch_shadow_observer.as_ref() {
-                        observer
-                            .observe_boundary(
-                                position,
-                                segment.ordinary_layers.start..=segment.ordinary_layers.end - 1,
-                                &report.selected_ids,
-                                self.residency_manager.as_ref(),
-                            )
-                            .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
+                        let observed_layers =
+                            segment.ordinary_layers.start..=segment.ordinary_layers.end - 1;
+                        let guard_layers = observed_layers.clone().collect::<Vec<_>>();
+                        with_observer_runtime_guard(
+                            observer,
+                            engine.as_ref(),
+                            self.residency_manager.as_ref(),
+                            ShadowObserverCallbackKind::ObserveBoundary,
+                            &guard_layers,
+                            || {
+                                observer.observe_boundary(
+                                    position,
+                                    observed_layers,
+                                    &report.selected_ids,
+                                    self.residency_manager.as_ref(),
+                                )
+                            },
+                        )
+                        .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
                     }
                 }
                 continue;
@@ -2400,14 +2434,25 @@ impl GpuNativeTokenLoop {
 
             if segment.ordinary_layers.start < segment.ordinary_layers.end {
                 if let Some(observer) = prefetch_shadow_observer.as_ref() {
-                    observer
-                        .observe_boundary(
-                            position,
-                            segment.ordinary_layers.start..=segment.ordinary_layers.end - 1,
-                            &report.selected_ids,
-                            self.residency_manager.as_ref(),
-                        )
-                        .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
+                    let observed_layers =
+                        segment.ordinary_layers.start..=segment.ordinary_layers.end - 1;
+                    let guard_layers = observed_layers.clone().collect::<Vec<_>>();
+                    with_observer_runtime_guard(
+                        observer,
+                        engine.as_ref(),
+                        self.residency_manager.as_ref(),
+                        ShadowObserverCallbackKind::ObserveBoundary,
+                        &guard_layers,
+                        || {
+                            observer.observe_boundary(
+                                position,
+                                observed_layers,
+                                &report.selected_ids,
+                                self.residency_manager.as_ref(),
+                            )
+                        },
+                    )
+                    .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
                 }
             }
 

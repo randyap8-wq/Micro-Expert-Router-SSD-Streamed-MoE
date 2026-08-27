@@ -5,8 +5,8 @@
 //! admission, prefetch-governor, or physical-residency mutation APIs.
 
 use crate::gpu_native_residency::{
-    GpuNativePhysicalLayerShadowSnapshot, GpuNativeTieredResidencyError,
-    GpuNativeTieredResidencyManager,
+    GpuNativeObserverResidencyGuardSnapshot, GpuNativePhysicalLayerShadowSnapshot,
+    GpuNativeTieredResidencyError, GpuNativeTieredResidencyManager,
 };
 use crate::pregate::PerLayerPreGate;
 use parking_lot::Mutex;
@@ -71,6 +71,125 @@ pub(crate) struct ShadowObserverConfig {
     pub(crate) num_layers: usize,
     pub(crate) experts_per_layer: usize,
     pub(crate) top_k: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ShadowObserverCallbackKind {
+    BeforeSegment,
+    ObserveBoundary,
+}
+
+impl std::fmt::Display for ShadowObserverCallbackKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeSegment => f.write_str("before_segment"),
+            Self::ObserveBoundary => f.write_str("observe_boundary"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct ObserverRuntimeGuardEvidence {
+    pub(crate) verified: bool,
+    pub(crate) checked_callback_count: u64,
+    pub(crate) before_segment_callback_count: u64,
+    pub(crate) observe_boundary_callback_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ObserverEngineGuardSnapshot {
+    ram_cache_hits: u64,
+    ram_cache_misses: u64,
+    nvme_read_operations: u64,
+    nvme_bytes_read: u64,
+    prefetch_completed: u64,
+    predictor_observations: u64,
+    logical_gpu_promotions: u64,
+    logical_gpu_cache_hits: u64,
+    logical_gpu_cache_misses: u64,
+    logical_gpu_anchor_count: usize,
+    logical_gpu_lru_count: usize,
+    logical_gpu_used_bytes: u64,
+    prefetch_used: u64,
+    prefetch_dropped_governor: u64,
+    governor_admitted: u64,
+    governor_throttled: u64,
+}
+
+impl ObserverEngineGuardSnapshot {
+    fn capture(engine: &crate::engine::Engine) -> Self {
+        let report = engine.report();
+        Self {
+            ram_cache_hits: report.hits,
+            ram_cache_misses: report.misses,
+            nvme_read_operations: report.io_count,
+            nvme_bytes_read: report.bytes_read,
+            prefetch_completed: report.prefetch_completed,
+            predictor_observations: report.predictor_observations,
+            logical_gpu_promotions: report.gpu_promotions,
+            logical_gpu_cache_hits: report.gpu_cache_hits,
+            logical_gpu_cache_misses: report.gpu_cache_misses,
+            logical_gpu_anchor_count: report.gpu_anchor_count,
+            logical_gpu_lru_count: report.gpu_lru_count,
+            logical_gpu_used_bytes: report.vram_used_bytes,
+            prefetch_used: report.prefetch_used,
+            prefetch_dropped_governor: report.prefetch_dropped_governor,
+            governor_admitted: report.governor_admitted,
+            governor_throttled: report.governor_throttled,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ObserverCallbackGuardSnapshot {
+    residency: GpuNativeObserverResidencyGuardSnapshot,
+    engine: ObserverEngineGuardSnapshot,
+}
+
+impl ObserverCallbackGuardSnapshot {
+    fn capture(
+        engine: &crate::engine::Engine,
+        residency: &GpuNativeTieredResidencyManager,
+        relevant_layers: &[usize],
+    ) -> Result<Self, ShadowObserverError> {
+        Ok(Self {
+            residency: residency.shadow_observer_guard_snapshot(relevant_layers)?,
+            engine: ObserverEngineGuardSnapshot::capture(engine),
+        })
+    }
+}
+
+fn verify_callback_guard_unchanged(
+    kind: ShadowObserverCallbackKind,
+    before: &ObserverCallbackGuardSnapshot,
+    after: &ObserverCallbackGuardSnapshot,
+) -> Result<(), ShadowObserverError> {
+    if before != after {
+        return Err(ShadowObserverError::new(format!(
+            "shadow observer {kind} mutated guarded production state: before={before:?} after={after:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Execute one observer callback between independent read-only production
+/// snapshots. Snapshot locks are released before the callback begins. Any
+/// callback-window change fails closed before normal execution can continue.
+pub(crate) fn with_observer_runtime_guard<T>(
+    observer: &GpuNativePrefetchShadowObserver,
+    engine: &crate::engine::Engine,
+    residency: &GpuNativeTieredResidencyManager,
+    kind: ShadowObserverCallbackKind,
+    relevant_layers: &[usize],
+    callback: impl FnOnce() -> Result<T, ShadowObserverError>,
+) -> Result<T, ShadowObserverError> {
+    let before = ObserverCallbackGuardSnapshot::capture(engine, residency, relevant_layers)?;
+    let callback_result = callback();
+    let after = ObserverCallbackGuardSnapshot::capture(engine, residency, relevant_layers)?;
+    verify_callback_guard_unchanged(kind, &before, &after)?;
+    let value = callback_result?;
+    observer.record_runtime_guarded_callback(kind);
+    Ok(value)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -145,6 +264,54 @@ struct PendingPrediction {
     target_probe_at_us: Option<u64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthoritativeActualPhysicalClassification {
+    selected_global_ids: Vec<u32>,
+    current_selected_global_ids: Vec<u32>,
+    missing_selected_global_ids: Vec<u32>,
+}
+
+trait AuthoritativePhysicalCurrentness {
+    fn authoritative_physical_current(
+        &self,
+        global_id: u32,
+    ) -> Result<bool, GpuNativeTieredResidencyError>;
+}
+
+impl AuthoritativePhysicalCurrentness for GpuNativeTieredResidencyManager {
+    fn authoritative_physical_current(
+        &self,
+        global_id: u32,
+    ) -> Result<bool, GpuNativeTieredResidencyError> {
+        self.has_current_for_demand(global_id)
+    }
+}
+
+fn classify_authoritative_actual_selected<C: AuthoritativePhysicalCurrentness + ?Sized>(
+    currentness: &C,
+    target_layer: usize,
+    actual_local_ids: &[u32],
+    experts_per_layer: usize,
+) -> Result<AuthoritativeActualPhysicalClassification, ShadowObserverError> {
+    let mut selected_global_ids = Vec::with_capacity(actual_local_ids.len());
+    let mut current_selected_global_ids = Vec::with_capacity(actual_local_ids.len());
+    let mut missing_selected_global_ids = Vec::with_capacity(actual_local_ids.len());
+    for &local_id in actual_local_ids {
+        let global_id = global_id(target_layer, local_id, experts_per_layer)?;
+        selected_global_ids.push(global_id);
+        if currentness.authoritative_physical_current(global_id)? {
+            current_selected_global_ids.push(global_id);
+        } else {
+            missing_selected_global_ids.push(global_id);
+        }
+    }
+    Ok(AuthoritativeActualPhysicalClassification {
+        selected_global_ids,
+        current_selected_global_ids,
+        missing_selected_global_ids,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct LastRoute {
     completed_token_position: usize,
@@ -166,6 +333,7 @@ struct ObserverInner {
     last_route: Option<LastRoute>,
     pending: Option<PendingPrediction>,
     events: Vec<ShadowPredictionEvent>,
+    runtime_guard_evidence: ObserverRuntimeGuardEvidence,
 }
 
 impl ObserverInner {
@@ -205,6 +373,7 @@ impl GpuNativePrefetchShadowObserver {
                 last_route: None,
                 pending: None,
                 events: Vec::new(),
+                runtime_guard_evidence: ObserverRuntimeGuardEvidence::default(),
             }),
             config,
         }))
@@ -321,13 +490,18 @@ impl GpuNativePrefetchShadowObserver {
             }) {
                 let pending = inner.pending.take().expect("pending target checked");
                 let target_physical = residency.shadow_layer_snapshot(layer)?;
+                let actual_physical = classify_authoritative_actual_selected(
+                    residency,
+                    layer,
+                    local_ids,
+                    self.config.experts_per_layer,
+                )?;
                 let scored_sequence = inner.next_sequence();
                 let updated_sequence = scored_sequence.saturating_add(1);
                 let mut events = score_pending(
                     pending,
-                    local_ids,
+                    actual_physical,
                     target_physical,
-                    self.config.experts_per_layer,
                     scored_sequence,
                     updated_sequence,
                 )?;
@@ -379,6 +553,27 @@ impl GpuNativePrefetchShadowObserver {
     pub(crate) fn snapshot(&self) -> ShadowObserverSnapshot {
         let inner = self.inner.lock();
         ShadowObserverSnapshot::from_events(inner.events.clone())
+    }
+
+    pub(crate) fn runtime_guard_evidence(&self) -> ObserverRuntimeGuardEvidence {
+        self.inner.lock().runtime_guard_evidence
+    }
+
+    fn record_runtime_guarded_callback(&self, kind: ShadowObserverCallbackKind) {
+        let mut inner = self.inner.lock();
+        let evidence = &mut inner.runtime_guard_evidence;
+        evidence.checked_callback_count = evidence.checked_callback_count.saturating_add(1);
+        match kind {
+            ShadowObserverCallbackKind::BeforeSegment => {
+                evidence.before_segment_callback_count =
+                    evidence.before_segment_callback_count.saturating_add(1);
+            }
+            ShadowObserverCallbackKind::ObserveBoundary => {
+                evidence.observe_boundary_callback_count =
+                    evidence.observe_boundary_callback_count.saturating_add(1);
+            }
+        }
+        evidence.verified = true;
     }
 
     #[cfg(test)]
@@ -533,9 +728,8 @@ fn fanouts_for_capacity(capacity: usize) -> Vec<usize> {
 
 fn score_pending(
     pending: PendingPrediction,
-    actual_local_ids: &[u32],
+    actual_physical: AuthoritativeActualPhysicalClassification,
     target_physical: GpuNativePhysicalLayerShadowSnapshot,
-    experts_per_layer: usize,
     scored_sequence: u64,
     predictor_updated_sequence: u64,
 ) -> Result<Vec<ShadowPredictionEvent>, ShadowObserverError> {
@@ -557,10 +751,7 @@ fn score_pending(
             predictor_updated_sequence,
         )));
     }
-    let actual = actual_local_ids
-        .iter()
-        .map(|&local_id| global_id(pending.target_layer, local_id, experts_per_layer))
-        .collect::<Result<Vec<_>, _>>()?;
+    let actual = actual_physical.selected_global_ids;
     let actual_set = actual.iter().copied().collect::<HashSet<_>>();
     if target_physical.layer_index != pending.target_layer
         || target_physical.slot_capacity != pending.physical.slot_capacity
@@ -570,27 +761,14 @@ fn score_pending(
             pending.physical,
         )));
     }
-    let target_residents = target_physical
-        .resident_global_ids_mru_to_lru
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
     let prediction_residents = pending
         .physical
         .resident_global_ids_mru_to_lru
         .iter()
         .copied()
         .collect::<HashSet<_>>();
-    let actual_current = actual
-        .iter()
-        .copied()
-        .filter(|id| target_residents.contains(id))
-        .collect::<Vec<_>>();
-    let missing = actual
-        .iter()
-        .copied()
-        .filter(|id| !target_residents.contains(id))
-        .collect::<Vec<_>>();
+    let actual_current = actual_physical.current_selected_global_ids;
+    let missing = actual_physical.missing_selected_global_ids;
     let missing_set = missing.iter().copied().collect::<HashSet<_>>();
     let miss_boundary = !missing.is_empty();
     let lead_time_us = target_probe_at_us.saturating_sub(pending.frozen_at_us);
@@ -1080,20 +1258,6 @@ fn aggregate_phase(events: &[ShadowPredictionEvent], phase: ShadowPhase) -> Phas
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-pub(crate) struct ShadowSideEffectCounters {
-    pub(crate) prefetch_requests: u64,
-    pub(crate) source_acquisitions: u64,
-    pub(crate) ram_reads: u64,
-    pub(crate) nvme_reads: u64,
-    pub(crate) logical_admissions: u64,
-    pub(crate) physical_installs: u64,
-    pub(crate) physical_evictions: u64,
-    pub(crate) physical_retires: u64,
-    pub(crate) generation_changes: u64,
-    pub(crate) lru_touches: u64,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct CommandArgs {
     pub(crate) config: std::path::PathBuf,
@@ -1208,8 +1372,12 @@ pub(crate) struct ShadowReport {
     pub(crate) qualification_pass: bool,
     pub(crate) performance_claim: bool,
     pub(crate) production_prefetch_enabled: bool,
-    pub(crate) shadow_side_effect_postconditions_verified: bool,
-    pub(crate) production_speculative_postconditions_verified: bool,
+    pub(crate) shadow_mutation_surface_evidence_kind: &'static str,
+    pub(crate) observer_runtime_guarded_classes: Vec<&'static str>,
+    pub(crate) observer_runtime_guard_evidence: ObserverRuntimeGuardEvidence,
+    pub(crate) structural_source_audit_claims: Vec<&'static str>,
+    pub(crate) production_speculative_runtime_postconditions_verified: bool,
+    pub(crate) external_l4_behavioral_equivalence_pending: bool,
     pub(crate) production_semantics: ShadowProductionSemantics,
     pub(crate) provenance: crate::gpu_native_real_benchmark::BenchmarkProvenance,
     pub(crate) hardware: Option<crate::backend::GpuDeviceIdentity>,
@@ -1237,7 +1405,6 @@ pub(crate) struct ShadowReport {
     pub(crate) counterfactual_model: &'static str,
     pub(crate) counterfactual_limitations: &'static str,
     pub(crate) warmup_learning_semantics: &'static str,
-    pub(crate) shadow_side_effect_counters: ShadowSideEffectCounters,
     pub(crate) warmup_run_evidence: Vec<ShadowRunEvidence>,
     pub(crate) measured_run_evidence: Vec<ShadowRunEvidence>,
     pub(crate) shadow_observations: Option<ShadowObserverSnapshot>,
@@ -1306,10 +1473,11 @@ fn source_audit() -> Vec<SourceAuditAnswer> {
         },
         SourceAuditAnswer {
             question: 7,
-            answer: "Engine::ensure_gpu_native_demand_residency computes physical_current with GpuNativeTieredResidencyManager::has_current_for_demand and derives physical_missing before any source acquisition. The shadow observer copies the same layer residency metadata at the boundary before that service begins.",
+            answer: "Engine::ensure_gpu_native_demand_residency computes physical_current with GpuNativeTieredResidencyManager::has_current_for_demand and derives physical_missing before any source acquisition. Shadow scoring now calls that same authoritative read-only predicate for every actual selected global ID and propagates PhysicalIdentityCorrupt as an error. Separately, shadow_layer_snapshot supplies prediction-time capacity, resident IDs, and MRU-to-LRU metadata only; it is not authoritative actual-currentness evidence.",
             exact_source_locations: vec![
                 "rust-engine/src/engine.rs::Engine::ensure_gpu_native_demand_residency",
                 "rust-engine/src/gpu_native_residency.rs::GpuNativeTieredResidencyManager::has_current_for_demand",
+                "rust-engine/src/gpu_native_prefetch_shadow.rs::classify_authoritative_actual_selected",
                 "rust-engine/src/gpu_native_residency.rs::GpuNativeTieredResidencyManager::shadow_layer_snapshot",
             ],
         },
@@ -1741,8 +1909,26 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         qualification_pass: false,
         performance_claim: false,
         production_prefetch_enabled: false,
-        shadow_side_effect_postconditions_verified: false,
-        production_speculative_postconditions_verified: false,
+        shadow_mutation_surface_evidence_kind:
+            "runtime-observer-callback-guard-plus-structural-source-audit",
+        observer_runtime_guarded_classes: vec![
+            "GPU-native residency counters including source acquisitions, logical admissions, installs, evictions, reinstalls, and speculative activity",
+            "physical resident counts and free slots",
+            "relevant-layer physical resident IDs and exact MRU-to-LRU order",
+            "relevant-layer arena install, retire, reuse, mapping, stale-install, and cancellation counters",
+            "engine RAM cache hit/miss counters",
+            "engine NVMe operation and byte counters",
+            "logical GPU admission, hit/miss, occupancy, and used-byte counters",
+            "production prefetch, governor, and predictor-observation counters",
+        ],
+        observer_runtime_guard_evidence: ObserverRuntimeGuardEvidence::default(),
+        structural_source_audit_claims: vec![
+            "the observer owns no storage, RAM-cache fetch, logical-admission, physical-mutation, production-prefetch, semaphore, or background-task API",
+            "prediction uses only private CPU transition state and read-only physical snapshots",
+            "authoritative actual currentness uses has_current_for_demand with touch=false",
+        ],
+        production_speculative_runtime_postconditions_verified: false,
+        external_l4_behavioral_equivalence_pending: true,
         production_semantics: ShadowProductionSemantics::shadow_only(),
         provenance: BenchmarkProvenance {
             build,
@@ -1770,14 +1956,13 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         predictor_sources: predictor_source_audit(),
         exact_causal_prediction_point: "GpuNativePrefetchShadowObserver::observe_boundary -> freeze_prediction after route L-1 becomes CPU-visible and before the next segment submission",
         exact_target_route_observation_point: "GpuNativeTokenLoop::step_token_unified_inner after the ordinary boundary-report readback and before demand residency service",
-        exact_physical_missing_observation_point: "read-only target-layer physical snapshot immediately before Engine::ensure_gpu_native_demand_residency; equivalent to its has_current_for_demand set computation because no target-layer mutation intervenes",
+        exact_physical_missing_observation_point: "for each actual selected target-layer global ID, call GpuNativeTieredResidencyManager::has_current_for_demand inside the guarded observer callback that precedes Engine::ensure_gpu_native_demand_residency; shadow_layer_snapshot remains a separate capacity/LRU model input",
         layer_zero_prediction_semantics: "unscored: the evaluated per-layer pre-gate transition source has no legal layer predecessor and v1 does not invent a cross-token layer-0 predictor",
         lead_time_limitation: "prediction freeze and conservative target-probe markers are monotonic CPU timestamps; no GPU timestamp or shader instrumentation is added, so timing is diagnostic only",
         current_policy_model: "ranked nonresident candidates consume only free target-layer physical slots; a full arena installs zero because production speculative residency does not evict",
         counterfactual_model: "ORACLE / SHADOW ONLY: copy prediction-time MRU-to-LRU IDs, process candidates in predictor rank order, promote copied hits, fill free slots, then evict the copied LRU tail for nonresident candidates",
         counterfactual_limitations: "the oracle knows the later selected top-8 only when scoring harmful evictions; it models metadata capacity and LRU ordering, not I/O completion, contention, bandwidth, install latency, or generation races",
         warmup_learning_semantics: "one shared private predictor spans the keep-cache schedule; warmup trains it causally, warmup events remain separate, and measured events use only state learned earlier in execution order",
-        shadow_side_effect_counters: ShadowSideEffectCounters::default(),
         warmup_run_evidence: Vec::new(),
         measured_run_evidence: Vec::new(),
         shadow_observations: None,
@@ -1873,6 +2058,21 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
+        let runtime_guard_evidence = observer.runtime_guard_evidence();
+        if !runtime_guard_evidence.verified
+            || runtime_guard_evidence.checked_callback_count == 0
+            || runtime_guard_evidence.before_segment_callback_count == 0
+            || runtime_guard_evidence.observe_boundary_callback_count == 0
+        {
+            return Err(BenchmarkFailure::new(
+                "postcondition",
+                "observer-runtime-guard-incomplete",
+                format!(
+                    "shadow observer callback guard did not verify every callback class: {runtime_guard_evidence:?}"
+                ),
+            ));
+        }
+        report.observer_runtime_guard_evidence = runtime_guard_evidence;
         report.shadow_observations = Some(snapshot);
         Ok::<(), BenchmarkFailure>(())
     }
@@ -1909,8 +2109,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
                 emit_report(&report, args.report_out.as_deref())?;
                 return Err(failure.into());
             }
-            report.shadow_side_effect_postconditions_verified = true;
-            report.production_speculative_postconditions_verified = true;
+            report.production_speculative_runtime_postconditions_verified = true;
             report.shadow_complete = true;
             emit_report(&report, args.report_out.as_deref())
         }
@@ -1937,6 +2136,64 @@ mod tests {
         }
     }
 
+    struct TestAuthoritativeCurrentness {
+        outcomes: BTreeMap<u32, Result<bool, GpuNativeTieredResidencyError>>,
+        calls: std::cell::RefCell<Vec<u32>>,
+        physical_lru: Vec<u32>,
+        residency_counters: [u64; 4],
+    }
+
+    impl AuthoritativePhysicalCurrentness for TestAuthoritativeCurrentness {
+        fn authoritative_physical_current(
+            &self,
+            global_id: u32,
+        ) -> Result<bool, GpuNativeTieredResidencyError> {
+            self.calls.borrow_mut().push(global_id);
+            self.outcomes.get(&global_id).cloned().unwrap_or(Ok(false))
+        }
+    }
+
+    fn score_pending_for_test(
+        pending: PendingPrediction,
+        actual_local_ids: &[u32],
+        target_physical: GpuNativePhysicalLayerShadowSnapshot,
+        experts_per_layer: usize,
+        scored_sequence: u64,
+        predictor_updated_sequence: u64,
+    ) -> Result<Vec<ShadowPredictionEvent>, ShadowObserverError> {
+        let residents = target_physical
+            .resident_global_ids_mru_to_lru
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let outcomes = actual_local_ids
+            .iter()
+            .map(|&local_id| {
+                let global_id = global_id(pending.target_layer, local_id, experts_per_layer)?;
+                Ok((global_id, Ok(residents.contains(&global_id))))
+            })
+            .collect::<Result<BTreeMap<_, _>, ShadowObserverError>>()?;
+        let currentness = TestAuthoritativeCurrentness {
+            outcomes,
+            calls: std::cell::RefCell::new(Vec::new()),
+            physical_lru: target_physical.resident_global_ids_mru_to_lru.clone(),
+            residency_counters: [0; 4],
+        };
+        let actual_physical = classify_authoritative_actual_selected(
+            &currentness,
+            pending.target_layer,
+            actual_local_ids,
+            experts_per_layer,
+        )?;
+        score_pending(
+            pending,
+            actual_physical,
+            target_physical,
+            scored_sequence,
+            predictor_updated_sequence,
+        )
+    }
+
     fn observer() -> Arc<GpuNativePrefetchShadowObserver> {
         GpuNativePrefetchShadowObserver::new(ShadowObserverConfig {
             num_layers: 48,
@@ -1944,6 +2201,87 @@ mod tests {
             top_k: 8,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn authoritative_actual_classification_uses_read_only_predicate_for_current_and_missing() {
+        let currentness = TestAuthoritativeCurrentness {
+            outcomes: BTreeMap::from([(128, Ok(true)), (129, Ok(false)), (130, Ok(true))]),
+            calls: std::cell::RefCell::new(Vec::new()),
+            physical_lru: vec![130, 128, 140],
+            residency_counters: [11, 12, 13, 14],
+        };
+        let lru_before = currentness.physical_lru.clone();
+        let counters_before = currentness.residency_counters;
+
+        let classified =
+            classify_authoritative_actual_selected(&currentness, 1, &[0, 1, 2], 128).unwrap();
+
+        assert_eq!(
+            currentness.calls.into_inner(),
+            vec![128, 129, 130],
+            "every derived global ID must use the authoritative predicate"
+        );
+        assert_eq!(classified.selected_global_ids, vec![128, 129, 130]);
+        assert_eq!(classified.current_selected_global_ids, vec![128, 130]);
+        assert_eq!(classified.missing_selected_global_ids, vec![129]);
+        assert_eq!(currentness.physical_lru, lru_before);
+        assert_eq!(currentness.residency_counters, counters_before);
+    }
+
+    #[test]
+    fn authoritative_actual_classification_fails_closed_on_physical_identity_corruption() {
+        let currentness = TestAuthoritativeCurrentness {
+            outcomes: BTreeMap::from([
+                (128, Ok(false)),
+                (
+                    129,
+                    Err(GpuNativeTieredResidencyError::PhysicalIdentityCorrupt { global_id: 129 }),
+                ),
+            ]),
+            calls: std::cell::RefCell::new(Vec::new()),
+            physical_lru: vec![129],
+            residency_counters: [7, 8, 9, 10],
+        };
+        let lru_before = currentness.physical_lru.clone();
+        let counters_before = currentness.residency_counters;
+
+        let error = classify_authoritative_actual_selected(&currentness, 1, &[0, 1], 128)
+            .expect_err("corrupt physical identity must not be classified as missing");
+
+        assert!(error.to_string().contains("physical metadata disagrees"));
+        assert_eq!(currentness.calls.into_inner(), vec![128, 129]);
+        assert_eq!(currentness.physical_lru, lru_before);
+        assert_eq!(currentness.residency_counters, counters_before);
+    }
+
+    #[test]
+    fn observer_callback_runtime_guard_fails_closed_on_any_guarded_delta() {
+        let before = ObserverCallbackGuardSnapshot::default();
+        assert!(verify_callback_guard_unchanged(
+            ShadowObserverCallbackKind::ObserveBoundary,
+            &before,
+            &before,
+        )
+        .is_ok());
+
+        let mut residency_changed = before.clone();
+        residency_changed.residency.tiered.physical_evictions = 1;
+        assert!(verify_callback_guard_unchanged(
+            ShadowObserverCallbackKind::ObserveBoundary,
+            &before,
+            &residency_changed,
+        )
+        .is_err());
+
+        let mut storage_changed = before.clone();
+        storage_changed.engine.nvme_bytes_read = 1;
+        assert!(verify_callback_guard_unchanged(
+            ShadowObserverCallbackKind::BeforeSegment,
+            &before,
+            &storage_changed,
+        )
+        .is_err());
     }
 
     fn synthetic_event(
@@ -2135,7 +2473,7 @@ mod tests {
         );
         obs.before_segment(0, 1).unwrap();
         let pending = obs.inner.lock().pending.take().unwrap();
-        let scored = score_pending(
+        let scored = score_pending_for_test(
             pending,
             &[0, 1, 2, 3, 4, 5, 6, 7],
             physical(&[128, 129, 130, 131, 132, 133], 8),
@@ -2157,7 +2495,7 @@ mod tests {
             obs.inject_frozen_for_test(ShadowPhase::Measured, 0, 0, 1, ranked, physical(&[], 8));
             obs.before_segment(0, 1).unwrap();
             let pending = obs.inner.lock().pending.take().unwrap();
-            score_pending(
+            score_pending_for_test(
                 pending,
                 &[0, 1, 2, 3, 4, 5, 6, 7],
                 physical(&[], 8),
@@ -2200,7 +2538,7 @@ mod tests {
             );
             obs.before_segment(0, 1).unwrap();
             let pending = obs.inner.lock().pending.take().unwrap();
-            score_pending(
+            score_pending_for_test(
                 pending,
                 &[0, 1, 2, 3, 4, 5, 6, 7],
                 physical(&[128, 129, 130, 131, 132, 133, 134], 8),
@@ -2230,7 +2568,7 @@ mod tests {
         );
         obs.before_segment(0, 1).unwrap();
         let pending = obs.inner.lock().pending.take().unwrap();
-        let scored = score_pending(
+        let scored = score_pending_for_test(
             pending,
             &[0, 1, 2, 3, 4, 5, 6, 7],
             physical(&[128, 129, 130, 131, 132, 133, 134, 135], 8),
@@ -2252,7 +2590,7 @@ mod tests {
         obs.inject_frozen_for_test(ShadowPhase::Measured, 0, 0, 1, &[128], physical(&[], 8));
         obs.before_segment(0, 1).unwrap();
         let pending = obs.inner.lock().pending.take().unwrap();
-        let scored = score_pending(
+        let scored = score_pending_for_test(
             pending,
             &[0, 1, 2, 3, 4, 5, 6, 7],
             physical(&[], 8),
@@ -2367,20 +2705,22 @@ mod tests {
     }
 
     #[test]
-    fn shadow_side_effect_counters_are_structurally_zero() {
+    fn runtime_guard_evidence_is_false_until_real_callback_windows_are_checked() {
+        let obs = observer();
         assert_eq!(
-            ShadowSideEffectCounters::default(),
-            ShadowSideEffectCounters {
-                prefetch_requests: 0,
-                source_acquisitions: 0,
-                ram_reads: 0,
-                nvme_reads: 0,
-                logical_admissions: 0,
-                physical_installs: 0,
-                physical_evictions: 0,
-                physical_retires: 0,
-                generation_changes: 0,
-                lru_touches: 0,
+            obs.runtime_guard_evidence(),
+            ObserverRuntimeGuardEvidence::default()
+        );
+
+        obs.record_runtime_guarded_callback(ShadowObserverCallbackKind::BeforeSegment);
+        obs.record_runtime_guarded_callback(ShadowObserverCallbackKind::ObserveBoundary);
+        assert_eq!(
+            obs.runtime_guard_evidence(),
+            ObserverRuntimeGuardEvidence {
+                verified: true,
+                checked_callback_count: 2,
+                before_segment_callback_count: 1,
+                observe_boundary_callback_count: 1,
             }
         );
     }
