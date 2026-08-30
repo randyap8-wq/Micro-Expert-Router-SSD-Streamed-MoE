@@ -16,7 +16,7 @@ use crate::gpu_native_residency::{
 use crate::pregate::PerLayerPreGate;
 use crate::router::{
     spatial_neighbors, LayeredExpertAffinity, LocalityMonitor, PredictiveLoader,
-    SPATIAL_CONFIDENCE_THRESHOLD, W_AFFINITY, W_SPATIAL,
+    SPATIAL_CONFIDENCE_THRESHOLD, W_AFFINITY, W_LOCALITY, W_MARKOV, W_SPATIAL,
 };
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -41,7 +41,9 @@ const MARKOV1: &str = "predictive-loader-first-order";
 const MARKOV2: &str = "predictive-loader-second-order";
 const LOCALITY: &str = "locality-hot-set";
 const REDUCED_UNIFIED: &str = "reduced-unified-markov2-locality";
-const REDUCED_SPATIAL_AFFINITY: &str = "reduced-unified-markov2-locality-spatial-affinity";
+const REDUCED_NORMALIZED_SPATIAL_AFFINITY: &str =
+    "reduced-normalized-markov2-locality-spatial-affinity";
+const REDUCED_HEADLINE_WEIGHT_MASS: f32 = W_MARKOV + W_LOCALITY;
 const MAX_FANOUT: usize = 16;
 const BASE_FANOUTS: [usize; 4] = [1, 2, 4, 8];
 const OPTIONAL_FANOUTS: [usize; 2] = [12, 16];
@@ -179,7 +181,7 @@ pub(crate) fn predictor_candidate_audit() -> Vec<PredictorCandidateAudit> {
             unavailable_or_prohibited_requirements: vec!["cannot rank a future target without causal seeds"],
             private_shadow_state: true,
             target_leakage: false,
-            disposition: "evaluated only in the reduced spatial-affinity fusion",
+            disposition: "evaluated only as a fusion arm in the new simple deterministic reduced-normalized Markov2+locality spatial-affinity candidate",
         },
         PredictorCandidateAudit {
             source: "predict_unified",
@@ -215,7 +217,7 @@ pub(crate) fn predictor_candidate_audit() -> Vec<PredictorCandidateAudit> {
             unavailable_or_prohibited_requirements: vec!["full unified neural hidden-state arm is unavailable", "a new GPU-to-CPU readback is prohibited"],
             private_shadow_state: false,
             target_leakage: false,
-            disposition: "full production spatial unified is not claimed; an explicitly named reduced fusion is evaluated",
+            disposition: "full production spatial unified remains ineligible because the neural hidden feature is unavailable without a prohibited GPU-to-CPU readback; only an explicitly named new reduced-normalized causal fusion is evaluated",
         },
         PredictorCandidateAudit {
             source: "NeuralSpeculator",
@@ -253,23 +255,24 @@ pub(crate) fn predictor_candidate_audit() -> Vec<PredictorCandidateAudit> {
             disposition: "evaluated and explicitly not represented as full production unified",
         },
         PredictorCandidateAudit {
-            source: REDUCED_SPATIAL_AFFINITY,
+            source: REDUCED_NORMALIZED_SPATIAL_AFFINITY,
             source_locations: vec![
                 "rust-engine/src/gpu_native_prefetch_multipredictor_shadow.rs::freeze_predictions",
-                "rust-engine/src/router.rs::{spatial_neighbors,SPATIAL_CONFIDENCE_THRESHOLD,W_AFFINITY,W_SPATIAL}",
+                "rust-engine/src/gpu_native_prefetch_multipredictor_shadow.rs::{normalize_reduced_headline_scores,fold_normalized_reduced_spatial_affinity}",
+                "rust-engine/src/router.rs::{W_MARKOV,W_LOCALITY,spatial_neighbors,SPATIAL_CONFIDENCE_THRESHOLD,W_AFFINITY,W_SPATIAL}",
                 "rust-engine/src/router.rs::LayeredExpertAffinity::neighbors",
             ],
             eligibility: "eligible",
-            implementation: "thin global-ID adapter preserving canonical unified, spatial-threshold, spatial-neighbor, and affinity weights",
-            exact_state_consumed: "reduced unified candidates plus private historical layer-qualified affinity",
-            learning_state_mutated: "none during fusion; affinity updates after target scoring",
+            implementation: "new simple deterministic causal fusion: divide every frozen raw reduced score by available headline mass W_MARKOV + W_LOCALITY = 0.58, then apply the canonical 0.80 seed threshold, 0.05 spatial contribution, and 0.10 affinity contribution",
+            exact_state_consumed: "frozen Markov2, frozen locality, and historical private layer-qualified affinity; no current target route or target truth",
+            learning_state_mutated: "none during normalization/fusion; private affinity updates only after the frozen target is scored",
             id_namespace: "global candidates with layer-qualified local affinity lookup",
             temporal_target: "next contiguous MoE layer plus neighbors of causally predicted high-confidence seeds",
             cpu_visible_at_prediction_freeze: true,
             unavailable_or_prohibited_requirements: vec![],
             private_shadow_state: true,
             target_leakage: false,
-            disposition: "evaluated; with the neural arm absent, canonical 0.80 seed threshold may make the neighbor fold a structural no-op",
+            disposition: "evaluated as a new causal fusion, not as either production unified predictor; without normalization the reduced Markov2+locality maximum is W_MARKOV + W_LOCALITY = 0.58, so the canonical 0.80 spatial/affinity seed threshold is structurally unreachable",
         },
     ]
 }
@@ -743,21 +746,27 @@ fn freeze_predictions(
         .iter()
         .map(|prediction| (prediction.global_id, prediction.score))
         .collect::<Vec<_>>();
-    let mut reduced =
+    let reduced_complete =
         inner
             .predictors
             .markov
             .combine_unified_arms(&markov2_arm, &locality_ids, &[]);
-    reduced.truncate(MAX_FANOUT);
-    let reduced = reduced
+    let reduced_complete = reduced_complete
         .into_iter()
         .map(|(global_id, score)| RankedPrediction {
             global_id,
             score: score as f64,
         })
         .collect::<Vec<_>>();
-    let reduced_spatial_affinity =
-        fold_reduced_spatial_affinity(&reduced, &inner.predictors.affinity, config);
+    let reduced_normalized_spatial_affinity = fold_normalized_reduced_spatial_affinity(
+        &reduced_complete,
+        &inner.predictors.affinity,
+        config,
+    );
+    let reduced = reduced_complete
+        .into_iter()
+        .take(MAX_FANOUT)
+        .collect::<Vec<_>>();
 
     let candidates = vec![
         (CONTROL, "summed online transition counts; not a calibrated probability", pregate),
@@ -765,7 +774,7 @@ fn freeze_predictions(
         (MARKOV2, "50/50 Laplace-smoothed first/second-order transition blend with first-order fallback", markov2),
         (LOCALITY, "sliding-window heat count with existing descending-heat/ascending-ID tie order", locality),
         (REDUCED_UNIFIED, "canonical 0.33 Markov + 0.25 locality weighted score; neural arm explicitly absent", reduced),
-        (REDUCED_SPATIAL_AFFINITY, "reduced unified score plus canonical 0.05 spatial and 0.10 layer-affinity seed expansion at the 0.80 threshold", reduced_spatial_affinity),
+        (REDUCED_NORMALIZED_SPATIAL_AFFINITY, "raw reduced score divided by available headline mass W_MARKOV + W_LOCALITY = 0.58, then canonical 0.80 seed threshold with 0.05 spatial and 0.10 layer-affinity contributions", reduced_normalized_spatial_affinity),
     ];
     let predictors = candidates
         .into_iter()
@@ -795,18 +804,31 @@ fn freeze_predictions(
     })
 }
 
-fn fold_reduced_spatial_affinity(
-    base: &[RankedPrediction],
+fn normalize_reduced_headline_scores(base: &[RankedPrediction]) -> Vec<RankedPrediction> {
+    debug_assert!(REDUCED_HEADLINE_WEIGHT_MASS.is_finite());
+    debug_assert!(REDUCED_HEADLINE_WEIGHT_MASS > 0.0);
+    let available_mass = REDUCED_HEADLINE_WEIGHT_MASS as f64;
+    base.iter()
+        .map(|candidate| RankedPrediction {
+            global_id: candidate.global_id,
+            score: candidate.score / available_mass,
+        })
+        .collect()
+}
+
+fn fold_normalized_reduced_spatial_affinity(
+    raw_reduced_base: &[RankedPrediction],
     affinity: &LayeredExpertAffinity,
     config: &MultipredictorObserverConfig,
 ) -> Vec<RankedPrediction> {
-    let seeds = base
+    let normalized_base = normalize_reduced_headline_scores(raw_reduced_base);
+    let seeds = normalized_base
         .iter()
         .filter(|candidate| candidate.score as f32 >= SPATIAL_CONFIDENCE_THRESHOLD)
         .map(|candidate| candidate.global_id)
         .collect::<Vec<_>>();
     let total_experts = config.num_layers.saturating_mul(config.experts_per_layer) as u32;
-    let mut combined = base
+    let mut combined = normalized_base
         .iter()
         .map(|candidate| (candidate.global_id, candidate.score as f32))
         .collect::<HashMap<_, _>>();
@@ -1108,7 +1130,7 @@ fn score_pending(
                         MARKOV1 | MARKOV2 => "the configured global expert namespace, thresholded transition row, and deterministic unseen top-up emitted fewer distinct candidates than requested",
                         LOCALITY => "the thresholded private locality window contained fewer distinct hot experts than requested",
                         REDUCED_UNIFIED => "the eligible Markov2 and locality arms contained fewer distinct fused candidates than requested",
-                        REDUCED_SPATIAL_AFFINITY => "the reduced unified, spatial, and historical layer-affinity arms contained fewer distinct fused candidates than requested",
+                        REDUCED_NORMALIZED_SPATIAL_AFFINITY => "the normalized reduced unified, spatial, and historical layer-affinity arms contained fewer distinct fused candidates than requested",
                         _ => "the predictor emitted fewer distinct candidates than requested",
                     },
                 ),
@@ -2249,7 +2271,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
             MARKOV2,
             LOCALITY,
             REDUCED_UNIFIED,
-            REDUCED_SPATIAL_AFFINITY,
+            REDUCED_NORMALIZED_SPATIAL_AFFINITY,
         ],
         exact_prediction_freeze_point: "after ordinary boundary readback makes route L-1 CPU-visible and after all earlier targets are scored/learned, before the next segment submission/probe for target L",
         exact_update_timing: "score every frozen predictor against one authoritative target truth first; only then update private pre-gate, Markov, locality, and layer-affinity state",
@@ -2549,7 +2571,7 @@ mod tests {
             MARKOV2,
             LOCALITY,
             REDUCED_UNIFIED,
-            REDUCED_SPATIAL_AFFINITY,
+            REDUCED_NORMALIZED_SPATIAL_AFFINITY,
         ] {
             let candidate = audit
                 .iter()
@@ -2579,6 +2601,219 @@ mod tests {
             .find(|candidate| candidate.source == "LayeredExpertAffinity")
             .unwrap();
         assert_eq!(affinity.eligibility, "eligible-fusion-only");
+        assert!(affinity
+            .disposition
+            .contains("new simple deterministic reduced-normalized"));
+        let full_spatial = audit
+            .iter()
+            .find(|candidate| candidate.source == "predict_unified_with_spatial")
+            .unwrap();
+        assert!(full_spatial.disposition.contains(
+            "neural hidden feature is unavailable without a prohibited GPU-to-CPU readback"
+        ));
+        let normalized = audit
+            .iter()
+            .find(|candidate| candidate.source == REDUCED_NORMALIZED_SPATIAL_AFFINITY)
+            .unwrap();
+        assert!(normalized
+            .implementation
+            .contains("W_MARKOV + W_LOCALITY = 0.58"));
+        assert!(normalized.implementation.contains("0.80 seed threshold"));
+        assert!(normalized.implementation.contains("0.05 spatial"));
+        assert!(normalized.implementation.contains("0.10 affinity"));
+        assert!(normalized
+            .exact_state_consumed
+            .contains("no current target route or target truth"));
+        assert!(normalized
+            .learning_state_mutated
+            .contains("affinity updates only after"));
+        assert!(normalized.disposition.contains("structurally unreachable"));
+    }
+
+    #[test]
+    fn raw_reduced_headline_mass_is_structurally_below_the_canonical_seed_threshold() {
+        assert_eq!(REDUCED_HEADLINE_WEIGHT_MASS, W_MARKOV + W_LOCALITY);
+        assert!(REDUCED_HEADLINE_WEIGHT_MASS < SPATIAL_CONFIDENCE_THRESHOLD);
+
+        let seed = 9;
+        let loader = PredictiveLoader::new(24, MAX_FANOUT, 0.0, 7);
+        let raw = loader.combine_unified_arms(&[(seed, 1.0)], &[seed], &[]);
+        let raw_score = raw
+            .iter()
+            .find(|(global_id, _)| *global_id == seed)
+            .unwrap()
+            .1;
+        assert!((raw_score - REDUCED_HEADLINE_WEIGHT_MASS).abs() < 1e-6);
+        assert!(raw_score < SPATIAL_CONFIDENCE_THRESHOLD);
+
+        let normalized = normalize_reduced_headline_scores(&[RankedPrediction {
+            global_id: seed,
+            score: raw_score as f64,
+        }]);
+        assert!((normalized[0].score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalized_reduced_fusion_activates_spatial_and_historical_layer_affinity() {
+        let cfg = config();
+        let affinity = LayeredExpertAffinity::new(cfg.num_layers, cfg.experts_per_layer as u32);
+        affinity.observe_layer(1, &[1, 6]);
+        let raw = vec![RankedPrediction {
+            global_id: 9,
+            score: REDUCED_HEADLINE_WEIGHT_MASS as f64,
+        }];
+
+        let fused = fold_normalized_reduced_spatial_affinity(&raw, &affinity, &cfg);
+        let score = |global_id| {
+            fused
+                .iter()
+                .find(|candidate| candidate.global_id == global_id)
+                .map(|candidate| candidate.score)
+        };
+        assert!((score(9).unwrap() - 1.0).abs() < 1e-6);
+        assert!((score(8).unwrap() - W_SPATIAL as f64).abs() < 1e-6);
+        assert!((score(10).unwrap() - W_SPATIAL as f64).abs() < 1e-6);
+        assert!((score(14).unwrap() - W_AFFINITY as f64).abs() < 1e-6);
+        assert_ne!(
+            fused
+                .iter()
+                .map(|candidate| candidate.global_id)
+                .collect::<Vec<_>>(),
+            raw.iter()
+                .map(|candidate| candidate.global_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn normalization_preserves_raw_ranking_without_auxiliary_additions_and_ties_are_deterministic()
+    {
+        let cfg = config();
+        let affinity = LayeredExpertAffinity::new(cfg.num_layers, cfg.experts_per_layer as u32);
+        let raw = vec![
+            RankedPrediction {
+                global_id: 10,
+                score: 0.40,
+            },
+            RankedPrediction {
+                global_id: 12,
+                score: 0.40,
+            },
+            RankedPrediction {
+                global_id: 11,
+                score: 0.30,
+            },
+        ];
+        assert!(
+            raw[0].score / (REDUCED_HEADLINE_WEIGHT_MASS as f64)
+                < SPATIAL_CONFIDENCE_THRESHOLD as f64
+        );
+        let fused = fold_normalized_reduced_spatial_affinity(&raw, &affinity, &cfg);
+        assert_eq!(
+            fused
+                .iter()
+                .map(|candidate| candidate.global_id)
+                .collect::<Vec<_>>(),
+            vec![10, 12, 11]
+        );
+        for (raw_candidate, normalized_candidate) in raw.iter().zip(&fused) {
+            assert!(
+                (normalized_candidate.score
+                    - raw_candidate.score / REDUCED_HEADLINE_WEIGHT_MASS as f64)
+                    .abs()
+                    < 1e-6
+            );
+        }
+
+        let reversed_tie = vec![raw[1].clone(), raw[0].clone(), raw[2].clone()];
+        let reranked = fold_normalized_reduced_spatial_affinity(&reversed_tie, &affinity, &cfg);
+        assert_eq!(
+            reranked
+                .iter()
+                .map(|candidate| candidate.global_id)
+                .collect::<Vec<_>>(),
+            vec![10, 12, 11]
+        );
+    }
+
+    #[test]
+    fn normalized_fusion_truncates_only_after_complete_auxiliary_ranking() {
+        let cfg = config();
+        let affinity = LayeredExpertAffinity::new(cfg.num_layers, cfg.experts_per_layer as u32);
+        let mut complete_raw = (0..MAX_FANOUT as u32)
+            .map(|global_id| RankedPrediction {
+                global_id,
+                score: 0.001,
+            })
+            .collect::<Vec<_>>();
+        complete_raw.push(RankedPrediction {
+            global_id: 16,
+            score: REDUCED_HEADLINE_WEIGHT_MASS as f64,
+        });
+
+        let fused = fold_normalized_reduced_spatial_affinity(&complete_raw, &affinity, &cfg);
+        assert_eq!(fused.len(), MAX_FANOUT);
+        assert_eq!(fused[0].global_id, 16);
+        assert!(fused.iter().any(|candidate| candidate.global_id == 17));
+    }
+
+    #[test]
+    fn normalized_fusion_is_target_truth_independent_and_affinity_learning_is_post_score() {
+        let cfg = config();
+        let affinity = LayeredExpertAffinity::new(cfg.num_layers, cfg.experts_per_layer as u32);
+        let raw = vec![RankedPrediction {
+            global_id: 9,
+            score: REDUCED_HEADLINE_WEIGHT_MASS as f64,
+        }];
+        let frozen = fold_normalized_reduced_spatial_affinity(&raw, &affinity, &cfg);
+        assert!(!frozen.iter().any(|candidate| candidate.global_id == 14));
+
+        let make_pending = || PendingTarget {
+            phase: ShadowPhase::Measured,
+            run_index: 0,
+            completed_token_position: 9,
+            target_layer: 1,
+            predictors: vec![FrozenPredictor {
+                source: REDUCED_NORMALIZED_SPATIAL_AFFINITY,
+                score_semantics: "test normalized causal fusion",
+                ranked: frozen.clone(),
+                duplicate_prediction_count: 0,
+            }],
+            physical: physical(1, &[], 16),
+            frozen_sequence: 1,
+            frozen_at_us: 10,
+            target_probe_sequence: Some(2),
+            target_probe_at_us: Some(20),
+        };
+        let first_truth = score_pending(
+            make_pending(),
+            actual(&[9, 14], &[], &[9, 14]),
+            physical(1, &[], 16),
+            3,
+            4,
+        )
+        .unwrap();
+        let second_truth = score_pending(
+            make_pending(),
+            actual(&[9, 13], &[], &[9, 13]),
+            physical(1, &[], 16),
+            3,
+            4,
+        )
+        .unwrap();
+        assert!(first_truth.iter().zip(&second_truth).all(|(left, right)| {
+            left.ranked_candidate_global_ids == right.ranked_candidate_global_ids
+                && left.ranked_candidate_scores == right.ranked_candidate_scores
+        }));
+        assert!(first_truth.iter().all(|event| {
+            event.ordering.prediction_scored_sequence < event.ordering.predictor_updated_sequence
+        }));
+
+        affinity.observe_layer(1, &[1, 6]);
+        let next_target = fold_normalized_reduced_spatial_affinity(&raw, &affinity, &cfg);
+        assert!(next_target
+            .iter()
+            .any(|candidate| candidate.global_id == 14));
     }
 
     #[test]
