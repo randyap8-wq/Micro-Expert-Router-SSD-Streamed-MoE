@@ -25,7 +25,9 @@ use crate::backend::gpu_native::{
 use crate::dense_tensor::DenseDType;
 use crate::engine::{Engine, GpuNativeDemandResidencyError};
 use crate::gating::ScoringFunc;
-use crate::gpu_native_prefetch_shadow::{with_observer_runtime_guard, ShadowObserverCallbackKind};
+use crate::gpu_native_prefetch_shadow::{
+    with_observer_runtime_guard, GpuNativePrefetchShadowCallbacks, ShadowObserverCallbackKind,
+};
 use crate::gpu_native_residency::GpuNativeTieredResidencyManager;
 use crate::model::RealModel;
 use crate::sampling::SamplingParams;
@@ -982,9 +984,8 @@ pub struct GpuNativeTokenLoop {
     report_layout: GpuNativeBoundaryReportLayout,
     counters: GpuNativeTokenLoopCounters,
     recovery_counters: GpuNativeRecoveryCounters,
-    prefetch_shadow_observer: parking_lot::RwLock<
-        Option<Arc<crate::gpu_native_prefetch_shadow::GpuNativePrefetchShadowObserver>>,
-    >,
+    prefetch_shadow_observer:
+        parking_lot::RwLock<Option<Arc<dyn GpuNativePrefetchShadowCallbacks>>>,
     execution_guard: TokioMutex<()>,
 }
 
@@ -1336,7 +1337,7 @@ impl GpuNativeTokenLoop {
     /// this slot empty and retain the exact canonical token-loop path.
     pub(crate) fn install_prefetch_shadow_observer(
         &self,
-        observer: Arc<crate::gpu_native_prefetch_shadow::GpuNativePrefetchShadowObserver>,
+        observer: Arc<dyn GpuNativePrefetchShadowCallbacks>,
     ) -> Result<(), crate::gpu_native_prefetch_shadow::ShadowObserverError> {
         let mut slot = self.prefetch_shadow_observer.write();
         if slot.is_some() {
@@ -2188,7 +2189,7 @@ impl GpuNativeTokenLoop {
                     Vec::new()
                 };
                 with_observer_runtime_guard(
-                    observer,
+                    observer.as_ref(),
                     engine.as_ref(),
                     self.residency_manager.as_ref(),
                     ShadowObserverCallbackKind::BeforeSegment,
@@ -2339,7 +2340,7 @@ impl GpuNativeTokenLoop {
                         let observed_layers = segment.ordinary_layers.start..=fail_layer;
                         let guard_layers = observed_layers.clone().collect::<Vec<_>>();
                         with_observer_runtime_guard(
-                            observer,
+                            observer.as_ref(),
                             engine.as_ref(),
                             self.residency_manager.as_ref(),
                             ShadowObserverCallbackKind::ObserveBoundary,
@@ -2397,7 +2398,7 @@ impl GpuNativeTokenLoop {
                             segment.ordinary_layers.start..=segment.ordinary_layers.end - 1;
                         let guard_layers = observed_layers.clone().collect::<Vec<_>>();
                         with_observer_runtime_guard(
-                            observer,
+                            observer.as_ref(),
                             engine.as_ref(),
                             self.residency_manager.as_ref(),
                             ShadowObserverCallbackKind::ObserveBoundary,
@@ -2438,7 +2439,7 @@ impl GpuNativeTokenLoop {
                         segment.ordinary_layers.start..=segment.ordinary_layers.end - 1;
                     let guard_layers = observed_layers.clone().collect::<Vec<_>>();
                     with_observer_runtime_guard(
-                        observer,
+                        observer.as_ref(),
                         engine.as_ref(),
                         self.residency_manager.as_ref(),
                         ShadowObserverCallbackKind::ObserveBoundary,

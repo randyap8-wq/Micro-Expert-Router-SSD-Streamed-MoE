@@ -488,6 +488,47 @@ impl PredictiveLoader {
         probs
     }
 
+    /// Deterministic, read-only adapter for shadow qualification. This keeps
+    /// the production first-order probability, smoothing, threshold, and
+    /// unseen-candidate semantics, but applies an explicit ascending-id tie
+    /// break before the caller-supplied limit. Ordinary production prediction
+    /// continues to use [`Self::predict_next`] unchanged.
+    pub(crate) fn predict_next_shadow_ranked(&self, from: u32, limit: usize) -> Vec<(u32, f64)> {
+        if from >= self.num_experts || self.fanout == 0 || limit == 0 {
+            return Vec::new();
+        }
+        let n = self.num_experts as usize;
+        let rows = self.rows.read();
+        let row = &rows[from as usize];
+        let total_f = self.effective_total(row.total_observed) as f64;
+        let prior_f = self.prior as f64;
+        let mut ranked = row
+            .counts
+            .iter()
+            .map(|(&id, &count)| (id, (count as f64 + prior_f) / total_f))
+            .filter(|&(_, probability)| probability >= self.min_prob)
+            .collect::<Vec<_>>();
+        let prior_probability = prior_f / total_f;
+        if ranked.len() < self.fanout {
+            for id in 0..n as u32 {
+                if ranked.len() >= self.fanout {
+                    break;
+                }
+                if !row.counts.contains_key(&id) {
+                    ranked.push((id, prior_probability));
+                }
+            }
+        }
+        ranked.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        ranked.truncate(limit.min(self.fanout));
+        ranked
+    }
+
     /// 2nd-order variant of [`Self::predict_next`]. When a `(prev_prev,
     /// prev)` row has been observed, blends its distribution with the
     /// 1st-order distribution from `prev` (50/50). Falls back to pure
@@ -525,6 +566,56 @@ impl PredictiveLoader {
         out.sort_by(|a, b| b.1.total_cmp(&a.1));
         out.truncate(self.fanout);
         out
+    }
+
+    /// Deterministic, read-only second-order adapter for shadow
+    /// qualification. It preserves the production 50/50 blend and fallback
+    /// semantics while making equal-score ordering explicit. Production uses
+    /// [`Self::predict_next2`] unchanged.
+    pub(crate) fn predict_next2_shadow_ranked(
+        &self,
+        prev_prev: u32,
+        prev: u32,
+        limit: usize,
+    ) -> Vec<(u32, f64)> {
+        let baseline = self.predict_next_shadow_ranked(prev, self.fanout);
+        if prev_prev >= self.num_experts
+            || prev >= self.num_experts
+            || self.fanout == 0
+            || limit == 0
+        {
+            return baseline.into_iter().take(limit).collect();
+        }
+        let key = (prev_prev as u64) * (self.num_experts as u64) + prev as u64;
+        let rows2 = self.rows2.read();
+        let Some(row2) = rows2.get(&key) else {
+            return baseline.into_iter().take(limit).collect();
+        };
+        if row2.total_observed == 0 {
+            return baseline.into_iter().take(limit).collect();
+        }
+        let total_f = self.effective_total(row2.total_observed) as f64;
+        let prior_f = self.prior as f64;
+        let mut combined = HashMap::<u32, f64>::new();
+        for (id, probability) in baseline {
+            *combined.entry(id).or_insert(0.0) += 0.5 * probability;
+        }
+        for (&id, &count) in &row2.counts {
+            let probability = (count as f64 + prior_f) / total_f;
+            *combined.entry(id).or_insert(0.0) += 0.5 * probability;
+        }
+        let mut ranked = combined
+            .into_iter()
+            .filter(|&(_, probability)| probability >= self.min_prob)
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        ranked.truncate(limit.min(self.fanout));
+        ranked
     }
 
     /// **Unified prediction.** Combines the Markov-chain row predictions

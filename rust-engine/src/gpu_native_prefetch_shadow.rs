@@ -175,8 +175,26 @@ fn verify_callback_guard_unchanged(
 /// Execute one observer callback between independent read-only production
 /// snapshots. Snapshot locks are released before the callback begins. Any
 /// callback-window change fails closed before normal execution can continue.
+pub(crate) trait GpuNativePrefetchShadowCallbacks: Send + Sync {
+    fn before_segment(
+        &self,
+        completed_token_position: usize,
+        first_new_layer: usize,
+    ) -> Result<(), ShadowObserverError>;
+
+    fn observe_boundary(
+        &self,
+        completed_token_position: usize,
+        observed_layers: std::ops::RangeInclusive<usize>,
+        selected_ids_by_layer: &[Vec<u32>],
+        residency: &GpuNativeTieredResidencyManager,
+    ) -> Result<(), ShadowObserverError>;
+
+    fn record_runtime_guarded_callback(&self, kind: ShadowObserverCallbackKind);
+}
+
 pub(crate) fn with_observer_runtime_guard<T>(
-    observer: &GpuNativePrefetchShadowObserver,
+    observer: &dyn GpuNativePrefetchShadowCallbacks,
     engine: &crate::engine::Engine,
     residency: &GpuNativeTieredResidencyManager,
     kind: ShadowObserverCallbackKind,
@@ -612,6 +630,36 @@ impl GpuNativePrefetchShadowObserver {
             target_probe_sequence: None,
             target_probe_at_us: None,
         });
+    }
+}
+
+impl GpuNativePrefetchShadowCallbacks for GpuNativePrefetchShadowObserver {
+    fn before_segment(
+        &self,
+        completed_token_position: usize,
+        first_new_layer: usize,
+    ) -> Result<(), ShadowObserverError> {
+        Self::before_segment(self, completed_token_position, first_new_layer)
+    }
+
+    fn observe_boundary(
+        &self,
+        completed_token_position: usize,
+        observed_layers: std::ops::RangeInclusive<usize>,
+        selected_ids_by_layer: &[Vec<u32>],
+        residency: &GpuNativeTieredResidencyManager,
+    ) -> Result<(), ShadowObserverError> {
+        Self::observe_boundary(
+            self,
+            completed_token_position,
+            observed_layers,
+            selected_ids_by_layer,
+            residency,
+        )
+    }
+
+    fn record_runtime_guarded_callback(&self, kind: ShadowObserverCallbackKind) {
+        Self::record_runtime_guarded_callback(self, kind);
     }
 }
 
@@ -1553,7 +1601,7 @@ fn validate_hex(value: &str, len: usize) -> bool {
     value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn validate_zero_speculative_work(
+pub(crate) fn validate_zero_speculative_work(
     result: &crate::gpu_native_real_benchmark::PerRunResult,
 ) -> Result<(), crate::gpu_native_real_benchmark::BenchmarkFailure> {
     let residency = result.counters.gpu_native_residency_delta;
@@ -1575,7 +1623,7 @@ fn validate_zero_speculative_work(
     Ok(())
 }
 
-fn validate_shadow_preflight(
+pub(crate) fn validate_shadow_preflight(
     build: &crate::qualification::BuildProvenance,
     artifacts: &crate::qualification::QualificationArtifacts,
     artifact_errors: &[String],
@@ -1621,7 +1669,7 @@ fn validate_shadow_preflight(
     Ok(())
 }
 
-fn validate_shadow_runtime(
+pub(crate) fn validate_shadow_runtime(
     runtime: &crate::BenchRealRuntime,
     resolved_config_sha256: &str,
     expected_adapter_name: &str,

@@ -146,6 +146,7 @@ pub(crate) mod gpu_native_f32_reference_boundary_audit;
 pub(crate) mod gpu_native_greedy_parity;
 pub(crate) mod gpu_native_layer0_diagnostics;
 pub(crate) mod gpu_native_q4_expert_stage_attribution;
+pub(crate) mod gpu_native_prefetch_multipredictor_shadow;
 pub(crate) mod gpu_native_prefetch_shadow;
 pub(crate) mod gpu_native_real_benchmark;
 pub(crate) mod gpu_native_router_rank_diagnostics;
@@ -939,6 +940,41 @@ enum Cmd {
         #[arg(long)]
         expected_adapter_name: String,
         /// Write the typed JSON shadow report here instead of stdout.
+        #[arg(long)]
+        report_out: Option<PathBuf>,
+    },
+
+    /// Compare private causal GPU-native residency predictors without active
+    /// prefetch, storage I/O, cache admission, or physical mutation.
+    QualifyGpuNativePrefetchMultipredictorShadow {
+        /// Path to the strict production GPU-native TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Prompt text to tokenize once for every run.
+        #[arg(long, conflicts_with = "request_json")]
+        prompt: Option<String>,
+        /// OpenAI-style request JSON containing `prompt` or chat `messages`.
+        #[arg(long, conflicts_with = "prompt")]
+        request_json: Option<PathBuf>,
+        /// Exact number of generated tokens; must be at least two.
+        #[arg(long)]
+        output_tokens: Option<usize>,
+        /// Warmup requests, trained causally but excluded from measured metrics.
+        #[arg(long, default_value_t = 1)]
+        warmup_runs: usize,
+        /// Measured requests retained individually in the report.
+        #[arg(long, default_value_t = 3)]
+        measured_runs: usize,
+        /// Frozen cache schedule; only `keep` is accepted.
+        #[arg(long, value_enum, default_value_t = BenchRealCacheReset::Keep)]
+        cache_reset: BenchRealCacheReset,
+        /// Required deterministic greedy decoding contract.
+        #[arg(long, required = true)]
+        greedy: bool,
+        /// Exact authoritative adapter name expected at runtime.
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Write the typed JSON multipredictor report here instead of stdout.
         #[arg(long)]
         report_out: Option<PathBuf>,
     },
@@ -1894,6 +1930,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::BenchReal { config, .. }
         | Cmd::BenchGpuNativeReal { config, .. }
         | Cmd::QualifyGpuNativePrefetchShadow { config, .. }
+        | Cmd::QualifyGpuNativePrefetchMultipredictorShadow { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
@@ -2350,6 +2387,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     progress_watchdog,
                 },
             ))
+        }
+        Cmd::QualifyGpuNativePrefetchMultipredictorShadow {
+            config,
+            prompt,
+            request_json,
+            output_tokens,
+            warmup_runs,
+            measured_runs,
+            cache_reset,
+            greedy,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(
+                crate::gpu_native_prefetch_multipredictor_shadow::run_command(
+                    crate::gpu_native_prefetch_multipredictor_shadow::CommandArgs {
+                        config,
+                        prompt,
+                        request_json,
+                        output_tokens,
+                        warmup_runs,
+                        measured_runs,
+                        cache_reset,
+                        greedy,
+                        expected_adapter_name,
+                        report_out,
+                        progress_watchdog,
+                    },
+                ),
+            )
         }
         Cmd::QualifyHybridQ4 {
             config,
