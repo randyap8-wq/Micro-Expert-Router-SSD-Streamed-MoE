@@ -526,6 +526,8 @@ struct TieredResidencyCounters {
     speculative_requests: AtomicU64,
     speculative_vram_hits: AtomicU64,
     speculative_ram_to_vram_installs: AtomicU64,
+    total_ram_to_vram_install_bytes: AtomicU64,
+    speculative_ram_to_vram_install_bytes: AtomicU64,
     speculative_dropped_capacity_or_pressure: AtomicU64,
 }
 
@@ -592,6 +594,19 @@ pub(crate) struct GpuNativeTieredResidencySnapshot {
     pub(crate) speculative_ram_to_vram_installs: u64,
     pub(crate) speculative_dropped_capacity_or_pressure: u64,
     pub(crate) layers: Vec<GpuNativeTieredLayerSnapshot>,
+}
+
+/// PR1C-D qualification-only byte evidence for successful physical installs.
+///
+/// These fields deliberately remain separate from
+/// [`GpuNativeTieredResidencySnapshot`] so the canonical benchmark schema does
+/// not change. The total is the exact sum of `resident.data().len()` supplied
+/// to successful physical installs; the speculative value is its strict
+/// subset.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct GpuNativeQualificationInstallByteSnapshot {
+    pub(crate) total_ram_to_vram_install_bytes: u64,
+    pub(crate) speculative_ram_to_vram_install_bytes: u64,
 }
 
 /// Model-scoped owner of the preallocated per-layer Q4 expert arenas.
@@ -1115,6 +1130,23 @@ impl GpuNativeTieredResidencyManager {
         }
     }
 
+    /// Read-only PR1C-D qualification snapshot. This is intentionally not part
+    /// of the canonical GPU-native residency/benchmark evidence contract.
+    pub(crate) fn qualification_install_byte_snapshot(
+        &self,
+    ) -> GpuNativeQualificationInstallByteSnapshot {
+        GpuNativeQualificationInstallByteSnapshot {
+            total_ram_to_vram_install_bytes: self
+                .counters
+                .total_ram_to_vram_install_bytes
+                .load(Ordering::Relaxed),
+            speculative_ram_to_vram_install_bytes: self
+                .counters
+                .speculative_ram_to_vram_install_bytes
+                .load(Ordering::Relaxed),
+        }
+    }
+
     /// Copy one layer's physical capacity, resident ids, and exact LRU order
     /// without acquiring payloads, touching recency, or changing counters.
     pub(crate) fn shadow_layer_snapshot(
@@ -1354,16 +1386,10 @@ impl GpuNativeTieredResidencyManager {
             .put(global_id, PhysicalRecord { key, residency });
         if installed {
             self.counters
-                .ram_to_vram_installs
-                .fetch_add(1, Ordering::Relaxed);
+                .record_ram_to_vram_install(resident.data().len() as u64, speculative);
             if reinstall {
                 self.counters
                     .physical_reinstalls
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            if speculative {
-                self.counters
-                    .speculative_ram_to_vram_installs
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1374,6 +1400,32 @@ impl GpuNativeTieredResidencyManager {
         self.counters
             .speculative_dropped_capacity_or_pressure
             .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl TieredResidencyCounters {
+    fn record_ram_to_vram_install(&self, resident_payload_bytes: u64, speculative: bool) {
+        self.ram_to_vram_installs.fetch_add(1, Ordering::Relaxed);
+        self.total_ram_to_vram_install_bytes
+            .fetch_add(resident_payload_bytes, Ordering::Relaxed);
+        if speculative {
+            self.speculative_ram_to_vram_installs
+                .fetch_add(1, Ordering::Relaxed);
+            self.speculative_ram_to_vram_install_bytes
+                .fetch_add(resident_payload_bytes, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    fn qualification_install_byte_snapshot(&self) -> GpuNativeQualificationInstallByteSnapshot {
+        GpuNativeQualificationInstallByteSnapshot {
+            total_ram_to_vram_install_bytes: self
+                .total_ram_to_vram_install_bytes
+                .load(Ordering::Relaxed),
+            speculative_ram_to_vram_install_bytes: self
+                .speculative_ram_to_vram_install_bytes
+                .load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -1463,6 +1515,35 @@ mod tests {
             max_compute_invocations_per_workgroup: 64,
             ..wgpu::Limits::default()
         }
+    }
+
+    #[test]
+    fn successful_physical_install_accounting_tracks_demand_and_speculative_subsets() {
+        let counters = TieredResidencyCounters::default();
+
+        counters.record_ram_to_vram_install(4_096, false);
+        let demand = counters.qualification_install_byte_snapshot();
+        assert_eq!(counters.ram_to_vram_installs.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counters
+                .speculative_ram_to_vram_installs
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(demand.total_ram_to_vram_install_bytes, 4_096);
+        assert_eq!(demand.speculative_ram_to_vram_install_bytes, 0);
+
+        counters.record_ram_to_vram_install(8_192, true);
+        let speculative = counters.qualification_install_byte_snapshot();
+        assert_eq!(counters.ram_to_vram_installs.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            counters
+                .speculative_ram_to_vram_installs
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(speculative.total_ram_to_vram_install_bytes, 12_288);
+        assert_eq!(speculative.speculative_ram_to_vram_install_bytes, 8_192);
     }
 
     #[test]

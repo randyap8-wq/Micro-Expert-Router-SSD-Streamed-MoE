@@ -7,7 +7,8 @@
 use crate::gpu_native_prefetch_shadow::{ShadowObserverError, ShadowPhase};
 use crate::gpu_native_residency::{
     GpuNativeLivePostconditionEvidence, GpuNativeLiveReplacementPolicy,
-    GpuNativeLiveSpeculativeInstall, GpuNativeTieredResidencyManager,
+    GpuNativeLiveSpeculativeInstall, GpuNativeQualificationInstallByteSnapshot,
+    GpuNativeTieredResidencyManager,
 };
 use crate::router::PredictiveLoader;
 use parking_lot::Mutex;
@@ -1383,6 +1384,14 @@ fn global_id(
 pub(crate) struct LiveQualifiedRunEvidence {
     pub(crate) production: crate::gpu_native_real_benchmark::PerRunResult,
     pub(crate) live: LiveRunEvidence,
+    pub(crate) gpu_native_h2d_install_bytes: QualificationInstallByteEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct QualificationInstallByteEvidence {
+    pub(crate) before: GpuNativeQualificationInstallByteSnapshot,
+    pub(crate) after: GpuNativeQualificationInstallByteSnapshot,
+    pub(crate) delta: GpuNativeQualificationInstallByteSnapshot,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1398,6 +1407,12 @@ pub(crate) struct DemandSourceEvidence {
     pub(crate) demand_nvme_bytes: u64,
     pub(crate) demand_h2d_installs: u64,
     pub(crate) demand_h2d_bytes: u64,
+    pub(crate) total_gpu_native_h2d_installs: u64,
+    pub(crate) total_gpu_native_h2d_bytes: u64,
+    pub(crate) h2d_install_count_source: &'static str,
+    pub(crate) h2d_install_byte_source: &'static str,
+    pub(crate) legacy_gpu_expert_io_used_for_h2d_attribution: bool,
+    pub(crate) h2d_reconciliation_semantics: &'static str,
     pub(crate) speculative_ram_hits: u64,
     pub(crate) speculative_ram_misses: u64,
     pub(crate) speculative_nvme_operations: u64,
@@ -1693,6 +1708,94 @@ where
     })
 }
 
+fn qualification_install_byte_evidence(
+    before: GpuNativeQualificationInstallByteSnapshot,
+    after: GpuNativeQualificationInstallByteSnapshot,
+) -> Result<QualificationInstallByteEvidence, crate::gpu_native_real_benchmark::BenchmarkFailure> {
+    use crate::gpu_native_real_benchmark::BenchmarkFailure;
+    let checked_delta = |after: u64, before: u64, field: &str| {
+        after.checked_sub(before).ok_or_else(|| {
+            BenchmarkFailure::new(
+                "postcondition",
+                "gpu-native-install-byte-counter-underflow",
+                format!("{field}: before={before} after={after}"),
+            )
+        })
+    };
+    Ok(QualificationInstallByteEvidence {
+        before,
+        after,
+        delta: GpuNativeQualificationInstallByteSnapshot {
+            total_ram_to_vram_install_bytes: checked_delta(
+                after.total_ram_to_vram_install_bytes,
+                before.total_ram_to_vram_install_bytes,
+                "total RAM-to-VRAM install bytes",
+            )?,
+            speculative_ram_to_vram_install_bytes: checked_delta(
+                after.speculative_ram_to_vram_install_bytes,
+                before.speculative_ram_to_vram_install_bytes,
+                "speculative RAM-to-VRAM install bytes",
+            )?,
+        },
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GpuNativeH2dTotals {
+    total_installs: u64,
+    speculative_installs: u64,
+    total_bytes: u64,
+    speculative_bytes: u64,
+}
+
+fn reconcile_gpu_native_h2d(
+    totals: GpuNativeH2dTotals,
+    live: &LiveLifecycleCounters,
+) -> Result<(u64, u64), crate::gpu_native_real_benchmark::BenchmarkFailure> {
+    use crate::gpu_native_real_benchmark::BenchmarkFailure;
+    if totals.speculative_installs != live.speculative_h2d_installs {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "source-attribution-counter-mismatch",
+            format!(
+                "GPU-native speculative H2D installs: residency={} live-controller={}",
+                totals.speculative_installs, live.speculative_h2d_installs
+            ),
+        ));
+    }
+    if totals.speculative_bytes != live.speculative_h2d_bytes {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "source-attribution-counter-mismatch",
+            format!(
+                "GPU-native speculative H2D bytes: qualification-residency={} live-controller={}",
+                totals.speculative_bytes, live.speculative_h2d_bytes
+            ),
+        ));
+    }
+    let subtract = |total: u64, speculative: u64, field: &str| {
+        total.checked_sub(speculative).ok_or_else(|| {
+            BenchmarkFailure::new(
+                "postcondition",
+                "source-attribution-underflow",
+                format!("{field}: total={total} speculative={speculative}"),
+            )
+        })
+    };
+    Ok((
+        subtract(
+            totals.total_installs,
+            totals.speculative_installs,
+            "GPU-native H2D installs",
+        )?,
+        subtract(
+            totals.total_bytes,
+            totals.speculative_bytes,
+            "GPU-native H2D bytes",
+        )?,
+    ))
+}
+
 fn demand_source_evidence(
     runs: &[LiveQualifiedRunEvidence],
     live: &LiveLifecycleCounters,
@@ -1721,24 +1824,48 @@ fn demand_source_evidence(
             .map(|run| run.production.counters.engine_storage_delta.nvme_bytes_read),
         "engine-nvme-bytes",
     )?;
-    let total_h2d_installs = checked_sum(
+    let total_gpu_native_h2d_installs = checked_sum(
         runs.iter().map(|run| {
             run.production
                 .counters
-                .gpu_expert_io_delta
-                .expert_weight_uploads
+                .gpu_native_residency_delta
+                .ram_to_vram_installs
         }),
-        "total-h2d-installs",
+        "total-gpu-native-h2d-installs",
     )?;
-    let total_h2d_bytes = checked_sum(
+    let speculative_gpu_native_h2d_installs = checked_sum(
         runs.iter().map(|run| {
             run.production
                 .counters
-                .gpu_expert_io_delta
-                .expert_weight_upload_bytes
+                .gpu_native_residency_delta
+                .speculative_ram_to_vram_installs
         }),
-        "total-h2d-bytes",
+        "speculative-gpu-native-h2d-installs",
     )?;
+    let total_gpu_native_h2d_bytes = checked_sum(
+        runs.iter().map(|run| {
+            run.gpu_native_h2d_install_bytes
+                .delta
+                .total_ram_to_vram_install_bytes
+        }),
+        "total-gpu-native-h2d-bytes",
+    )?;
+    let speculative_gpu_native_h2d_bytes = checked_sum(
+        runs.iter().map(|run| {
+            run.gpu_native_h2d_install_bytes
+                .delta
+                .speculative_ram_to_vram_install_bytes
+        }),
+        "speculative-gpu-native-h2d-bytes",
+    )?;
+    let h2d_totals = GpuNativeH2dTotals {
+        total_installs: total_gpu_native_h2d_installs,
+        speculative_installs: speculative_gpu_native_h2d_installs,
+        total_bytes: total_gpu_native_h2d_bytes,
+        speculative_bytes: speculative_gpu_native_h2d_bytes,
+    };
+    let (demand_gpu_native_h2d_installs, demand_gpu_native_h2d_bytes) =
+        reconcile_gpu_native_h2d(h2d_totals, live)?;
     let subtract = |total: u64, speculative: u64, field: &str| {
         total.checked_sub(speculative).ok_or_else(|| {
             BenchmarkFailure::new(
@@ -1762,22 +1889,20 @@ fn demand_source_evidence(
             live.speculative_nvme_bytes,
             "NVMe bytes",
         )?,
-        demand_h2d_installs: subtract(
-            total_h2d_installs,
-            live.speculative_h2d_installs,
-            "H2D installs",
-        )?,
-        demand_h2d_bytes: subtract(
-            total_h2d_bytes,
-            live.speculative_h2d_bytes,
-            "H2D bytes",
-        )?,
+        demand_h2d_installs: demand_gpu_native_h2d_installs,
+        demand_h2d_bytes: demand_gpu_native_h2d_bytes,
+        total_gpu_native_h2d_installs,
+        total_gpu_native_h2d_bytes,
+        h2d_install_count_source: "production.counters.gpu_native_residency_delta.ram_to_vram_installs; speculative subset from speculative_ram_to_vram_installs",
+        h2d_install_byte_source: "PR1C-D qualification-local before/after counters incremented by the exact resident.data() payload length only for successful GPU-native physical installs",
+        legacy_gpu_expert_io_used_for_h2d_attribution: false,
+        h2d_reconciliation_semantics: "GPU-native speculative physical-residency install counts and qualification-local speculative install bytes must each equal the bounded-live controller aggregate exactly; disagreement fails qualification",
         speculative_ram_hits: live.speculative_ram_hits,
         speculative_ram_misses: live.speculative_ram_misses,
         speculative_nvme_operations: live.speculative_nvme_operations,
         speculative_nvme_bytes: live.speculative_nvme_bytes,
-        speculative_h2d_installs: live.speculative_h2d_installs,
-        speculative_h2d_bytes: live.speculative_h2d_bytes,
+        speculative_h2d_installs: speculative_gpu_native_h2d_installs,
+        speculative_h2d_bytes: speculative_gpu_native_h2d_bytes,
         cancellations_wasted_source_bytes: live.cancellations_wasted_source_bytes,
     })
 }
@@ -1820,9 +1945,16 @@ async fn execute_live_run(
     watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
 ) -> Result<LiveQualifiedRunEvidence, crate::gpu_native_real_benchmark::BenchmarkFailure> {
     use crate::gpu_native_real_benchmark::BenchmarkFailure;
+    let token_loop = runtime
+        .gpu_native_token_loop
+        .as_ref()
+        .expect("validated bounded-live runtime has a token loop");
+    let residency_manager = token_loop.residency_manager();
     controller.begin_run(phase, run_index).map_err(|error| {
         BenchmarkFailure::new("live-controller", "begin-run-failed", error.to_string())
     })?;
+    let gpu_native_h2d_install_bytes_before =
+        residency_manager.qualification_install_byte_snapshot();
     let phase_label = match phase {
         ShadowPhase::Warmup => "warmup",
         ShadowPhase::Measured => "measured",
@@ -1845,15 +1977,10 @@ async fn execute_live_run(
             error.to_string(),
         )
     });
-    let token_loop = runtime
-        .gpu_native_token_loop
-        .as_ref()
-        .expect("validated bounded-live runtime has a token loop");
+    let gpu_native_h2d_install_bytes_after =
+        residency_manager.qualification_install_byte_snapshot();
     let finalized = controller
-        .end_run(
-            runtime.engine.as_ref(),
-            token_loop.residency_manager().as_ref(),
-        )
+        .end_run(runtime.engine.as_ref(), residency_manager.as_ref())
         .await
         .map_err(|error| {
             BenchmarkFailure::new(
@@ -1863,7 +1990,14 @@ async fn execute_live_run(
             )
         });
     match (execution, finalized) {
-        (Ok(production), Ok(live)) => Ok(LiveQualifiedRunEvidence { production, live }),
+        (Ok(production), Ok(live)) => Ok(LiveQualifiedRunEvidence {
+            production,
+            live,
+            gpu_native_h2d_install_bytes: qualification_install_byte_evidence(
+                gpu_native_h2d_install_bytes_before,
+                gpu_native_h2d_install_bytes_after,
+            )?,
+        }),
         (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
         (Err(execution), Err(finalization)) => Err(BenchmarkFailure::new(
             "postcondition",
@@ -3032,6 +3166,111 @@ mod tests {
             true,
             live_path_exercised(&progressed).pass
         ));
+    }
+
+    #[test]
+    fn gpu_native_h2d_demand_is_total_minus_speculative_without_legacy_upload_counters() {
+        let live = LiveLifecycleCounters {
+            speculative_h2d_installs: 2,
+            speculative_h2d_bytes: 8_192,
+            ..LiveLifecycleCounters::default()
+        };
+        let totals = GpuNativeH2dTotals {
+            total_installs: 3,
+            speculative_installs: 2,
+            total_bytes: 12_288,
+            speculative_bytes: 8_192,
+        };
+
+        // No legacy gpu_expert_io upload value participates in this API. In
+        // particular, a legacy total of zero cannot underflow attribution.
+        assert_eq!(reconcile_gpu_native_h2d(totals, &live).unwrap(), (1, 4_096));
+    }
+
+    #[test]
+    fn gpu_native_h2d_controller_count_mismatch_fails_closed() {
+        let live = LiveLifecycleCounters {
+            speculative_h2d_installs: 1,
+            speculative_h2d_bytes: 4_096,
+            ..LiveLifecycleCounters::default()
+        };
+        let failure = reconcile_gpu_native_h2d(
+            GpuNativeH2dTotals {
+                total_installs: 2,
+                speculative_installs: 2,
+                total_bytes: 8_192,
+                speculative_bytes: 4_096,
+            },
+            &live,
+        )
+        .unwrap_err();
+        assert_eq!(failure.stage, "postcondition");
+        assert_eq!(failure.code, "source-attribution-counter-mismatch");
+        assert!(failure.detail.contains("speculative H2D installs"));
+    }
+
+    #[test]
+    fn gpu_native_h2d_controller_byte_mismatch_fails_closed() {
+        let live = LiveLifecycleCounters {
+            speculative_h2d_installs: 1,
+            speculative_h2d_bytes: 4_095,
+            ..LiveLifecycleCounters::default()
+        };
+        let failure = reconcile_gpu_native_h2d(
+            GpuNativeH2dTotals {
+                total_installs: 2,
+                speculative_installs: 1,
+                total_bytes: 8_192,
+                speculative_bytes: 4_096,
+            },
+            &live,
+        )
+        .unwrap_err();
+        assert_eq!(failure.stage, "postcondition");
+        assert_eq!(failure.code, "source-attribution-counter-mismatch");
+        assert!(failure.detail.contains("speculative H2D bytes"));
+    }
+
+    #[test]
+    fn qualification_install_byte_delta_is_exact_and_fail_closed() {
+        let evidence = qualification_install_byte_evidence(
+            GpuNativeQualificationInstallByteSnapshot {
+                total_ram_to_vram_install_bytes: 1_000,
+                speculative_ram_to_vram_install_bytes: 500,
+            },
+            GpuNativeQualificationInstallByteSnapshot {
+                total_ram_to_vram_install_bytes: 5_096,
+                speculative_ram_to_vram_install_bytes: 2_548,
+            },
+        )
+        .unwrap();
+        assert_eq!(evidence.delta.total_ram_to_vram_install_bytes, 4_096);
+        assert_eq!(evidence.delta.speculative_ram_to_vram_install_bytes, 2_048);
+
+        let failure =
+            qualification_install_byte_evidence(evidence.after, evidence.before).unwrap_err();
+        assert_eq!(failure.code, "gpu-native-install-byte-counter-underflow");
+    }
+
+    #[test]
+    fn canonical_gpu_native_benchmark_schema_excludes_qualification_install_bytes() {
+        assert_eq!(
+            crate::gpu_native_real_benchmark::SCHEMA,
+            "mer.gpu-native-real-benchmark.v4"
+        );
+        let canonical_snapshot = serde_json::to_value(
+            crate::gpu_native_residency::GpuNativeTieredResidencySnapshot::default(),
+        )
+        .unwrap();
+        let canonical_delta = serde_json::to_value(
+            crate::gpu_native_real_benchmark::GpuNativeResidencyDelta::default(),
+        )
+        .unwrap();
+        for canonical in [&canonical_snapshot, &canonical_delta] {
+            let fields = canonical.as_object().unwrap();
+            assert!(!fields.contains_key("total_ram_to_vram_install_bytes"));
+            assert!(!fields.contains_key("speculative_ram_to_vram_install_bytes"));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
