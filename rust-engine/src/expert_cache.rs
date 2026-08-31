@@ -965,6 +965,17 @@ impl GpuExpertCache {
         self.logical_admitted_bytes.load(Ordering::Relaxed)
     }
 
+    /// Qualification postcondition: every foreground/speculative logical
+    /// generation guard must have retired before a request is finalized.
+    pub(crate) fn demand_protection_count(&self) -> usize {
+        self.inner
+            .lock()
+            .demand_protections
+            .values()
+            .copied()
+            .fold(0usize, usize::saturating_add)
+    }
+
     /// Cumulative RAM → logical GPU-admission promotions.
     #[inline]
     pub fn promotions(&self) -> u64 {

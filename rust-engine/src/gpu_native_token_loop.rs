@@ -998,6 +998,9 @@ pub struct GpuNativeTokenLoop {
     recovery_counters: GpuNativeRecoveryCounters,
     prefetch_shadow_observer:
         parking_lot::RwLock<Option<Arc<dyn GpuNativePrefetchShadowCallbacks>>>,
+    bounded_live_prefetch_controller: parking_lot::RwLock<
+        Option<Arc<crate::gpu_native_bounded_live_prefetch::GpuNativeBoundedLivePrefetchController>>,
+    >,
     execution_guard: TokioMutex<()>,
 }
 
@@ -1321,12 +1324,20 @@ impl GpuNativeTokenLoop {
             counters: GpuNativeTokenLoopCounters::default(),
             recovery_counters: GpuNativeRecoveryCounters::default(),
             prefetch_shadow_observer: parking_lot::RwLock::new(None),
+            bounded_live_prefetch_controller: parking_lot::RwLock::new(None),
             execution_guard: TokioMutex::new(()),
         }))
     }
 
     pub fn model_geometry(&self) -> GpuNativeModelGeometry {
         self.model_geometry
+    }
+
+    /// Qualification-only access to the authoritative residency owner. The
+    /// live-prefetch controller uses this only for end-of-request invariant
+    /// validation; ordinary inference has no caller for this accessor.
+    pub(crate) fn residency_manager(&self) -> &Arc<GpuNativeTieredResidencyManager> {
+        &self.residency_manager
     }
 
     pub fn rope_dim(&self) -> usize {
@@ -1358,6 +1369,23 @@ impl GpuNativeTokenLoop {
             ));
         }
         *slot = Some(observer);
+        Ok(())
+    }
+
+    /// Install the PR1C-D-only live controller. No normal runtime calls this.
+    pub(crate) fn install_bounded_live_prefetch_controller(
+        &self,
+        controller: Arc<
+            crate::gpu_native_bounded_live_prefetch::GpuNativeBoundedLivePrefetchController,
+        >,
+    ) -> Result<(), crate::gpu_native_prefetch_shadow::ShadowObserverError> {
+        let mut slot = self.bounded_live_prefetch_controller.write();
+        if slot.is_some() {
+            return Err(crate::gpu_native_prefetch_shadow::ShadowObserverError::new(
+                "GPU-native bounded live-prefetch controller is already installed",
+            ));
+        }
+        *slot = Some(controller);
         Ok(())
     }
 
@@ -2193,6 +2221,8 @@ impl GpuNativeTokenLoop {
                 None => GpuNativeExecutionSegment::fresh(self.layers.len())?,
             };
             let prefetch_shadow_observer = self.prefetch_shadow_observer.read().clone();
+            let bounded_live_prefetch_controller =
+                self.bounded_live_prefetch_controller.read().clone();
             if let Some(observer) = prefetch_shadow_observer.as_ref() {
                 let first_new_layer = segment.ordinary_layers.start;
                 let ordinary_guard_layers = if first_new_layer < self.layers.len() {
@@ -2214,6 +2244,11 @@ impl GpuNativeTokenLoop {
                     || observer.before_segment(position, first_new_layer),
                 )
                 .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
+            }
+            if let Some(controller) = bounded_live_prefetch_controller.as_ref() {
+                controller
+                    .before_segment(position, segment.ordinary_layers.start)
+                    .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
             }
             let sink = diagnostic_sink.map(|(layout, buf)| GpuNativeDiagnosticSink {
                 layout,
@@ -2377,13 +2412,33 @@ impl GpuNativeTokenLoop {
                         )
                         .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
                     }
+                    if let Some(controller) = bounded_live_prefetch_controller.as_ref() {
+                        controller
+                            .observe_boundary(
+                                engine,
+                                &self.residency_manager,
+                                position,
+                                segment.ordinary_layers.start..=fail_layer,
+                                &report.selected_ids,
+                            )
+                            .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
+                    }
                 }
 
                 let residency_started = Instant::now();
-                engine
-                    .ensure_gpu_native_demand_residency(fail_layer, &global_ids)
-                    .await
-                    .map_err(GpuNativeTokenLoopError::ResidencyServiceFailed)?;
+                match bounded_live_prefetch_controller.as_ref() {
+                    Some(controller) => engine
+                        .ensure_gpu_native_demand_residency_with_live_prefetch(
+                            fail_layer,
+                            &global_ids,
+                            controller,
+                        )
+                        .await,
+                    None => engine
+                        .ensure_gpu_native_demand_residency(fail_layer, &global_ids)
+                        .await,
+                }
+                .map_err(GpuNativeTokenLoopError::ResidencyServiceFailed)?;
                 self.recovery_counters
                     .residency_service_us
                     .fetch_add(saturating_micros(residency_started), Ordering::Relaxed);
@@ -2439,6 +2494,18 @@ impl GpuNativeTokenLoop {
                         )
                         .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
                     }
+                    if let Some(controller) = bounded_live_prefetch_controller.as_ref() {
+                        controller
+                            .observe_boundary(
+                                engine,
+                                &self.residency_manager,
+                                position,
+                                segment.ordinary_layers.start
+                                    ..=segment.ordinary_layers.end - 1,
+                                &report.selected_ids,
+                            )
+                            .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
+                    }
                 }
                 continue;
             }
@@ -2483,6 +2550,17 @@ impl GpuNativeTokenLoop {
                         },
                     )
                     .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
+                }
+                if let Some(controller) = bounded_live_prefetch_controller.as_ref() {
+                    controller
+                        .observe_boundary(
+                            engine,
+                            &self.residency_manager,
+                            position,
+                            segment.ordinary_layers.start..=segment.ordinary_layers.end - 1,
+                            &report.selected_ids,
+                        )
+                        .map_err(GpuNativeTokenLoopError::PrefetchShadowObserverFailed)?;
                 }
             }
 

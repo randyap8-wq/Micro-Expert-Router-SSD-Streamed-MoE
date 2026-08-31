@@ -86,6 +86,12 @@ pub(crate) enum GpuNativeTieredResidencyError {
     PhysicalIdentityCorrupt {
         global_id: u32,
     },
+    LiveReplacementNotAuthorized {
+        layer_index: usize,
+    },
+    LivePostconditionFailed {
+        detail: String,
+    },
     ResidencyPriorityMismatch,
     Backend(GpuNativeBootstrapError),
 }
@@ -112,6 +118,8 @@ impl fmt::Display for GpuNativeTieredResidencyError {
             Self::NoEvictablePhysicalSlot { layer_index } => write!(f, "layer {layer_index} has no physical victim outside the protected demand set"),
             Self::StalePhysicalRequester { global_id, generation } => write!(f, "stale physical requester for global expert {global_id} generation {generation}"),
             Self::PhysicalIdentityCorrupt { global_id } => write!(f, "GPU-native physical metadata disagrees with the authoritative arena for global expert {global_id}"),
+            Self::LiveReplacementNotAuthorized { layer_index } => write!(f, "live speculative install reached full layer {layer_index} without a reserved replacement budget"),
+            Self::LivePostconditionFailed { detail } => write!(f, "GPU-native live-prefetch postcondition failed: {detail}"),
             Self::ResidencyPriorityMismatch => f.write_str("residency request used the wrong demand/speculative priority"),
             Self::Backend(error) => write!(f, "GPU-native residency backend error: {error}"),
         }
@@ -389,6 +397,69 @@ pub(crate) enum GpuNativeSpeculativeInstall {
     Installed(GpuNativeQ4ExpertResidency),
     DroppedCapacityOrPressure,
     StaleLogicalGeneration,
+}
+
+/// The four PR1C-C policies, shared by the isolated PR1C-D live adapter.
+/// Ordinary inference never constructs a value of this type.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum GpuNativeLiveReplacementPolicy {
+    PhysicalLru,
+    PhysicalLruPredictionProtected,
+    RouteRecency,
+    RouteRecencyPredictionProtected,
+}
+
+impl GpuNativeLiveReplacementPolicy {
+    pub(crate) const fn route_recency(self) -> bool {
+        matches!(
+            self,
+            Self::RouteRecency | Self::RouteRecencyPredictionProtected
+        )
+    }
+
+    pub(crate) const fn prediction_protected(self) -> bool {
+        matches!(
+            self,
+            Self::PhysicalLruPredictionProtected | Self::RouteRecencyPredictionProtected
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GpuNativeLiveSpeculativeInstall {
+    Hit(GpuNativeQ4ExpertResidency),
+    Installed {
+        residency: GpuNativeQ4ExpertResidency,
+        replaced_global_id: Option<u32>,
+        prediction_protected_victim_skips: u64,
+        forced_prediction_protected_eviction: bool,
+    },
+    DroppedCapacityOrPressure,
+    StaleLogicalGeneration,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct GpuNativeLivePostconditionEvidence {
+    pub(crate) layers_checked: usize,
+    pub(crate) metadata_residents_checked: usize,
+    pub(crate) arena_residents_checked: usize,
+    pub(crate) installing_slots: usize,
+    pub(crate) duplicate_global_owners: usize,
+    pub(crate) logical_demand_protections: usize,
+    pub(crate) verified: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -813,6 +884,183 @@ impl GpuNativeTieredResidencyManager {
         Ok(GpuNativeSpeculativeInstall::Installed(residency))
     }
 
+    /// Read-only capacity probe used immediately before reserving one of the
+    /// qualification mode's bounded replacement permits. The subsequent
+    /// install rechecks under the physical layer lock; if demand fills a slot
+    /// after this probe and no replacement was reserved, speculation drops.
+    pub(crate) fn live_replacement_needed(
+        &self,
+        global_id: u32,
+    ) -> Result<bool, GpuNativeTieredResidencyError> {
+        let identity = self.identity(global_id)?;
+        let layer = &self.layers[identity.layer_index];
+        let mut state = layer.state.lock();
+        if self
+            .current_record_locked(global_id, layer, &mut state, false)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        self.validate_layer_records_locked(layer, &mut state)?;
+        Ok(state.residents.len() >= layer.arena.slot_capacity())
+    }
+
+    /// PR1C-D-only live installation with the exact named PR1C-C victim
+    /// ordering. It deliberately uses `try_lock`: demand owns the blocking
+    /// path and speculation is discarded under physical-layer contention.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ensure_live_speculative_resident(
+        &self,
+        global_id: u32,
+        resident: &Arc<ExpertResident>,
+        admission: &GpuAdmission,
+        priority: GpuNativeResidencyPriority,
+        policy: GpuNativeLiveReplacementPolicy,
+        protected_prediction_ids: &HashSet<u32>,
+        route_last_seen_clock: &HashMap<u32, u64>,
+        replacement_authorized: bool,
+    ) -> Result<GpuNativeLiveSpeculativeInstall, GpuNativeTieredResidencyError> {
+        let GpuNativeResidencyPriority::Speculative { score: _ } = priority else {
+            return Err(GpuNativeTieredResidencyError::ResidencyPriorityMismatch);
+        };
+        if let Err(error) = self.validate_source(global_id, resident, admission) {
+            if matches!(
+                error,
+                GpuNativeTieredResidencyError::LogicalAdmissionStale { .. }
+            ) {
+                return Ok(GpuNativeLiveSpeculativeInstall::StaleLogicalGeneration);
+            }
+            return Err(error);
+        }
+        let identity = self.identity(global_id)?;
+        let layer = &self.layers[identity.layer_index];
+        let Some(mut state) = layer.state.try_lock() else {
+            self.record_speculative_drop();
+            return Ok(GpuNativeLiveSpeculativeInstall::DroppedCapacityOrPressure);
+        };
+        if let Some(record) = self.current_record_locked(global_id, layer, &mut state, true)? {
+            self.counters.vram_hits.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .speculative_vram_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(GpuNativeLiveSpeculativeInstall::Hit(record.residency));
+        }
+        self.validate_layer_records_locked(layer, &mut state)?;
+        if !self
+            .gpu_cache
+            .contains_generation(global_id, admission.generation())
+        {
+            self.counters
+                .stale_generation_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(GpuNativeLiveSpeculativeInstall::StaleLogicalGeneration);
+        }
+
+        let mut replaced_global_id = None;
+        let mut prediction_protected_victim_skips = 0u64;
+        let mut forced_prediction_protected_eviction = false;
+        if state.residents.len() >= layer.arena.slot_capacity() {
+            if !replacement_authorized {
+                self.record_speculative_drop();
+                return Ok(GpuNativeLiveSpeculativeInstall::DroppedCapacityOrPressure);
+            }
+            let (victim, skipped, forced) = select_live_speculative_victim(
+                &state.residents,
+                policy,
+                protected_prediction_ids,
+                route_last_seen_clock,
+            )
+            .ok_or(GpuNativeTieredResidencyError::NoPhysicalSlot {
+                layer_index: identity.layer_index,
+            })?;
+            self.retire_metadata_record_locked(victim, layer, &mut state, true)?;
+            replaced_global_id = Some(victim);
+            prediction_protected_victim_skips = skipped;
+            forced_prediction_protected_eviction = forced;
+        }
+
+        let residency = match self.install_locked(
+            global_id,
+            resident,
+            admission,
+            layer,
+            &mut state,
+            true,
+        ) {
+            Ok(residency) => residency,
+            Err(GpuNativeTieredResidencyError::NoPhysicalSlot { .. }) => {
+                return Ok(GpuNativeLiveSpeculativeInstall::DroppedCapacityOrPressure);
+            }
+            Err(GpuNativeTieredResidencyError::LogicalAdmissionStale { .. }) => {
+                return Ok(GpuNativeLiveSpeculativeInstall::StaleLogicalGeneration);
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(GpuNativeLiveSpeculativeInstall::Installed {
+            residency,
+            replaced_global_id,
+            prediction_protected_victim_skips,
+            forced_prediction_protected_eviction,
+        })
+    }
+
+    /// Fail-closed end-of-request audit for the opt-in live experiment.
+    pub(crate) fn validate_live_postconditions(
+        &self,
+    ) -> Result<GpuNativeLivePostconditionEvidence, GpuNativeTieredResidencyError> {
+        let mut evidence = GpuNativeLivePostconditionEvidence::default();
+        let mut global_owners = HashSet::new();
+        for layer in &self.layers {
+            let mut state = layer.state.lock();
+            self.validate_layer_records_locked(layer, &mut state)?;
+            let arena = layer.arena.residency_snapshot();
+            evidence.layers_checked += 1;
+            evidence.metadata_residents_checked += state.residents.len();
+            evidence.arena_residents_checked += arena.resident_slots;
+            evidence.installing_slots += arena.installing_slots;
+            if state.residents.len() != arena.resident_slots {
+                return Err(GpuNativeTieredResidencyError::LivePostconditionFailed {
+                    detail: format!(
+                        "layer {} metadata residents {} != arena residents {}",
+                        layer.arena.layer_index(),
+                        state.residents.len(),
+                        arena.resident_slots
+                    ),
+                });
+            }
+            if arena.installing_slots != 0 {
+                return Err(GpuNativeTieredResidencyError::LivePostconditionFailed {
+                    detail: format!(
+                        "layer {} retained {} installing slots",
+                        layer.arena.layer_index(),
+                        arena.installing_slots
+                    ),
+                });
+            }
+            for (&global_id, _) in state.residents.iter() {
+                if !global_owners.insert(global_id) {
+                    return Err(GpuNativeTieredResidencyError::LivePostconditionFailed {
+                        detail: format!("global expert {global_id} has duplicate physical owners"),
+                    });
+                }
+            }
+        }
+        evidence.logical_demand_protections = self.gpu_cache.demand_protection_count();
+        if evidence.logical_demand_protections != 0 {
+            return Err(GpuNativeTieredResidencyError::LivePostconditionFailed {
+                detail: format!(
+                    "logical GPU cache retained {} demand/install protections",
+                    evidence.logical_demand_protections
+                ),
+            });
+        }
+        evidence.verified = evidence.installing_slots == 0
+            && evidence.duplicate_global_owners == 0
+            && evidence.logical_demand_protections == 0
+            && evidence.metadata_residents_checked == evidence.arena_residents_checked;
+        Ok(evidence)
+    }
+
     pub(crate) fn snapshot(&self) -> GpuNativeTieredResidencySnapshot {
         let layers = self
             .layers
@@ -979,6 +1227,29 @@ impl GpuNativeTieredResidencyManager {
         }
     }
 
+    fn validate_layer_records_locked(
+        &self,
+        layer: &LayerResidency,
+        state: &mut MutexGuard<'_, LayerResidencyState>,
+    ) -> Result<(), GpuNativeTieredResidencyError> {
+        let ids = state
+            .residents
+            .iter()
+            .map(|(&global_id, _)| global_id)
+            .collect::<Vec<_>>();
+        for global_id in ids {
+            if self
+                .current_record_locked(global_id, layer, state, false)?
+                .is_none()
+            {
+                return Err(GpuNativeTieredResidencyError::PhysicalIdentityCorrupt {
+                    global_id,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn retire_metadata_record_locked(
         &self,
         global_id: u32,
@@ -1111,6 +1382,67 @@ fn oldest_unprotected<T>(cache: &LruCache<u32, T>, protected: &HashSet<u32>) -> 
         .iter()
         .rev()
         .find_map(|(&global_id, _)| (!protected.contains(&global_id)).then_some(global_id))
+}
+
+fn select_live_speculative_victim<T>(
+    residents: &LruCache<u32, T>,
+    policy: GpuNativeLiveReplacementPolicy,
+    protected: &HashSet<u32>,
+    route_last_seen_clock: &HashMap<u32, u64>,
+) -> Option<(u32, u64, bool)> {
+    let mut ranked = if policy.route_recency() {
+        let physical_rank = residents
+            .iter()
+            .enumerate()
+            .map(|(index, (&global_id, _))| (global_id, index))
+            .collect::<HashMap<_, _>>();
+        let mut victims = residents
+            .iter()
+            .map(|(&global_id, _)| global_id)
+            .collect::<Vec<_>>();
+        victims.sort_by(|left, right| {
+            match (
+                route_last_seen_clock.get(left).copied(),
+                route_last_seen_clock.get(right).copied(),
+            ) {
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(left), Some(right)) => left.cmp(&right),
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+            .then_with(|| {
+                physical_rank
+                    .get(right)
+                    .expect("physical rank covers every resident")
+                    .cmp(
+                        physical_rank
+                            .get(left)
+                            .expect("physical rank covers every resident"),
+                    )
+            })
+            .then_with(|| left.cmp(right))
+        });
+        victims
+    } else {
+        residents
+            .iter()
+            .rev()
+            .map(|(&global_id, _)| global_id)
+            .collect::<Vec<_>>()
+    };
+    let first = *ranked.first()?;
+    if !policy.prediction_protected() {
+        return Some((first, 0, false));
+    }
+    let mut skipped = 0u64;
+    for candidate in ranked.drain(..) {
+        if protected.contains(&candidate) {
+            skipped = skipped.saturating_add(1);
+        } else {
+            return Some((candidate, skipped, false));
+        }
+    }
+    Some((first, skipped, true))
 }
 
 #[cfg(test)]
@@ -1409,5 +1741,55 @@ mod tests {
             before
         );
         assert_eq!(oldest_unprotected(&residents, &HashSet::new()), Some(128));
+    }
+
+    #[test]
+    fn live_victim_changes_while_speculative_source_is_in_flight() {
+        let mut residents = LruCache::unbounded();
+        residents.put(1, ());
+        residents.put(2, ());
+        residents.put(3, ());
+        let empty = HashSet::new();
+        assert_eq!(
+            select_live_speculative_victim(
+                &residents,
+                GpuNativeLiveReplacementPolicy::PhysicalLru,
+                &empty,
+                &HashMap::new(),
+            ),
+            Some((1, 0, false))
+        );
+
+        // A foreground demand touch occurs while speculative source work is
+        // outstanding. Installation must select from the current ordering,
+        // not a stale victim captured before the await.
+        assert_eq!(touch_physical_record(&mut residents, 1), Some(()));
+        assert_eq!(
+            select_live_speculative_victim(
+                &residents,
+                GpuNativeLiveReplacementPolicy::PhysicalLru,
+                &empty,
+                &HashMap::new(),
+            ),
+            Some((2, 0, false))
+        );
+    }
+
+    #[test]
+    fn live_all_victims_prediction_protected_forces_deterministic_eviction() {
+        let mut residents = LruCache::unbounded();
+        residents.put(10, ());
+        residents.put(11, ());
+        residents.put(12, ());
+        let protected = HashSet::from([10, 11, 12]);
+        assert_eq!(
+            select_live_speculative_victim(
+                &residents,
+                GpuNativeLiveReplacementPolicy::PhysicalLruPredictionProtected,
+                &protected,
+                &HashMap::new(),
+            ),
+            Some((10, 3, true))
+        );
     }
 }

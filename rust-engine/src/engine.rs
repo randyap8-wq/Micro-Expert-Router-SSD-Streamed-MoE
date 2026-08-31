@@ -524,6 +524,29 @@ impl Drop for SingleflightLeaderGuard {
     }
 }
 
+/// Drop guard for one PR1C-D task. Aborts, runtime shutdown, I/O failures,
+/// and ordinary early returns all retire the controller ticket exactly once.
+struct BoundedLivePrefetchTaskGuard {
+    controller:
+        Arc<crate::gpu_native_bounded_live_prefetch::GpuNativeBoundedLivePrefetchController>,
+    ticket_id: u64,
+    completed: bool,
+}
+
+impl BoundedLivePrefetchTaskGuard {
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for BoundedLivePrefetchTaskGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.controller.record_task_cancelled(self.ticket_id);
+        }
+    }
+}
+
 /// Boot-time engine error reserved for startup-only invariant checks
 /// the synchronous `Engine::new` constructor doesn't perform.
 #[derive(Debug)]
@@ -1700,9 +1723,16 @@ impl EngineBackgroundTasks {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.spawn_tracked(future).is_some()
+    }
+
+    fn spawn_tracked<F>(self: &Arc<Self>, future: F) -> Option<tokio::task::AbortHandle>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         let mut state = self.state.lock();
         if !self.accepts_work() {
-            return false;
+            return None;
         }
         state.abort_handles.retain(|handle| !handle.is_finished());
         self.active.fetch_add(1, Ordering::AcqRel);
@@ -1716,8 +1746,9 @@ impl EngineBackgroundTasks {
                 _ = future => {}
             }
         });
-        state.abort_handles.push(handle.abort_handle());
-        true
+        let abort_handle = handle.abort_handle();
+        state.abort_handles.push(abort_handle.clone());
+        Some(abort_handle)
     }
 
     async fn cancelled(&self) {
@@ -2935,6 +2966,33 @@ impl Engine {
         gpu.current_admission(resident.id)
     }
 
+    /// Bounded live qualification authorization. Unlike ordinary production
+    /// speculation, this opt-in path may rotate the logical LRU to authorize a
+    /// physical replacement. Active foreground demand protections remain
+    /// authoritative, and physical currentness never consults this LRU.
+    fn ensure_live_speculative_gpu_admission(
+        &self,
+        resident: &Arc<ExpertResident>,
+    ) -> Result<Option<GpuAdmission>, GpuDemandAdmissionError> {
+        let gpu = self.core.execution_context.gpu_expert_cache();
+        if let Some(admission) = gpu.current_admission(resident.id) {
+            return Ok(Some(admission));
+        }
+        let gpu_resident = Arc::new(GpuResident::new_with_dtype(
+            resident.id,
+            resident.data().to_vec(),
+            self.core.options.dtype,
+        ));
+        let newly_admitted = gpu.demand_admit_lru(gpu_resident)?;
+        if newly_admitted {
+            if let Some(prom) = self.metrics.prom.as_ref() {
+                prom.record_promotions(1);
+                prom.set_vram_used_bytes(gpu.used_bytes());
+            }
+        }
+        Ok(gpu.current_admission(resident.id))
+    }
+
     /// Explicit future bootstrap seam for the GPU-native physical plane.
     ///
     /// The manager must retain the exact logical cache owned by this engine's
@@ -4055,13 +4113,25 @@ impl Engine {
         self: &Arc<Self>,
         global_id: u32,
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
+        live_controller: Option<
+            &Arc<
+                crate::gpu_native_bounded_live_prefetch::GpuNativeBoundedLivePrefetchController,
+            >,
+        >,
     ) -> Result<Arc<ExpertResident>, GpuNativeDemandResidencyError> {
         if let Some(resident) = residents.get(&global_id) {
             return Ok(resident.clone());
         }
         let resident = match self.core.cache.get(global_id) {
             Some(resident) => resident,
-            None => self.fetch_with_retry(global_id).await?,
+            None => {
+                if self.core.in_flight.contains_key(&global_id) {
+                    if let Some(controller) = live_controller {
+                        controller.record_demand_joined_source(global_id);
+                    }
+                }
+                self.fetch_with_retry(global_id).await?
+            }
         };
         residents.insert(global_id, resident.clone());
         Ok(resident)
@@ -4071,6 +4141,11 @@ impl Engine {
         self: &Arc<Self>,
         global_ids: &[u32],
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
+        live_controller: Option<
+            &Arc<
+                crate::gpu_native_bounded_live_prefetch::GpuNativeBoundedLivePrefetchController,
+            >,
+        >,
     ) -> Result<(Vec<GpuAdmission>, usize), GpuNativeDemandResidencyError> {
         let gpu = self.execution_context().gpu_expert_cache();
         let mut payloads = HashMap::with_capacity(global_ids.len());
@@ -4100,7 +4175,9 @@ impl Engine {
                 }
                 GpuDemandSetAdmission::PayloadRequired(missing) => {
                     for global_id in missing {
-                        let resident = self.gpu_native_demand_source(global_id, residents).await?;
+                        let resident = self
+                            .gpu_native_demand_source(global_id, residents, live_controller)
+                            .await?;
                         payloads.insert(
                             global_id,
                             Arc::new(GpuResident::new_with_dtype(
@@ -4126,6 +4203,42 @@ impl Engine {
         self: &Arc<Self>,
         layer_index: usize,
         global_ids: &[u32],
+    ) -> Result<
+        Vec<crate::backend::gpu_native::GpuNativeQ4ExpertResidency>,
+        GpuNativeDemandResidencyError,
+    > {
+        self.ensure_gpu_native_demand_residency_inner(layer_index, global_ids, None)
+            .await
+    }
+
+    pub(crate) async fn ensure_gpu_native_demand_residency_with_live_prefetch(
+        self: &Arc<Self>,
+        layer_index: usize,
+        global_ids: &[u32],
+        controller: &Arc<
+            crate::gpu_native_bounded_live_prefetch::GpuNativeBoundedLivePrefetchController,
+        >,
+    ) -> Result<
+        Vec<crate::backend::gpu_native::GpuNativeQ4ExpertResidency>,
+        GpuNativeDemandResidencyError,
+    > {
+        self.ensure_gpu_native_demand_residency_inner(
+            layer_index,
+            global_ids,
+            Some(controller),
+        )
+        .await
+    }
+
+    async fn ensure_gpu_native_demand_residency_inner(
+        self: &Arc<Self>,
+        layer_index: usize,
+        global_ids: &[u32],
+        live_controller: Option<
+            &Arc<
+                crate::gpu_native_bounded_live_prefetch::GpuNativeBoundedLivePrefetchController,
+            >,
+        >,
     ) -> Result<
         Vec<crate::backend::gpu_native::GpuNativeQ4ExpertResidency>,
         GpuNativeDemandResidencyError,
@@ -4182,12 +4295,20 @@ impl Engine {
                 for &global_id in &physical_missing {
                     if !residents.contains_key(&global_id) {
                         manager.record_physical_source_acquisition();
-                        self.gpu_native_demand_source(global_id, &mut residents)
+                        self.gpu_native_demand_source(
+                            global_id,
+                            &mut residents,
+                            live_controller,
+                        )
                             .await?;
                     }
                 }
                 let (admissions, newly_admitted) = self
-                    .ensure_gpu_native_logical_demand_set(&physical_missing, &mut residents)
+                    .ensure_gpu_native_logical_demand_set(
+                        &physical_missing,
+                        &mut residents,
+                        live_controller,
+                    )
                     .await?;
                 manager.record_logical_admissions_for_physical_misses(newly_admitted);
                 admissions_by_id
@@ -4223,7 +4344,12 @@ impl Engine {
                 layer_index,
                 &demands,
             ) {
-                Ok(residencies) => return Ok(residencies),
+                Ok(residencies) => {
+                    if let Some(controller) = live_controller {
+                        controller.record_demand_service_completed(global_ids);
+                    }
+                    return Ok(residencies);
+                }
                 Err(GpuNativeTieredResidencyError::DemandSourceMissing { global_id: _ })
                     if gpu_native_physical_demand_recovery_allowed(recovery_attempts) =>
                 {
@@ -4327,6 +4453,246 @@ impl Engine {
                 Err(FetchOnceError::Io(e.to_string()))
             }
         }
+    }
+
+    /// Launch one controller-admitted PR1C-D candidate through the existing
+    /// governor, shared speculative semaphore, shadow buffer pool,
+    /// singleflight map, RAM cache, logical authorization, and physical arena.
+    /// The method exists only for the dedicated qualification controller.
+    pub(crate) fn spawn_bounded_live_prefetch(
+        self: &Arc<Self>,
+        manager: Arc<GpuNativeTieredResidencyManager>,
+        controller: Arc<
+            crate::gpu_native_bounded_live_prefetch::GpuNativeBoundedLivePrefetchController,
+        >,
+        ticket: crate::gpu_native_bounded_live_prefetch::LiveCandidateTicket,
+    ) {
+        match manager.probe_speculative(
+            ticket.global_id,
+            GpuNativeResidencyPriority::Speculative {
+                score: ticket.score,
+            },
+        ) {
+            Ok(GpuNativeSpeculativeProbe::Hit(_)) => {
+                controller.record_already_physically_resident(ticket.ticket_id);
+                return;
+            }
+            Ok(GpuNativeSpeculativeProbe::DroppedPressure) => {
+                controller.record_task_cancelled(ticket.ticket_id);
+                return;
+            }
+            Ok(GpuNativeSpeculativeProbe::Miss) => {}
+            Err(error) => {
+                controller.record_fatal(ticket.ticket_id, error.to_string());
+                return;
+            }
+        }
+        if !self.core.governor.admit(ticket.score) {
+            self.metrics
+                .counters
+                .prefetch_dropped_governor
+                .fetch_add(1, Ordering::Relaxed);
+            controller.record_rejected_governor(ticket.ticket_id);
+            return;
+        }
+        let permit = match self.core.prefetch_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.metrics
+                    .counters
+                    .prefetch_dropped_concurrency
+                    .fetch_add(1, Ordering::Relaxed);
+                controller.record_task_cancelled(ticket.ticket_id);
+                return;
+            }
+        };
+        let me = self.clone();
+        let task_controller = controller.clone();
+        let ticket_id = ticket.ticket_id;
+        let task = async move {
+            let _permit = permit;
+            let mut task_guard = BoundedLivePrefetchTaskGuard {
+                controller: task_controller.clone(),
+                ticket_id,
+                completed: false,
+            };
+            let resident = if let Some(resident) = me.core.cache.get(ticket.global_id) {
+                task_controller.record_source_started(ticket_id, true, false);
+                resident
+            } else {
+                let (is_leader, notify) = match me.core.in_flight.entry(ticket.global_id) {
+                    dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                        (false, occupied.get().clone())
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                        let notify = Arc::new(Notify::new());
+                        vacant.insert(notify.clone());
+                        (true, notify)
+                    }
+                };
+                if !is_leader {
+                    task_controller.record_source_started(ticket_id, false, true);
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if me.core.cache.contains(ticket.global_id) {
+                        me.core
+                            .cache
+                            .get(ticket.global_id)
+                            .expect("joined source became resident under cache recheck")
+                    } else {
+                        if me.core.in_flight.contains_key(&ticket.global_id) {
+                            notified.await;
+                        }
+                        let Some(resident) = me.core.cache.get(ticket.global_id) else {
+                            return;
+                        };
+                        resident
+                    }
+                } else {
+                    let _singleflight = SingleflightLeaderGuard {
+                        map: me.core.in_flight.clone(),
+                        id: ticket.global_id,
+                        notify,
+                        armed: true,
+                    };
+                    let mut buf = match me.core.pool.try_acquire_shadow() {
+                        Some(buf) => buf,
+                        None if me.core.pool.shadow_capacity() == 0 => {
+                            let Some(buf) = me.core.pool.try_acquire() else {
+                                me.note_prefetch_dropped_pool_starved(ticket.global_id);
+                                return;
+                            };
+                            buf
+                        }
+                        None => {
+                            let recycled = me
+                                .core
+                                .cache
+                                .evict_lru_shadow_backed()
+                                .and_then(|victim| {
+                                    drop(victim);
+                                    me.core.pool.try_acquire_shadow()
+                                });
+                            let Some(buf) = recycled else {
+                                me.note_prefetch_dropped_pool_starved(ticket.global_id);
+                                return;
+                            };
+                            buf
+                        }
+                    };
+                    task_controller.record_source_started(ticket_id, false, false);
+                    if let Err(error) = me
+                        .core
+                        .storage
+                        .read_expert(ticket.global_id, &mut buf)
+                        .await
+                    {
+                        task_controller.record_fatal(
+                            ticket_id,
+                            format!(
+                                "speculative source read failed for expert {}: {error}",
+                                ticket.global_id
+                            ),
+                        );
+                        task_guard.complete();
+                        return;
+                    }
+                    let bytes = buf.len() as u64;
+                    task_controller.record_nvme_complete(ticket_id, bytes);
+                    me.metrics
+                        .counters
+                        .prefetch_completed
+                        .fetch_add(1, Ordering::Relaxed);
+                    me.metrics
+                        .counters
+                        .bytes_read
+                        .fetch_add(bytes, Ordering::Relaxed);
+                    me.core.governor.record_completed();
+                    let resident = Arc::new(ExpertResident::new_with_block_align(
+                        ticket.global_id,
+                        buf,
+                        me.core.storage.config().block_align,
+                    ));
+                    if let Err(rejected) = me.core.cache.insert(resident.clone()) {
+                        drop(rejected);
+                        return;
+                    }
+                    resident
+                }
+            };
+
+            let admission = match me.ensure_live_speculative_gpu_admission(&resident) {
+                Ok(Some(admission)) => admission,
+                Ok(None)
+                | Err(GpuDemandAdmissionError::PayloadExceedsLruCapacity { .. })
+                | Err(GpuDemandAdmissionError::DemandSetExceedsLruCapacity { .. })
+                | Err(GpuDemandAdmissionError::ProtectedDemandCapacity { .. }) => return,
+                Err(error) => {
+                    task_controller.record_fatal(ticket_id, error.to_string());
+                    task_guard.complete();
+                    return;
+                }
+            };
+            // Pin only the target's existing logical generation while the
+            // physical transaction runs. The guard holds no mutex, but it
+            // prevents a demand admission from evicting this authorization
+            // after a victim has been selected and before install commit.
+            let _logical_install_protection = match me
+                .execution_context()
+                .gpu_expert_cache()
+                .clone()
+                .protect_demand_set(&[ticket.global_id])
+            {
+                Ok(protection) => protection,
+                Err(error) => {
+                    task_controller.record_fatal(ticket_id, error.to_string());
+                    task_guard.complete();
+                    return;
+                }
+            };
+            let replacement_needed = match manager.live_replacement_needed(ticket.global_id) {
+                Ok(replacement_needed) => replacement_needed,
+                Err(error) => {
+                    task_controller.record_fatal(ticket_id, error.to_string());
+                    task_guard.complete();
+                    return;
+                }
+            };
+            if !task_controller.reserve_install(ticket_id, replacement_needed) {
+                return;
+            }
+            let outcome = manager.ensure_live_speculative_resident(
+                ticket.global_id,
+                &resident,
+                &admission,
+                GpuNativeResidencyPriority::Speculative {
+                    score: ticket.score,
+                },
+                task_controller.policy(),
+                ticket.protected_prediction_ids.as_ref(),
+                ticket.route_last_seen_clock.as_ref(),
+                replacement_needed,
+            );
+            match outcome {
+                Ok(outcome) => task_controller.record_install_outcome(
+                    ticket_id,
+                    outcome,
+                    resident.data().len() as u64,
+                ),
+                Err(error) => task_controller.record_fatal(ticket_id, error.to_string()),
+            }
+            task_guard.complete();
+        };
+        let Some(handle) = self.background_tasks.spawn_tracked(task) else {
+            controller.record_task_cancelled(ticket_id);
+            return;
+        };
+        controller.register_abort_handle(ticket_id, handle);
+    }
+
+    pub(crate) fn bounded_live_source_in_flight_count(&self) -> usize {
+        self.core.in_flight.len()
     }
 
     fn spawn_gpu_native_ram_to_vram_prefetch(
@@ -7042,7 +7408,7 @@ mod tests {
 
         let mut first_request = HashMap::new();
         let first = engine
-            .gpu_native_demand_source(0, &mut first_request)
+            .gpu_native_demand_source(0, &mut first_request, None)
             .await
             .unwrap();
         let after_nvme = engine.report().bytes_read;
@@ -7050,14 +7416,14 @@ mod tests {
 
         let mut second_request = HashMap::new();
         let ram_hit = engine
-            .gpu_native_demand_source(0, &mut second_request)
+            .gpu_native_demand_source(0, &mut second_request, None)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&first, &ram_hit));
         assert_eq!(engine.report().bytes_read, after_nvme);
 
         let same_request = engine
-            .gpu_native_demand_source(0, &mut second_request)
+            .gpu_native_demand_source(0, &mut second_request, None)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&ram_hit, &same_request));

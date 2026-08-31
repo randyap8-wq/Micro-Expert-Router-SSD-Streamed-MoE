@@ -139,6 +139,7 @@ mod expert_cache;
 mod gating;
 mod gguf;
 mod gguf_loader;
+pub(crate) mod gpu_native_bounded_live_prefetch;
 mod gpu_native_residency;
 pub(crate) mod gpu_native_diagnostics;
 pub(crate) mod gpu_native_expert_permutation_semantic_parity;
@@ -223,6 +224,8 @@ const STATEFUL_REPLACEMENT_SHADOW_COMMAND: &str =
     "qualify-gpu-native-prefetch-stateful-replacement-shadow";
 const MULTIPREDICTOR_SHADOW_COMMAND: &str =
     "qualify-gpu-native-prefetch-multipredictor-shadow";
+const BOUNDED_LIVE_PREFETCH_COMMAND: &str =
+    "qualify-gpu-native-bounded-live-prefetch";
 
 fn normalize_stateful_replacement_shadow_command(
     raw_args: &[OsString],
@@ -236,6 +239,64 @@ fn normalize_stateful_replacement_shadow_command(
     };
     normalized[command_index] = OsString::from(MULTIPREDICTOR_SHADOW_COMMAND);
     (normalized, true)
+}
+
+fn normalize_bounded_live_prefetch_command(
+    raw_args: &[OsString],
+) -> Result<
+    (
+        Vec<OsString>,
+        bool,
+        Option<crate::gpu_native_residency::GpuNativeLiveReplacementPolicy>,
+    ),
+    String,
+> {
+    let Some(command_index) = raw_args
+        .iter()
+        .position(|arg| arg == BOUNDED_LIVE_PREFETCH_COMMAND)
+    else {
+        return Ok((raw_args.to_vec(), false, None));
+    };
+    let mut normalized = Vec::with_capacity(raw_args.len());
+    let mut policy = None;
+    let mut index = 0usize;
+    while index < raw_args.len() {
+        if index == command_index {
+            normalized.push(OsString::from(MULTIPREDICTOR_SHADOW_COMMAND));
+            index += 1;
+            continue;
+        }
+        let text = raw_args[index].to_string_lossy();
+        let value = if text == "--replacement-policy" {
+            index += 1;
+            Some(
+                raw_args
+                    .get(index)
+                    .ok_or_else(|| "--replacement-policy requires a value".to_string())?
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else {
+            text.strip_prefix("--replacement-policy=")
+                .map(str::to_string)
+        };
+        if let Some(value) = value {
+            if policy.is_some() {
+                return Err("--replacement-policy may be supplied only once".to_string());
+            }
+            policy = Some(
+                <crate::gpu_native_residency::GpuNativeLiveReplacementPolicy as ValueEnum>::from_str(
+                    &value,
+                    true,
+                )
+                .map_err(|error| format!("invalid --replacement-policy {value:?}: {error}"))?,
+            );
+        } else {
+            normalized.push(raw_args[index].clone());
+        }
+        index += 1;
+    }
+    Ok((normalized, true, policy))
 }
 
 /// MoE execution engine that streams experts from NVMe via O_DIRECT pread(2).
@@ -1973,8 +2034,13 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
-    let (normalized_args, stateful_replacement_requested) =
+    let (stateful_normalized_args, stateful_replacement_requested) =
         normalize_stateful_replacement_shadow_command(&raw_args);
+    let (
+        normalized_args,
+        bounded_live_prefetch_requested,
+        bounded_live_replacement_policy,
+    ) = normalize_bounded_live_prefetch_command(&stateful_normalized_args)?;
     let cli = Cli::parse_from(normalized_args);
     let worker_protocol_stdout = matches!(
         cli.cmd,
@@ -2424,7 +2490,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            if stateful_replacement_requested {
+            if bounded_live_prefetch_requested {
+                let replacement_policy =
+                    crate::gpu_native_bounded_live_prefetch::require_explicit_replacement_policy(
+                        bounded_live_replacement_policy,
+                    )?;
+                rt.block_on(crate::gpu_native_bounded_live_prefetch::run_command(
+                    crate::gpu_native_bounded_live_prefetch::CommandArgs {
+                        config,
+                        prompt,
+                        request_json,
+                        output_tokens,
+                        warmup_runs,
+                        measured_runs,
+                        cache_reset,
+                        greedy,
+                        expected_adapter_name,
+                        replacement_policy,
+                        report_out,
+                        progress_watchdog,
+                    },
+                ))
+            } else if stateful_replacement_requested {
                 rt.block_on(
                     crate::gpu_native_prefetch_stateful_replacement_shadow::run_command(
                         crate::gpu_native_prefetch_stateful_replacement_shadow::CommandArgs {
