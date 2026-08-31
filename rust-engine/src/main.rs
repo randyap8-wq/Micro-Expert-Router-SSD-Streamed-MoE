@@ -148,6 +148,7 @@ pub(crate) mod gpu_native_layer0_diagnostics;
 pub(crate) mod gpu_native_q4_expert_stage_attribution;
 pub(crate) mod gpu_native_prefetch_multipredictor_shadow;
 pub(crate) mod gpu_native_prefetch_shadow;
+pub(crate) mod gpu_native_prefetch_stateful_replacement_shadow;
 pub(crate) mod gpu_native_real_benchmark;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
@@ -218,6 +219,24 @@ use crate::router::{
 const SUPPORTED_SYNTHETIC_DTYPES: &str = "f32, f16, bf16, int8, q4k, q4_0, q8_0, mxfp4";
 const SUPPORTED_RUNTIME_DTYPES: &str =
     "f32, f16, bf16, int8, q4k, q4_0, q5k, q6k, q8_0, mxfp4, mixed";
+const STATEFUL_REPLACEMENT_SHADOW_COMMAND: &str =
+    "qualify-gpu-native-prefetch-stateful-replacement-shadow";
+const MULTIPREDICTOR_SHADOW_COMMAND: &str =
+    "qualify-gpu-native-prefetch-multipredictor-shadow";
+
+fn normalize_stateful_replacement_shadow_command(
+    raw_args: &[OsString],
+) -> (Vec<OsString>, bool) {
+    let mut normalized = raw_args.to_vec();
+    let Some(command_index) = normalized
+        .iter()
+        .position(|arg| arg == STATEFUL_REPLACEMENT_SHADOW_COMMAND)
+    else {
+        return (normalized, false);
+    };
+    normalized[command_index] = OsString::from(MULTIPREDICTOR_SHADOW_COMMAND);
+    (normalized, true)
+}
 
 /// MoE execution engine that streams experts from NVMe via O_DIRECT pread(2).
 #[derive(Parser, Debug)]
@@ -1954,7 +1973,9 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
-    let cli = Cli::parse();
+    let (normalized_args, stateful_replacement_requested) =
+        normalize_stateful_replacement_shadow_command(&raw_args);
+    let cli = Cli::parse_from(normalized_args);
     let worker_protocol_stdout = matches!(
         cli.cmd,
         Cmd::GreedyParityHybridWorkerInternal { .. }
@@ -2403,23 +2424,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(
-                crate::gpu_native_prefetch_multipredictor_shadow::run_command(
-                    crate::gpu_native_prefetch_multipredictor_shadow::CommandArgs {
-                        config,
-                        prompt,
-                        request_json,
-                        output_tokens,
-                        warmup_runs,
-                        measured_runs,
-                        cache_reset,
-                        greedy,
-                        expected_adapter_name,
-                        report_out,
-                        progress_watchdog,
-                    },
-                ),
-            )
+            if stateful_replacement_requested {
+                rt.block_on(
+                    crate::gpu_native_prefetch_stateful_replacement_shadow::run_command(
+                        crate::gpu_native_prefetch_stateful_replacement_shadow::CommandArgs {
+                            config,
+                            prompt,
+                            request_json,
+                            output_tokens,
+                            warmup_runs,
+                            measured_runs,
+                            cache_reset,
+                            greedy,
+                            expected_adapter_name,
+                            report_out,
+                            progress_watchdog,
+                        },
+                    ),
+                )
+            } else {
+                rt.block_on(
+                    crate::gpu_native_prefetch_multipredictor_shadow::run_command(
+                        crate::gpu_native_prefetch_multipredictor_shadow::CommandArgs {
+                            config,
+                            prompt,
+                            request_json,
+                            output_tokens,
+                            warmup_runs,
+                            measured_runs,
+                            cache_reset,
+                            greedy,
+                            expected_adapter_name,
+                            report_out,
+                            progress_watchdog,
+                        },
+                    ),
+                )
+            }
         }
         Cmd::QualifyHybridQ4 {
             config,

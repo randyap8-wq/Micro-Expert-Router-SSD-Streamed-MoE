@@ -32,6 +32,18 @@ use crate::gpu_native_residency::GpuNativeTieredResidencyManager;
 use crate::model::RealModel;
 use crate::sampling::SamplingParams;
 
+fn prefetch_shadow_guard_layers(
+    observer: &dyn GpuNativePrefetchShadowCallbacks,
+    ordinary_layers: Vec<usize>,
+    num_layers: usize,
+) -> Vec<usize> {
+    if observer.guard_all_residency_layers() {
+        (0..num_layers).collect()
+    } else {
+        ordinary_layers
+    }
+}
+
 /// Structured summary of runtime counters across the GPU-native token loop.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GpuNativeTokenLoopSnapshot {
@@ -2183,11 +2195,16 @@ impl GpuNativeTokenLoop {
             let prefetch_shadow_observer = self.prefetch_shadow_observer.read().clone();
             if let Some(observer) = prefetch_shadow_observer.as_ref() {
                 let first_new_layer = segment.ordinary_layers.start;
-                let guard_layers = if first_new_layer < self.layers.len() {
+                let ordinary_guard_layers = if first_new_layer < self.layers.len() {
                     vec![first_new_layer]
                 } else {
                     Vec::new()
                 };
+                let guard_layers = prefetch_shadow_guard_layers(
+                    observer.as_ref(),
+                    ordinary_guard_layers,
+                    self.layers.len(),
+                );
                 with_observer_runtime_guard(
                     observer.as_ref(),
                     engine.as_ref(),
@@ -2338,7 +2355,11 @@ impl GpuNativeTokenLoop {
                 if segment.ordinary_layers.start <= fail_layer {
                     if let Some(observer) = prefetch_shadow_observer.as_ref() {
                         let observed_layers = segment.ordinary_layers.start..=fail_layer;
-                        let guard_layers = observed_layers.clone().collect::<Vec<_>>();
+                        let guard_layers = prefetch_shadow_guard_layers(
+                            observer.as_ref(),
+                            observed_layers.clone().collect(),
+                            self.layers.len(),
+                        );
                         with_observer_runtime_guard(
                             observer.as_ref(),
                             engine.as_ref(),
@@ -2396,7 +2417,11 @@ impl GpuNativeTokenLoop {
                     if let Some(observer) = prefetch_shadow_observer.as_ref() {
                         let observed_layers =
                             segment.ordinary_layers.start..=segment.ordinary_layers.end - 1;
-                        let guard_layers = observed_layers.clone().collect::<Vec<_>>();
+                        let guard_layers = prefetch_shadow_guard_layers(
+                            observer.as_ref(),
+                            observed_layers.clone().collect(),
+                            self.layers.len(),
+                        );
                         with_observer_runtime_guard(
                             observer.as_ref(),
                             engine.as_ref(),
@@ -2437,7 +2462,11 @@ impl GpuNativeTokenLoop {
                 if let Some(observer) = prefetch_shadow_observer.as_ref() {
                     let observed_layers =
                         segment.ordinary_layers.start..=segment.ordinary_layers.end - 1;
-                    let guard_layers = observed_layers.clone().collect::<Vec<_>>();
+                    let guard_layers = prefetch_shadow_guard_layers(
+                        observer.as_ref(),
+                        observed_layers.clone().collect(),
+                        self.layers.len(),
+                    );
                     with_observer_runtime_guard(
                         observer.as_ref(),
                         engine.as_ref(),
@@ -3334,6 +3363,48 @@ pub(crate) mod tests {
     use crate::gating::{LinearGate, ScoringFunc};
     use crate::model::RealModelConfig;
     use crate::transformer::{LMHead, MultiHeadSelfAttention, RmsNorm, TransformerLayer};
+
+    struct GuardScopeObserver {
+        all_layers: bool,
+    }
+
+    impl GpuNativePrefetchShadowCallbacks for GuardScopeObserver {
+        fn guard_all_residency_layers(&self) -> bool {
+            self.all_layers
+        }
+
+        fn before_segment(
+            &self,
+            _completed_token_position: usize,
+            _first_new_layer: usize,
+        ) -> Result<(), crate::gpu_native_prefetch_shadow::ShadowObserverError> {
+            Ok(())
+        }
+
+        fn observe_boundary(
+            &self,
+            _completed_token_position: usize,
+            _observed_layers: std::ops::RangeInclusive<usize>,
+            _selected_ids_by_layer: &[Vec<u32>],
+            _residency: &GpuNativeTieredResidencyManager,
+        ) -> Result<(), crate::gpu_native_prefetch_shadow::ShadowObserverError> {
+            Ok(())
+        }
+
+        fn record_runtime_guarded_callback(&self, _kind: ShadowObserverCallbackKind) {}
+    }
+
+    #[test]
+    fn prefetch_shadow_guard_scope_preserves_legacy_and_supports_model_wide_observers() {
+        let legacy = GuardScopeObserver { all_layers: false };
+        assert_eq!(prefetch_shadow_guard_layers(&legacy, vec![2], 4), vec![2]);
+
+        let model_wide = GuardScopeObserver { all_layers: true };
+        assert_eq!(
+            prefetch_shadow_guard_layers(&model_wide, vec![2], 4),
+            vec![0, 1, 2, 3]
+        );
+    }
 
     pub(crate) fn make_test_qwen3_moe_config() -> RealModelConfig {
         RealModelConfig {

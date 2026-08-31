@@ -176,6 +176,14 @@ fn verify_callback_guard_unchanged(
 /// snapshots. Snapshot locks are released before the callback begins. Any
 /// callback-window change fails closed before normal execution can continue.
 pub(crate) trait GpuNativePrefetchShadowCallbacks: Send + Sync {
+    /// Most observers need exact before/after evidence only for the layers
+    /// named by the callback. Stateful model-wide residency simulations read
+    /// every layer at prediction freeze, so they can request a model-wide
+    /// guard without changing the legacy observer behavior.
+    fn guard_all_residency_layers(&self) -> bool {
+        false
+    }
+
     fn before_segment(
         &self,
         completed_token_position: usize,

@@ -1725,7 +1725,7 @@ pub(crate) struct ProductionBehaviorProjection {
 }
 
 impl ProductionBehaviorProjection {
-    fn from_request(
+    pub(crate) fn from_request(
         generated_token_ids: &[u32],
         counters: &crate::gpu_native_real_benchmark::RequestSnapshots,
     ) -> Self {
@@ -1767,7 +1767,7 @@ pub(crate) struct BehavioralEquivalenceContract {
 }
 
 impl BehavioralEquivalenceContract {
-    fn pr1cb() -> Self {
+    pub(crate) fn pr1cb() -> Self {
         Self {
             definition:
                 "behavioral_equivalence = generated tokens + deterministic discrete production counters",
@@ -1832,7 +1832,7 @@ pub(crate) struct MultipredictorProductionSemantics {
 }
 
 impl MultipredictorProductionSemantics {
-    const fn shadow_only() -> Self {
+    pub(crate) const fn shadow_only() -> Self {
         Self {
             inference_math_changed: false,
             q4_changed: false,
@@ -1878,7 +1878,7 @@ pub(crate) struct MultipredictorRunEvidence {
 }
 
 impl MultipredictorRunEvidence {
-    fn from_result(
+    pub(crate) fn from_result(
         phase: ShadowPhase,
         result: crate::gpu_native_real_benchmark::PerRunResult,
     ) -> Self {
