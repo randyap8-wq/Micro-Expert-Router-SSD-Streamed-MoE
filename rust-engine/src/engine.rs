@@ -21,6 +21,7 @@ use crate::expert_cache::{
     GpuHotPromotionOutcome, GpuResident,
 };
 use crate::gating::Router;
+use crate::gpu_native_bounded_live_prefetch::LiveCancellationReason;
 use crate::gpu_native_residency::{
     global_to_layer_local as gpu_native_global_to_layer_local, GpuNativeDemandExpert,
     GpuNativeResidencyPriority, GpuNativeSpeculativeInstall, GpuNativeSpeculativeProbe,
@@ -542,7 +543,10 @@ impl BoundedLivePrefetchTaskGuard {
 impl Drop for BoundedLivePrefetchTaskGuard {
     fn drop(&mut self) {
         if !self.completed {
-            self.controller.record_task_cancelled(self.ticket_id);
+            self.controller.record_cancelled(
+                self.ticket_id,
+                LiveCancellationReason::CancelledTaskOrShutdown,
+            );
         }
     }
 }
@@ -1304,6 +1308,10 @@ pub(crate) struct EngineCore {
     /// failure to acquire drops the prefetch and increments
     /// `EngineMetrics::counters::prefetch_dropped_concurrency`.
     pub(super) prefetch_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Immutable construction-time capacity of `prefetch_semaphore`.
+    /// Qualification evidence reads this value before any work starts rather
+    /// than inferring capacity from a transient available-permit count.
+    pub(super) prefetch_permit_capacity: usize,
     /// Immutable execution plan plus the sole backend context used by this
     /// engine and its associated real model. Routed-expert dispatch reads the
     /// backend selected by this context; it never reconstructs one privately.
@@ -1601,6 +1609,7 @@ impl EngineCore {
             gpu_promotion_tx: None,
             in_flight: Arc::new(DashMap::new()),
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(prefetch_permits)),
+            prefetch_permit_capacity: prefetch_permits,
             execution_context,
             routed_expert_gpu_failure_policy: RoutedExpertGpuFailurePolicy::default(),
             governor,
@@ -4478,7 +4487,10 @@ impl Engine {
                 return;
             }
             Ok(GpuNativeSpeculativeProbe::DroppedPressure) => {
-                controller.record_task_cancelled(ticket.ticket_id);
+                controller.record_cancelled(
+                    ticket.ticket_id,
+                    LiveCancellationReason::RejectedResidencyPressure,
+                );
                 return;
             }
             Ok(GpuNativeSpeculativeProbe::Miss) => {}
@@ -4495,14 +4507,17 @@ impl Engine {
             controller.record_rejected_governor(ticket.ticket_id);
             return;
         }
-        let permit = match self.core.prefetch_semaphore.clone().try_acquire_owned() {
+        let permit = match self.try_acquire_bounded_live_prefetch_permit() {
             Ok(permit) => permit,
             Err(_) => {
                 self.metrics
                     .counters
                     .prefetch_dropped_concurrency
                     .fetch_add(1, Ordering::Relaxed);
-                controller.record_task_cancelled(ticket.ticket_id);
+                controller.record_cancelled(
+                    ticket.ticket_id,
+                    LiveCancellationReason::RejectedConcurrencyNoPermit,
+                );
                 return;
             }
         };
@@ -4685,7 +4700,10 @@ impl Engine {
             task_guard.complete();
         };
         let Some(handle) = self.background_tasks.spawn_tracked(task) else {
-            controller.record_task_cancelled(ticket_id);
+            controller.record_cancelled(
+                ticket_id,
+                LiveCancellationReason::CancelledBackgroundSpawn,
+            );
             return;
         };
         controller.register_abort_handle(ticket_id, handle);
@@ -4693,6 +4711,19 @@ impl Engine {
 
     pub(crate) fn bounded_live_source_in_flight_count(&self) -> usize {
         self.core.in_flight.len()
+    }
+
+    pub(crate) fn bounded_live_speculative_resource_layout(&self) -> (usize, usize) {
+        (
+            self.core.pool.shadow_capacity(),
+            self.core.prefetch_permit_capacity,
+        )
+    }
+
+    fn try_acquire_bounded_live_prefetch_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        self.core.prefetch_semaphore.clone().try_acquire_owned()
     }
 
     fn spawn_gpu_native_ram_to_vram_prefetch(
@@ -9337,6 +9368,86 @@ mod tests {
             available < DEFAULT_MAX_CONCURRENT_PREFETCHES,
             "clamp must strictly tighten the user ceiling when pool headroom is smaller"
         );
+    }
+
+    #[test]
+    fn qualification_shadow_permit_allows_nonresident_source_acquisition() {
+        let dir = TempDir::new("bounded-live-resource");
+        let expert_size = 4096;
+        let block_align = 4096;
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            })
+            .expect("storage init"),
+        );
+        let pool = BufferPool::new_with_shadow(2, 1, expert_size, block_align);
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(1));
+        let router = Router::Markov(Arc::new(TopKRouter::new(2, 1, 0x1C_D1)));
+        let predictor = Arc::new(PredictiveLoader::new(2, 0, 0.0, 0x1C_D1));
+        let engine = Engine::with_options(
+            cache,
+            pool,
+            storage,
+            router,
+            predictor,
+            ModelShape {
+                d_model: 16,
+                d_ff: 32,
+                hidden_seed: 0x1C_D1,
+            },
+            EngineOptions {
+                max_concurrent_prefetches: 1,
+                ..EngineOptions::default()
+            },
+        );
+
+        assert_eq!(engine.bounded_live_speculative_resource_layout(), (1, 1));
+        let _permit = engine
+            .try_acquire_bounded_live_prefetch_permit()
+            .expect("the bounded live candidate must advance past the semaphore");
+        let _source_buffer = engine
+            .core
+            .pool
+            .try_acquire_shadow()
+            .expect("the nonresident source acquisition owns the dedicated shadow buffer");
+    }
+
+    #[test]
+    fn ordinary_predict_fanout_zero_keeps_production_speculation_disabled() {
+        let dir = TempDir::new("ordinary-zero-fanout");
+        let expert_size = 4096;
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align: 4096,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            })
+            .expect("storage init"),
+        );
+        let predictor = Arc::new(PredictiveLoader::new(2, 0, 0.0, 0x1C_D1));
+        let engine = Engine::with_options(
+            Arc::new(MultiLayerExpertCache::single_layer(1)),
+            BufferPool::new(2, expert_size, 4096),
+            storage,
+            Router::Markov(Arc::new(TopKRouter::new(2, 1, 0x1C_D1))),
+            predictor.clone(),
+            ModelShape {
+                d_model: 16,
+                d_ff: 32,
+                hidden_seed: 0x1C_D1,
+            },
+            EngineOptions::default(),
+        );
+
+        assert!(predictor.predict_next(0).is_empty());
+        assert_eq!(engine.bounded_live_speculative_resource_layout(), (0, 0));
     }
 
     /// **Gist Task 1 — GPU Promotion Regression Test.**

@@ -10219,6 +10219,7 @@ enum RealCliRuntimeMode {
     IsolatedGreedyParityHybrid,
     IsolatedGpuNativeDiagnostic,
     IsolatedGpuNativeBenchmark,
+    IsolatedGpuNativeBoundedLivePrefetch,
 }
 
 impl RealCliRuntimeMode {
@@ -10229,6 +10230,7 @@ impl RealCliRuntimeMode {
                 | Self::IsolatedGreedyParityHybrid
                 | Self::IsolatedGpuNativeDiagnostic
                 | Self::IsolatedGpuNativeBenchmark
+                | Self::IsolatedGpuNativeBoundedLivePrefetch
         )
     }
 
@@ -10239,6 +10241,7 @@ impl RealCliRuntimeMode {
                 | Self::IsolatedGreedyParityHybrid
                 | Self::IsolatedGpuNativeDiagnostic
                 | Self::IsolatedGpuNativeBenchmark
+                | Self::IsolatedGpuNativeBoundedLivePrefetch
         )
     }
 
@@ -10251,7 +10254,46 @@ impl RealCliRuntimeMode {
             }
             Self::IsolatedGpuNativeDiagnostic => "diagnose-gpu-native-q4-first-divergence",
             Self::IsolatedGpuNativeBenchmark => "bench-gpu-native-real",
+            Self::IsolatedGpuNativeBoundedLivePrefetch => {
+                crate::gpu_native_bounded_live_prefetch::COMMAND
+            }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RealCliRuntimeResources {
+    primary_slots: usize,
+    shadow_slots: usize,
+    max_concurrent_prefetches: usize,
+}
+
+/// Resolve buffer ownership independently from the source configuration.
+/// Every ordinary runtime preserves the production calculation exactly. The
+/// dedicated PR1C-D mode alone receives one shadow slot and one permit per
+/// frozen in-flight source-acquisition bound; it does not mutate
+/// `cfg.storage.predict_fanout` or enable the production predictor.
+fn real_cli_runtime_resources(
+    cfg: &crate::config::Config,
+    mode: RealCliRuntimeMode,
+) -> RealCliRuntimeResources {
+    let pipeline_depth = cfg.storage.pipeline_depth.max(1) as usize;
+    let production_shadow_slots = cfg.storage.predict_fanout.saturating_mul(pipeline_depth);
+    let (shadow_slots, max_concurrent_prefetches) =
+        if mode == RealCliRuntimeMode::IsolatedGpuNativeBoundedLivePrefetch {
+            let bounded = crate::gpu_native_bounded_live_prefetch::LiveResourceBounds::default()
+                .max_in_flight_source_acquisitions;
+            (bounded, bounded)
+        } else {
+            (
+                production_shadow_slots,
+                cfg.real_transformer.max_concurrent_prefetches,
+            )
+        };
+    RealCliRuntimeResources {
+        primary_slots: cfg.storage.cache_slots + 1,
+        shadow_slots,
+        max_concurrent_prefetches,
     }
 }
 
@@ -10327,7 +10369,8 @@ async fn build_real_cli_runtime(
         RealCliRuntimeMode::IsolatedGreedyParityCpu
         | RealCliRuntimeMode::IsolatedGreedyParityHybrid
         | RealCliRuntimeMode::IsolatedGpuNativeDiagnostic
-        | RealCliRuntimeMode::IsolatedGpuNativeBenchmark => {
+        | RealCliRuntimeMode::IsolatedGpuNativeBenchmark
+        | RealCliRuntimeMode::IsolatedGpuNativeBoundedLivePrefetch => {
             return Err("isolated qualification runtimes must use the private isolated factory".into());
         }
     };
@@ -10341,7 +10384,11 @@ fn resolve_real_cli_spec_from_config(
     crate::parallel::set_dense_matvec_backend(cfg.real_transformer.dense_matvec_backend);
     if mode == RealCliRuntimeMode::BenchReal {
         validate_bench_real_policies(&cfg)?;
-    } else if mode == RealCliRuntimeMode::IsolatedGpuNativeBenchmark {
+    } else if matches!(
+        mode,
+        RealCliRuntimeMode::IsolatedGpuNativeBenchmark
+            | RealCliRuntimeMode::IsolatedGpuNativeBoundedLivePrefetch
+    ) {
         crate::gpu_native_real_benchmark::validate_source_config(&cfg)?;
     }
 
@@ -10471,7 +10518,10 @@ async fn build_isolated_greedy_runtime(
         RealCliRuntimeMode::IsolatedGpuNativeDiagnostic => {
             crate::backend::ComputeOffload::Gpu
         }
-        RealCliRuntimeMode::IsolatedGpuNativeBenchmark => crate::backend::ComputeOffload::Gpu,
+        RealCliRuntimeMode::IsolatedGpuNativeBenchmark
+        | RealCliRuntimeMode::IsolatedGpuNativeBoundedLivePrefetch => {
+            crate::backend::ComputeOffload::Gpu
+        }
         _ => return Err("non-isolated runtime mode passed to isolated factory".into()),
     };
     let context = resolve_isolated_real_cli_context(spec, requested)?;
@@ -10556,19 +10606,17 @@ async fn build_real_cli_runtime_from_spec(
     // any truncated payload can be read.
     storage.validate_expert_file_layout(0..total_experts_for_files.min(8))?;
 
-    let pipeline_depth = cfg.storage.pipeline_depth.max(1) as usize;
-    let shadow_slots = cfg.storage.predict_fanout.saturating_mul(pipeline_depth);
-    let primary_slots = cfg.storage.cache_slots + 1;
-    let pool = if shadow_slots > 0 {
+    let runtime_resources = real_cli_runtime_resources(&cfg, mode);
+    let pool = if runtime_resources.shadow_slots > 0 {
         BufferPool::new_with_shadow(
-            primary_slots,
-            shadow_slots,
+            runtime_resources.primary_slots,
+            runtime_resources.shadow_slots,
             cfg.model.expert_size,
             cfg.storage.block_align,
         )
     } else {
         BufferPool::new(
-            primary_slots,
+            runtime_resources.primary_slots,
             cfg.model.expert_size,
             cfg.storage.block_align,
         )
@@ -10687,7 +10735,7 @@ async fn build_real_cli_runtime_from_spec(
             pin_after_observations: cfg.storage.pin_after_observations,
             use_qmm_for_q4: true,
             expert_execution_policy: cfg.real_transformer.expert_execution_policy,
-            max_concurrent_prefetches: cfg.real_transformer.max_concurrent_prefetches,
+            max_concurrent_prefetches: runtime_resources.max_concurrent_prefetches,
             max_fetch_yields: cfg.real_transformer.max_fetch_yields,
             prefetch_governor: cfg.predictive.prefetch_governor,
             prefetch_precision_floor: cfg.predictive.prefetch_precision_floor,
@@ -16526,6 +16574,55 @@ mod tests {
         assert_eq!(
             RealCliRuntimeMode::IsolatedGpuNativeDiagnostic.tokenizer_command(),
             "diagnose-gpu-native-q4-first-divergence"
+        );
+    }
+
+    #[test]
+    fn bounded_live_runtime_resources_are_qualification_only_and_source_preserving() {
+        let mut cfg = minimal_bench_cfg();
+        cfg.storage.cache_slots = 384;
+        cfg.storage.predict_fanout = 0;
+        cfg.storage.pipeline_depth = 1;
+        cfg.real_transformer.max_concurrent_prefetches = 64;
+
+        let ordinary = real_cli_runtime_resources(
+            &cfg,
+            RealCliRuntimeMode::IsolatedGpuNativeBenchmark,
+        );
+        assert_eq!(ordinary.primary_slots, 385);
+        assert_eq!(ordinary.shadow_slots, 0);
+        assert_eq!(ordinary.max_concurrent_prefetches, 64);
+        assert_eq!(cfg.storage.predict_fanout, 0);
+
+        let off = real_cli_runtime_resources(
+            &cfg,
+            RealCliRuntimeMode::IsolatedGpuNativeBoundedLivePrefetch,
+        );
+        let on = real_cli_runtime_resources(
+            &cfg,
+            RealCliRuntimeMode::IsolatedGpuNativeBoundedLivePrefetch,
+        );
+        let bounded =
+            crate::gpu_native_bounded_live_prefetch::LiveResourceBounds::default();
+        assert_eq!(off, on, "OFF and ON use the same isolated runtime mode");
+        assert_eq!(off.primary_slots, 385);
+        assert_eq!(
+            off.shadow_slots,
+            bounded.max_in_flight_source_acquisitions
+        );
+        assert_eq!(off.shadow_slots, 1);
+        assert_eq!(off.max_concurrent_prefetches, 1);
+        assert_eq!(cfg.storage.predict_fanout, 0);
+    }
+
+    #[test]
+    fn bounded_live_runtime_mode_is_private_to_the_qualification_command() {
+        let mode = RealCliRuntimeMode::IsolatedGpuNativeBoundedLivePrefetch;
+        assert!(mode.is_isolated());
+        assert!(mode.installs_logical_gpu_cache());
+        assert_eq!(
+            mode.tokenizer_command(),
+            crate::gpu_native_bounded_live_prefetch::COMMAND
         );
     }
 }

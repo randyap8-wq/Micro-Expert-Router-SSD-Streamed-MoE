@@ -139,6 +139,29 @@ enum CandidateState {
     Terminal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LiveCancellationReason {
+    RejectedConcurrencyNoPermit,
+    RejectedResidencyPressure,
+    CancelledBoundaryExpired,
+    CancelledBackgroundSpawn,
+    CancelledTaskOrShutdown,
+    CancelledStaleLogicalGeneration,
+}
+
+impl LiveCancellationReason {
+    fn classification(self) -> &'static str {
+        match self {
+            Self::RejectedConcurrencyNoPermit => "rejected-concurrency-no-permit",
+            Self::RejectedResidencyPressure => "rejected-residency-pressure",
+            Self::CancelledBoundaryExpired => "cancelled-boundary-expired",
+            Self::CancelledBackgroundSpawn => "cancelled-background-spawn",
+            Self::CancelledTaskOrShutdown => "cancelled-task-or-shutdown",
+            Self::CancelledStaleLogicalGeneration => "cancelled-stale-logical-generation",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CandidateRecord {
     boundary: u64,
@@ -189,6 +212,12 @@ pub(crate) struct LiveLifecycleCounters {
     pub(crate) speculative_joined_existing_acquisition: u64,
     pub(crate) demand_joined_speculative_acquisition: u64,
     pub(crate) source_acquisition_cancelled_stale: u64,
+    pub(crate) rejected_concurrency_no_permit: u64,
+    pub(crate) rejected_residency_pressure: u64,
+    pub(crate) cancelled_boundary_expired: u64,
+    pub(crate) cancelled_background_spawn: u64,
+    pub(crate) cancelled_task_or_shutdown: u64,
+    pub(crate) cancelled_stale_logical_generation: u64,
     pub(crate) physical_installation_started: u64,
     pub(crate) physical_installation_completed: u64,
     pub(crate) completed_before_first_demand: u64,
@@ -270,6 +299,7 @@ pub(crate) struct LiveRunEvidence {
     pub(crate) lifecycle_samples: Vec<LiveLifecycleSample>,
     pub(crate) postconditions: GpuNativeLivePostconditionEvidence,
     pub(crate) counter_reconciliation_pass: bool,
+    pub(crate) cancellation_reason_reconciliation_pass: bool,
     pub(crate) orphan_in_flight_source_entries: usize,
     pub(crate) no_orphan_in_flight_speculative_acquisitions: bool,
     pub(crate) no_leaked_install_reservations: bool,
@@ -543,19 +573,22 @@ impl GpuNativeBoundedLivePrefetchController {
             let current_boundary = run.next_boundary;
             let expired = run
                 .candidates
-                .values()
-                .filter(|candidate| {
+                .iter()
+                .filter(|(_, candidate)| {
                     !candidate.terminal
                         && current_boundary.saturating_sub(candidate.boundary)
                             > self.config.bounds.max_target_boundaries_survived
                 })
-                .filter_map(|candidate| candidate.abort_handle.clone())
+                .map(|(&ticket_id, candidate)| (ticket_id, candidate.abort_handle.clone()))
                 .collect::<Vec<_>>();
             (expired, frozen)
         };
 
-        for handle in expired {
-            handle.abort();
+        for (ticket_id, handle) in expired {
+            self.record_cancelled(ticket_id, LiveCancellationReason::CancelledBoundaryExpired);
+            if let Some(handle) = handle {
+                handle.abort();
+            }
         }
         if let Some(pending) = frozen {
             self.submit_frozen_candidates(engine, residency, pending)?;
@@ -859,19 +892,16 @@ impl GpuNativeBoundedLivePrefetchController {
                 );
             }
             GpuNativeLiveSpeculativeInstall::DroppedCapacityOrPressure => {
-                self.finish_ticket(ticket_id, "dropped-capacity-or-pressure", |_, _, _| {});
+                self.record_cancelled(
+                    ticket_id,
+                    LiveCancellationReason::RejectedResidencyPressure,
+                );
             }
             GpuNativeLiveSpeculativeInstall::StaleLogicalGeneration => {
-                self.finish_ticket(ticket_id, "stale-logical-generation", |run, record, _| {
-                    run.counters.source_acquisition_cancelled_stale = run
-                        .counters
-                        .source_acquisition_cancelled_stale
-                        .saturating_add(1);
-                    run.counters.cancellations_wasted_source_bytes = run
-                        .counters
-                        .cancellations_wasted_source_bytes
-                        .saturating_add(record.source_bytes);
-                });
+                self.record_cancelled(
+                    ticket_id,
+                    LiveCancellationReason::CancelledStaleLogicalGeneration,
+                );
             }
         }
     }
@@ -938,12 +968,33 @@ impl GpuNativeBoundedLivePrefetchController {
         );
     }
 
-    pub(crate) fn record_task_cancelled(&self, ticket_id: u64) {
-        self.finish_ticket(ticket_id, "cancelled-or-stale", |run, record, _| {
+    pub(crate) fn record_cancelled(&self, ticket_id: u64, reason: LiveCancellationReason) {
+        self.finish_ticket(ticket_id, reason.classification(), |run, record, _| {
             run.counters.source_acquisition_cancelled_stale = run
                 .counters
                 .source_acquisition_cancelled_stale
                 .saturating_add(1);
+            let attributed = match reason {
+                LiveCancellationReason::RejectedConcurrencyNoPermit => {
+                    &mut run.counters.rejected_concurrency_no_permit
+                }
+                LiveCancellationReason::RejectedResidencyPressure => {
+                    &mut run.counters.rejected_residency_pressure
+                }
+                LiveCancellationReason::CancelledBoundaryExpired => {
+                    &mut run.counters.cancelled_boundary_expired
+                }
+                LiveCancellationReason::CancelledBackgroundSpawn => {
+                    &mut run.counters.cancelled_background_spawn
+                }
+                LiveCancellationReason::CancelledTaskOrShutdown => {
+                    &mut run.counters.cancelled_task_or_shutdown
+                }
+                LiveCancellationReason::CancelledStaleLogicalGeneration => {
+                    &mut run.counters.cancelled_stale_logical_generation
+                }
+            };
+            *attributed = attributed.saturating_add(1);
             run.counters.cancellations_wasted_source_bytes = run
                 .counters
                 .cancellations_wasted_source_bytes
@@ -1000,19 +1051,25 @@ impl GpuNativeBoundedLivePrefetchController {
         engine: &crate::engine::Engine,
         residency: &GpuNativeTieredResidencyManager,
     ) -> Result<LiveRunEvidence, ShadowObserverError> {
-        let handles = {
+        let cancellations = {
             let inner = self.inner.lock();
             let run = inner.run.as_ref().ok_or_else(|| {
                 ShadowObserverError::new("bounded live end_run called without active run")
             })?;
             run.candidates
-                .values()
-                .filter(|candidate| !candidate.terminal)
-                .filter_map(|candidate| candidate.abort_handle.clone())
+                .iter()
+                .filter(|(_, candidate)| !candidate.terminal)
+                .map(|(&ticket_id, candidate)| (ticket_id, candidate.abort_handle.clone()))
                 .collect::<Vec<_>>()
         };
-        for handle in handles {
-            handle.abort();
+        for (ticket_id, handle) in cancellations {
+            self.record_cancelled(
+                ticket_id,
+                LiveCancellationReason::CancelledTaskOrShutdown,
+            );
+            if let Some(handle) = handle {
+                handle.abort();
+            }
         }
         let wait =
             async {
@@ -1062,6 +1119,25 @@ impl GpuNativeBoundedLivePrefetchController {
                 run.counters.accepted_candidates, accepted_terminal, run.counters.completed_tasks
             )));
         }
+        let attributed_cancellations = [
+            run.counters.rejected_concurrency_no_permit,
+            run.counters.rejected_residency_pressure,
+            run.counters.cancelled_boundary_expired,
+            run.counters.cancelled_background_spawn,
+            run.counters.cancelled_task_or_shutdown,
+            run.counters.cancelled_stale_logical_generation,
+        ]
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(|| ShadowObserverError::new("live-prefetch cancellation counters overflowed"))?;
+        let cancellation_reason_reconciliation_pass =
+            attributed_cancellations == run.counters.source_acquisition_cancelled_stale;
+        if !cancellation_reason_reconciliation_pass {
+            return Err(ShadowObserverError::new(format!(
+                "live-prefetch cancellation reasons did not reconcile: aggregate={} attributed={attributed_cancellations}",
+                run.counters.source_acquisition_cancelled_stale
+            )));
+        }
         run.counters.prediction_unused = run
             .candidates
             .values()
@@ -1090,6 +1166,7 @@ impl GpuNativeBoundedLivePrefetchController {
             lifecycle_samples: run.samples,
             postconditions,
             counter_reconciliation_pass,
+            cancellation_reason_reconciliation_pass,
             orphan_in_flight_source_entries,
             no_orphan_in_flight_speculative_acquisitions: true,
             no_leaked_install_reservations: true,
@@ -1341,6 +1418,14 @@ pub(crate) struct LiveDerivedFractions {
     pub(crate) unused_installation_fraction: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct QualificationResourceEvidence {
+    pub(crate) production_predict_fanout: usize,
+    pub(crate) qualification_shadow_slots: usize,
+    pub(crate) effective_speculative_permits: usize,
+    pub(crate) max_in_flight_source_acquisitions: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct LiveArmEvidence {
     pub(crate) arm: LiveArm,
@@ -1349,6 +1434,7 @@ pub(crate) struct LiveArmEvidence {
     pub(crate) hardware: crate::backend::GpuDeviceIdentity,
     pub(crate) model_load: crate::greedy_parity::ModelLoadEvidence,
     pub(crate) runtime_contract: crate::gpu_native_real_benchmark::RuntimeContractEvidence,
+    pub(crate) qualification_resources: QualificationResourceEvidence,
     pub(crate) warmup_run_evidence: Vec<LiveQualifiedRunEvidence>,
     pub(crate) measured_run_evidence: Vec<LiveQualifiedRunEvidence>,
     pub(crate) measured_aggregate: crate::gpu_native_real_benchmark::Aggregate,
@@ -1418,6 +1504,8 @@ pub(crate) struct DemandSourceComparisonEvidence {
 pub(crate) struct PerformanceEvidence {
     pub(crate) pass: bool,
     pub(crate) eligible_for_interpretation: bool,
+    pub(crate) behavioral_equivalence_pass: bool,
+    pub(crate) live_path_exercised_pass: bool,
     pub(crate) control_decode_tps_mean: f64,
     pub(crate) treatment_decode_tps_mean: f64,
     pub(crate) decode_tps_relative_delta: Option<f64>,
@@ -1427,6 +1515,15 @@ pub(crate) struct PerformanceEvidence {
     pub(crate) control_request_wall_seconds_mean: f64,
     pub(crate) treatment_request_wall_seconds_mean: f64,
     pub(crate) request_wall_time_improvement_fraction: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct LivePathExercisedEvidence {
+    pub(crate) pass: bool,
+    pub(crate) nonresident_accepted_candidates: u64,
+    pub(crate) source_acquisition_started: u64,
+    pub(crate) speculative_source_joins: u64,
+    pub(crate) physical_installation_started: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1466,6 +1563,7 @@ pub(crate) struct BoundedLivePrefetchReport {
     pub(crate) failure: Option<crate::gpu_native_real_benchmark::BenchmarkFailure>,
     pub(crate) qualification_pass: bool,
     pub(crate) behavioral_equivalence_pass: bool,
+    pub(crate) live_path_exercised_pass: bool,
     pub(crate) residency_effectiveness_pass: bool,
     pub(crate) performance_pass: bool,
     pub(crate) performance_claim: bool,
@@ -1482,6 +1580,8 @@ pub(crate) struct BoundedLivePrefetchReport {
     pub(crate) exact_causal_timing: &'static str,
     pub(crate) replacement_policy: GpuNativeLiveReplacementPolicy,
     pub(crate) live_resource_bounds: LiveResourceBounds,
+    pub(crate) qualification_resources: QualificationResourceEvidence,
+    pub(crate) off_on_resource_layout_identical: bool,
     pub(crate) replacement_policy_semantics: &'static str,
     pub(crate) normal_production_default_remains_disabled: bool,
     pub(crate) production_semantics: LiveProductionSemantics,
@@ -1491,6 +1591,7 @@ pub(crate) struct BoundedLivePrefetchReport {
     pub(crate) control: Option<LiveArmEvidence>,
     pub(crate) treatment: Option<LiveArmEvidence>,
     pub(crate) behavioral_equivalence: Option<BehavioralEquivalenceEvidence>,
+    pub(crate) live_path_exercised: Option<LivePathExercisedEvidence>,
     pub(crate) residency_effectiveness: Option<ResidencyEffectivenessEvidence>,
     pub(crate) demand_source_comparison: Option<DemandSourceComparisonEvidence>,
     pub(crate) performance: Option<PerformanceEvidence>,
@@ -1524,6 +1625,12 @@ fn checked_add_counters(
     add!(speculative_joined_existing_acquisition);
     add!(demand_joined_speculative_acquisition);
     add!(source_acquisition_cancelled_stale);
+    add!(rejected_concurrency_no_permit);
+    add!(rejected_residency_pressure);
+    add!(cancelled_boundary_expired);
+    add!(cancelled_background_spawn);
+    add!(cancelled_task_or_shutdown);
+    add!(cancelled_stale_logical_generation);
     add!(physical_installation_started);
     add!(physical_installation_completed);
     add!(completed_before_first_demand);
@@ -1784,20 +1891,51 @@ async fn run_arm(
     use crate::gpu_native_real_benchmark::BenchmarkFailure;
     let tokenizer = crate::load_real_cli_tokenizer(
         &spec.cfg,
-        crate::RealCliRuntimeMode::IsolatedGpuNativeBenchmark,
+        crate::RealCliRuntimeMode::IsolatedGpuNativeBoundedLivePrefetch,
     )
     .map_err(|error| {
         BenchmarkFailure::new("startup", "tokenizer-load-failed", error.to_string())
     })?;
     let runtime = crate::build_isolated_greedy_runtime(
         spec,
-        crate::RealCliRuntimeMode::IsolatedGpuNativeBenchmark,
+        crate::RealCliRuntimeMode::IsolatedGpuNativeBoundedLivePrefetch,
         tokenizer,
     )
     .await
     .map_err(|error| {
         BenchmarkFailure::new("startup", "runtime-construction-failed", error.to_string())
     })?;
+    let (qualification_shadow_slots, effective_speculative_permits) = runtime
+        .engine
+        .bounded_live_speculative_resource_layout();
+    let qualification_resources = QualificationResourceEvidence {
+        production_predict_fanout: runtime.cfg.storage.predict_fanout,
+        qualification_shadow_slots,
+        effective_speculative_permits,
+        max_in_flight_source_acquisitions: bounds.max_in_flight_source_acquisitions,
+    };
+    if runtime.cfg.storage.predict_fanout != spec.cfg.storage.predict_fanout
+        || qualification_shadow_slots != bounds.max_in_flight_source_acquisitions
+        || effective_speculative_permits < 1
+        || effective_speculative_permits != bounds.max_in_flight_source_acquisitions
+    {
+        let failure = BenchmarkFailure::new(
+            "startup",
+            "qualification-resource-contract-mismatch",
+            format!(
+                "source_predict_fanout={} runtime_predict_fanout={} resources={qualification_resources:?}",
+                spec.cfg.storage.predict_fanout, runtime.cfg.storage.predict_fanout
+            ),
+        );
+        return match runtime.shutdown_isolated().await {
+            Ok(_) => Err(failure),
+            Err(shutdown) => Err(BenchmarkFailure::new(
+                "postcondition",
+                "resource-contract-and-shutdown-failed",
+                format!("{failure}; {shutdown}"),
+            )),
+        };
+    }
     let validation = crate::gpu_native_prefetch_shadow::validate_shadow_runtime(
         &runtime,
         resolved_config_sha256,
@@ -1962,6 +2100,7 @@ async fn run_arm(
         hardware,
         model_load,
         runtime_contract,
+        qualification_resources,
         warmup_run_evidence,
         measured_run_evidence,
         measured_aggregate,
@@ -2152,10 +2291,32 @@ fn mean_wall_seconds(arm: &LiveArmEvidence) -> f64 {
         / arm.measured_run_evidence.len() as f64
 }
 
+fn live_path_exercised(counters: &LiveLifecycleCounters) -> LivePathExercisedEvidence {
+    let nonresident_accepted_candidates = counters
+        .accepted_candidates
+        .saturating_sub(counters.already_physically_resident);
+    let speculative_source_joins = counters.speculative_joined_existing_acquisition;
+    let progressed = counters.source_acquisition_started > 0
+        || speculative_source_joins > 0
+        || counters.physical_installation_started > 0;
+    LivePathExercisedEvidence {
+        pass: nonresident_accepted_candidates > 0 && progressed,
+        nonresident_accepted_candidates,
+        source_acquisition_started: counters.source_acquisition_started,
+        speculative_source_joins,
+        physical_installation_started: counters.physical_installation_started,
+    }
+}
+
+fn performance_eligible(behavioral_pass: bool, live_path_exercised_pass: bool) -> bool {
+    behavioral_pass && live_path_exercised_pass
+}
+
 fn compare_performance(
     control: &LiveArmEvidence,
     treatment: &LiveArmEvidence,
     behavioral_pass: bool,
+    live_path_exercised_pass: bool,
 ) -> PerformanceEvidence {
     let off_decode = control.measured_aggregate.decode_tps.mean;
     let on_decode = treatment.measured_aggregate.decode_tps.mean;
@@ -2163,9 +2324,16 @@ fn compare_performance(
     let on_e2e = treatment.measured_aggregate.end_to_end_generated_tps.mean;
     let off_wall = mean_wall_seconds(control);
     let on_wall = mean_wall_seconds(treatment);
+    let eligible_for_interpretation =
+        performance_eligible(behavioral_pass, live_path_exercised_pass);
     PerformanceEvidence {
-        pass: behavioral_pass && on_decode > off_decode && on_e2e > off_e2e && on_wall < off_wall,
-        eligible_for_interpretation: behavioral_pass,
+        pass: eligible_for_interpretation
+            && on_decode > off_decode
+            && on_e2e > off_e2e
+            && on_wall < off_wall,
+        eligible_for_interpretation,
+        behavioral_equivalence_pass: behavioral_pass,
+        live_path_exercised_pass,
         control_decode_tps_mean: off_decode,
         treatment_decode_tps_mean: on_decode,
         decode_tps_relative_delta: relative_delta(off_decode, on_decode),
@@ -2291,6 +2459,17 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     let build = crate::qualification::BuildProvenance::embedded();
     let cfg = crate::config::Config::from_file(&args.config)?;
     crate::gpu_native_real_benchmark::validate_source_config(&cfg)?;
+    if cfg.storage.predict_fanout != 0 {
+        return Err(BenchmarkFailure::new(
+            "preflight",
+            "production-prefetch-must-remain-disabled",
+            format!(
+                "{COMMAND} requires source storage.predict_fanout=0; observed {}",
+                cfg.storage.predict_fanout
+            ),
+        )
+        .into());
+    }
     let (artifacts, artifact_errors) = crate::qualification_artifacts(&args.config, &cfg);
     let expert_metadata =
         crate::qualification::read_expert_metadata(&cfg.model.data_dir.join("metadata.json"))
@@ -2315,7 +2494,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     let markov_min_prob = resolve_predict_min_prob(cfg.storage.predict_min_prob, total_experts);
     let spec = crate::resolve_real_cli_spec_from_config(
         cfg,
-        crate::RealCliRuntimeMode::IsolatedGpuNativeBenchmark,
+        crate::RealCliRuntimeMode::IsolatedGpuNativeBoundedLivePrefetch,
     )?;
     let model_identity = crate::greedy_parity_model_identity(&spec);
     if !model_identity.is_qwen3_coder_30b_a3b_q4_0() {
@@ -2331,7 +2510,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     let resolved_config_sha256 = crate::resolved_real_cli_spec_sha256(&spec)?;
     let tokenizer = crate::load_real_cli_tokenizer(
         &spec.cfg,
-        crate::RealCliRuntimeMode::IsolatedGpuNativeBenchmark,
+        crate::RealCliRuntimeMode::IsolatedGpuNativeBoundedLivePrefetch,
     )?;
     let prompt_ids = tokenizer.encode(&request_input.prompt)?;
     if prompt_ids.is_empty() {
@@ -2366,6 +2545,12 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         greedy: true,
     };
     let bounds = LiveResourceBounds::default();
+    let qualification_resources = QualificationResourceEvidence {
+        production_predict_fanout: spec.cfg.storage.predict_fanout,
+        qualification_shadow_slots: bounds.max_in_flight_source_acquisitions,
+        effective_speculative_permits: bounds.max_in_flight_source_acquisitions,
+        max_in_flight_source_acquisitions: bounds.max_in_flight_source_acquisitions,
+    };
     let mut report = BoundedLivePrefetchReport {
         schema: SCHEMA,
         mode: MODE,
@@ -2386,6 +2571,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         failure: None,
         qualification_pass: false,
         behavioral_equivalence_pass: false,
+        live_path_exercised_pass: false,
         residency_effectiveness_pass: false,
         performance_pass: false,
         performance_claim: false,
@@ -2412,6 +2598,8 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         exact_causal_timing: "freeze after completed actual route L-1 is CPU-visible and all earlier target truth has been scored, before target layer L submission; update predictor and route-recency only after target scoring",
         replacement_policy: args.replacement_policy,
         live_resource_bounds: bounds,
+        qualification_resources,
+        off_on_resource_layout_identical: false,
         replacement_policy_semantics: replacement_semantics(args.replacement_policy),
         normal_production_default_remains_disabled: true,
         production_semantics: LiveProductionSemantics {
@@ -2434,6 +2622,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         control: None,
         treatment: None,
         behavioral_equivalence: None,
+        live_path_exercised: None,
         residency_effectiveness: None,
         demand_source_comparison: None,
         performance: None,
@@ -2495,34 +2684,46 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         || control.model_load != treatment.model_load
         || control.runtime_contract.token_loop_geometry
             != treatment.runtime_contract.token_loop_geometry
+        || control.qualification_resources != treatment.qualification_resources
     {
         let failure = BenchmarkFailure::new(
             "postcondition",
             "off-on-runtime-identity-drift",
             format!(
-                "OFF/ON runtime identity differed: off_hardware={:?} on_hardware={:?} off_model={:?} on_model={:?}",
-                control.hardware, treatment.hardware, control.model_load, treatment.model_load
+                "OFF/ON runtime identity differed: off_hardware={:?} on_hardware={:?} off_model={:?} on_model={:?} off_resources={:?} on_resources={:?}",
+                control.hardware,
+                treatment.hardware,
+                control.model_load,
+                treatment.model_load,
+                control.qualification_resources,
+                treatment.qualification_resources
             ),
         );
         report.failure = Some(failure.clone());
         emit_report(&report, args.report_out.as_deref())?;
         return Err(failure.into());
     }
+    report.qualification_resources = control.qualification_resources;
+    report.off_on_resource_layout_identical = true;
     let behavioral = compare_behavior(&control, &treatment);
+    let live_path = live_path_exercised(&treatment.measured_live_totals);
     let residency = compare_residency(&control, &treatment);
     let demand_source_comparison = compare_demand_sources(&control, &treatment);
-    let performance = compare_performance(&control, &treatment, behavioral.pass);
+    let performance = compare_performance(&control, &treatment, behavioral.pass, live_path.pass);
     report.behavioral_equivalence_pass = behavioral.pass;
+    report.live_path_exercised_pass = live_path.pass;
     report.residency_effectiveness_pass = residency.pass;
     report.performance_pass = performance.pass;
-    report.performance_claim = behavioral.pass && performance.pass;
+    report.performance_claim = performance.pass;
     report.qualification_complete = true;
     report.qualification_pass = control.complete
         && treatment.complete
         && behavioral.pass
+        && live_path.pass
         && control.runtime_shutdown.all_runtime_resources_released
         && treatment.runtime_shutdown.all_runtime_resources_released;
     report.behavioral_equivalence = Some(behavioral);
+    report.live_path_exercised = Some(live_path);
     report.residency_effectiveness = Some(residency);
     report.demand_source_comparison = Some(demand_source_comparison);
     report.performance = Some(performance);
@@ -2535,8 +2736,12 @@ mod tests {
     use clap::Parser as _;
 
     fn controller() -> Arc<GpuNativeBoundedLivePrefetchController> {
+        controller_for_arm(LiveArm::On)
+    }
+
+    fn controller_for_arm(arm: LiveArm) -> Arc<GpuNativeBoundedLivePrefetchController> {
         GpuNativeBoundedLivePrefetchController::new(LiveControllerConfig {
-            arm: LiveArm::On,
+            arm,
             policy: GpuNativeLiveReplacementPolicy::PhysicalLru,
             num_layers: 2,
             experts_per_layer: 4,
@@ -2683,6 +2888,7 @@ mod tests {
         );
         let counters = counters(&controller);
         assert_eq!(counters.source_acquisition_cancelled_stale, 1);
+        assert_eq!(counters.cancelled_stale_logical_generation, 1);
         assert_eq!(counters.cancellations_wasted_source_bytes, 4096);
     }
 
@@ -2702,6 +2908,7 @@ mod tests {
         assert_eq!(counters.physical_installation_started, 1);
         assert_eq!(counters.physical_installation_completed, 0);
         assert_eq!(counters.source_acquisition_cancelled_stale, 1);
+        assert_eq!(counters.cancelled_stale_logical_generation, 1);
     }
 
     #[test]
@@ -2744,11 +2951,87 @@ mod tests {
         let ticket = accept(&controller, &pending);
         controller.record_source_started(ticket.ticket_id, false, false);
         classify(&controller, &pending, HashSet::from([4]), 100, false);
-        controller.record_task_cancelled(ticket.ticket_id);
+        controller.record_cancelled(
+            ticket.ticket_id,
+            LiveCancellationReason::CancelledTaskOrShutdown,
+        );
         let counters = counters(&controller);
         assert_eq!(counters.demand_arrived_while_speculative_in_flight, 1);
         assert_eq!(counters.source_acquisition_cancelled_stale, 1);
+        assert_eq!(counters.cancelled_task_or_shutdown, 1);
         assert_eq!(counters.completed_tasks, 1);
+    }
+
+    #[test]
+    fn off_arm_accepts_no_candidates_and_performs_zero_live_work() {
+        let controller = controller_for_arm(LiveArm::Off);
+        controller.begin_run(ShadowPhase::Measured, 0).unwrap();
+        let pending = pending(4);
+        let accepted = controller
+            .accept_candidate(
+                &pending,
+                &pending.candidates[0],
+                Arc::new(HashSet::from([4])),
+            )
+            .unwrap();
+        assert!(accepted.is_none());
+        let counters = counters(&controller);
+        assert_eq!(counters.rejected_live_disabled, 1);
+        assert_eq!(counters.accepted_candidates, 0);
+        assert_eq!(counters.source_acquisition_started, 0);
+        assert_eq!(counters.speculative_joined_existing_acquisition, 0);
+        assert_eq!(counters.physical_installation_started, 0);
+    }
+
+    #[test]
+    fn cancellation_reason_accounting_reconciles_with_legacy_aggregate() {
+        let controller = controller();
+        controller.begin_run(ShadowPhase::Measured, 0).unwrap();
+        let pending = pending(4);
+        for reason in [
+            LiveCancellationReason::RejectedConcurrencyNoPermit,
+            LiveCancellationReason::RejectedResidencyPressure,
+            LiveCancellationReason::CancelledBoundaryExpired,
+            LiveCancellationReason::CancelledBackgroundSpawn,
+            LiveCancellationReason::CancelledTaskOrShutdown,
+            LiveCancellationReason::CancelledStaleLogicalGeneration,
+        ] {
+            let ticket = accept(&controller, &pending);
+            controller.record_cancelled(ticket.ticket_id, reason);
+        }
+        let counters = counters(&controller);
+        let attributed = counters.rejected_concurrency_no_permit
+            + counters.rejected_residency_pressure
+            + counters.cancelled_boundary_expired
+            + counters.cancelled_background_spawn
+            + counters.cancelled_task_or_shutdown
+            + counters.cancelled_stale_logical_generation;
+        assert_eq!(counters.source_acquisition_cancelled_stale, 6);
+        assert_eq!(attributed, counters.source_acquisition_cancelled_stale);
+        assert_eq!(counters.completed_tasks, 6);
+    }
+
+    #[test]
+    fn nonresident_no_live_work_is_performance_ineligible() {
+        let counters = LiveLifecycleCounters {
+            accepted_candidates: 1,
+            ..LiveLifecycleCounters::default()
+        };
+        let evidence = live_path_exercised(&counters);
+        assert_eq!(evidence.nonresident_accepted_candidates, 1);
+        assert!(!evidence.pass);
+        assert!(!performance_eligible(true, evidence.pass));
+
+        let progressed = LiveLifecycleCounters {
+            accepted_candidates: 1,
+            source_acquisition_started: 1,
+            ..LiveLifecycleCounters::default()
+        };
+        assert!(live_path_exercised(&progressed).pass);
+        assert!(performance_eligible(
+            true,
+            live_path_exercised(&progressed).pass
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2763,7 +3046,10 @@ mod tests {
         });
         controller.register_abort_handle(ticket.ticket_id, handle.abort_handle());
         handle.abort();
-        controller.record_task_cancelled(ticket.ticket_id);
+        controller.record_cancelled(
+            ticket.ticket_id,
+            LiveCancellationReason::CancelledTaskOrShutdown,
+        );
         let _ = handle.await;
         let inner = controller.inner.lock();
         let run = inner.run.as_ref().unwrap();
