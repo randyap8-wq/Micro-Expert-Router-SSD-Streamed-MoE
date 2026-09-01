@@ -44,6 +44,7 @@ use crate::router::{
 use dashmap::DashMap;
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -380,6 +381,35 @@ impl std::error::Error for ExpertReadError {}
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum GpuNativeDemandResidencyError {
     ManagerNotInstalled,
+    QualificationIsolationViolation,
+    QualificationTreatmentNotEnabled,
+    QualificationBatchCapacity {
+        requested: usize,
+        layer_capacity: usize,
+    },
+    QualificationBatchVictimUnavailable {
+        global_id: u32,
+    },
+    QualificationPrimaryPoolUnavailable {
+        requested: usize,
+        acquired: usize,
+    },
+    QualificationBatchRead {
+        global_ids: Vec<u32>,
+        attempts: usize,
+        source: String,
+    },
+    QualificationCompletedReadSetMismatch {
+        requested_global_ids: Vec<u32>,
+        completed_global_ids: Vec<u32>,
+    },
+    QualificationCacheCommitRejected {
+        global_id: u32,
+    },
+    QualificationUnexpectedCommitEviction {
+        inserted_global_id: u32,
+        evicted_global_id: u32,
+    },
     ExpertRead(ExpertReadError),
     LogicalAdmission(crate::backend::GpuExpertDispatchError),
     LogicalDemandSet(GpuDemandAdmissionError),
@@ -400,6 +430,56 @@ impl std::fmt::Display for GpuNativeDemandResidencyError {
             Self::ManagerNotInstalled => {
                 f.write_str("GPU-native tiered residency manager is not installed")
             }
+            Self::QualificationIsolationViolation => f.write_str(
+                "qualification-only exact-demand source observed overlapping foreground demand sets",
+            ),
+            Self::QualificationTreatmentNotEnabled => f.write_str(
+                "qualification-only concurrent exact-demand source was called outside its explicit treatment arm",
+            ),
+            Self::QualificationBatchCapacity {
+                requested,
+                layer_capacity,
+            } => write!(
+                f,
+                "qualification-only exact-demand source requires {requested} protected residents but the owning RAM-cache layer capacity is {layer_capacity}"
+            ),
+            Self::QualificationBatchVictimUnavailable { global_id } => write!(
+                f,
+                "qualification-only exact-demand source could not reserve a non-pinned sequential-equivalent cache victim before expert {global_id}"
+            ),
+            Self::QualificationPrimaryPoolUnavailable {
+                requested,
+                acquired,
+            } => write!(
+                f,
+                "qualification-only exact-demand source required {requested} existing primary buffers but acquired only {acquired}"
+            ),
+            Self::QualificationBatchRead {
+                global_ids,
+                attempts,
+                source,
+            } => write!(
+                f,
+                "qualification-only exact-demand batch read for experts {global_ids:?} failed after {attempts} attempts: {source}"
+            ),
+            Self::QualificationCompletedReadSetMismatch {
+                requested_global_ids,
+                completed_global_ids,
+            } => write!(
+                f,
+                "qualification-only exact-demand completed-read set {completed_global_ids:?} did not match requested set {requested_global_ids:?}"
+            ),
+            Self::QualificationCacheCommitRejected { global_id } => write!(
+                f,
+                "qualification-only ordered RAM-cache commit rejected expert {global_id}"
+            ),
+            Self::QualificationUnexpectedCommitEviction {
+                inserted_global_id,
+                evicted_global_id,
+            } => write!(
+                f,
+                "qualification-only ordered RAM-cache commit of expert {inserted_global_id} unexpectedly evicted expert {evicted_global_id} after deterministic reservation"
+            ),
             Self::ExpertRead(error) => write!(f, "tiered residency fetch failed: {error}"),
             Self::LogicalAdmission(error) => {
                 write!(f, "tiered residency logical admission failed: {error}")
@@ -443,6 +523,385 @@ impl From<GpuNativeTieredResidencyError> for GpuNativeDemandResidencyError {
 impl From<GpuDemandAdmissionError> for GpuNativeDemandResidencyError {
     fn from(value: GpuDemandAdmissionError) -> Self {
         Self::LogicalDemandSet(value)
+    }
+}
+
+/// Explicit arm of the PR2-A exact-demand source qualification. This is not
+/// part of [`EngineOptions`] or TOML configuration: only the dedicated
+/// qualifier may install it on a fresh isolated runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GpuNativeDemandSourceQualificationArm {
+    Control,
+    Treatment,
+}
+
+/// Low-overhead, qualification-only source and cache evidence. All counters
+/// are cumulative since the most recent explicit qualification reset.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct GpuNativeDemandSourceQualificationSnapshot {
+    pub(crate) arm: GpuNativeDemandSourceQualificationArm,
+    pub(crate) qualification_only: bool,
+    pub(crate) production_demand_source_changed: bool,
+    pub(crate) single_request_stream: bool,
+    pub(crate) overlapping_demand_sets: u64,
+    pub(crate) primary_pool_capacity: usize,
+    pub(crate) shadow_pool_capacity: usize,
+    pub(crate) demand_sets: u64,
+    pub(crate) physical_missing_experts: u64,
+    pub(crate) physical_probe_us: u64,
+    pub(crate) source_sets: u64,
+    pub(crate) source_experts: u64,
+    pub(crate) demand_source_requests: u64,
+    pub(crate) source_ram_hits: u64,
+    pub(crate) source_ram_misses: u64,
+    pub(crate) source_nvme_reads: u64,
+    pub(crate) source_nvme_bytes: u64,
+    pub(crate) source_set_width_min: u64,
+    pub(crate) source_set_width_max: u64,
+    pub(crate) source_set_width_mean: f64,
+    pub(crate) source_acquisition_wall_us: u64,
+    pub(crate) sum_individual_source_service_us: Option<u64>,
+    pub(crate) logical_demand_admission_us: u64,
+    pub(crate) physical_demand_install_us: u64,
+    pub(crate) total_residency_service_us: u64,
+    pub(crate) batch_path_exercises: u64,
+    pub(crate) concurrent_source_reads: u64,
+    pub(crate) pool_capacity_failures: u64,
+    pub(crate) batch_read_failures: u64,
+    pub(crate) ordered_commit_violations: u64,
+    pub(crate) ram_cache_source_hits: u64,
+    pub(crate) ram_cache_source_misses: u64,
+    pub(crate) ram_cache_inserts: u64,
+    pub(crate) ram_cache_evictions: u64,
+    pub(crate) selected_route_ids_sha256: String,
+    pub(crate) physical_missing_ids_sha256: String,
+    pub(crate) demand_source_request_ids_sha256: String,
+    pub(crate) demand_ram_insert_ids_sha256: String,
+    pub(crate) demand_ram_eviction_ids_sha256: String,
+    pub(crate) deterministic_cache_commit_reconciliation: bool,
+}
+
+#[derive(Clone)]
+struct QualificationOrderedHasher {
+    inner: Sha256,
+}
+
+impl Default for QualificationOrderedHasher {
+    fn default() -> Self {
+        Self {
+            inner: Sha256::new(),
+        }
+    }
+}
+
+impl QualificationOrderedHasher {
+    fn record_set(&mut self, ids: &[u32]) {
+        self.inner.update([0x53]);
+        self.inner.update((ids.len() as u64).to_le_bytes());
+        for &id in ids {
+            self.inner.update(id.to_le_bytes());
+        }
+    }
+
+    fn record_id(&mut self, id: u32) {
+        self.inner.update([0x49]);
+        self.inner.update(id.to_le_bytes());
+    }
+
+    fn hex(&self) -> String {
+        format!("{:x}", self.inner.clone().finalize())
+    }
+}
+
+/// Normalize completed source reads into original request order before any
+/// cache mutation. The completed map is deliberately unordered, so neither
+/// storage-worker completion order nor map iteration order can become LRU
+/// insertion order.
+fn qualification_order_completed_residents(
+    request_order: &[u32],
+    mut completed: HashMap<u32, Arc<ExpertResident>>,
+) -> Result<Vec<(u32, Arc<ExpertResident>)>, GpuNativeDemandResidencyError> {
+    fn completed_set(completed: &HashMap<u32, Arc<ExpertResident>>) -> Vec<u32> {
+        let mut ids = completed.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+    if completed.len() != request_order.len()
+        || request_order.iter().any(|id| !completed.contains_key(id))
+    {
+        return Err(
+            GpuNativeDemandResidencyError::QualificationCompletedReadSetMismatch {
+                requested_global_ids: request_order.to_vec(),
+                completed_global_ids: completed_set(&completed),
+            },
+        );
+    }
+    let mut ordered = Vec::with_capacity(request_order.len());
+    for &global_id in request_order {
+        let resident = completed.remove(&global_id).ok_or_else(|| {
+            GpuNativeDemandResidencyError::QualificationCompletedReadSetMismatch {
+                requested_global_ids: request_order.to_vec(),
+                completed_global_ids: completed_set(&completed),
+            }
+        })?;
+        ordered.push((global_id, resident));
+    }
+    if !completed.is_empty() {
+        return Err(
+            GpuNativeDemandResidencyError::QualificationCompletedReadSetMismatch {
+                requested_global_ids: request_order.to_vec(),
+                completed_global_ids: completed_set(&completed),
+            },
+        );
+    }
+    Ok(ordered)
+}
+
+struct GpuNativeDemandSourceQualification {
+    arm: GpuNativeDemandSourceQualificationArm,
+    primary_pool_capacity: usize,
+    shadow_pool_capacity: usize,
+    active_demand_set: AtomicBool,
+    overlapping_demand_sets: AtomicU64,
+    demand_sets: AtomicU64,
+    physical_missing_experts: AtomicU64,
+    physical_probe_us: AtomicU64,
+    source_sets: AtomicU64,
+    source_experts: AtomicU64,
+    demand_source_requests: AtomicU64,
+    source_ram_hits: AtomicU64,
+    source_ram_misses: AtomicU64,
+    source_nvme_reads: AtomicU64,
+    source_nvme_bytes: AtomicU64,
+    source_set_width_min: AtomicU64,
+    source_set_width_max: AtomicU64,
+    source_set_width_sum: AtomicU64,
+    source_acquisition_wall_us: AtomicU64,
+    individual_source_service_us: AtomicU64,
+    logical_demand_admission_us: AtomicU64,
+    physical_demand_install_us: AtomicU64,
+    total_residency_service_us: AtomicU64,
+    batch_path_exercises: AtomicU64,
+    concurrent_source_reads: AtomicU64,
+    pool_capacity_failures: AtomicU64,
+    batch_read_failures: AtomicU64,
+    ordered_commit_violations: AtomicU64,
+    ram_cache_inserts: AtomicU64,
+    ram_cache_evictions: AtomicU64,
+    selected_route_ids: parking_lot::Mutex<QualificationOrderedHasher>,
+    physical_missing_ids: parking_lot::Mutex<QualificationOrderedHasher>,
+    demand_source_request_ids: parking_lot::Mutex<QualificationOrderedHasher>,
+    demand_ram_insert_ids: parking_lot::Mutex<QualificationOrderedHasher>,
+    demand_ram_eviction_ids: parking_lot::Mutex<QualificationOrderedHasher>,
+}
+
+impl GpuNativeDemandSourceQualification {
+    fn new(
+        arm: GpuNativeDemandSourceQualificationArm,
+        primary_pool_capacity: usize,
+        shadow_pool_capacity: usize,
+    ) -> Self {
+        Self {
+            arm,
+            primary_pool_capacity,
+            shadow_pool_capacity,
+            active_demand_set: AtomicBool::new(false),
+            overlapping_demand_sets: AtomicU64::new(0),
+            demand_sets: AtomicU64::new(0),
+            physical_missing_experts: AtomicU64::new(0),
+            physical_probe_us: AtomicU64::new(0),
+            source_sets: AtomicU64::new(0),
+            source_experts: AtomicU64::new(0),
+            demand_source_requests: AtomicU64::new(0),
+            source_ram_hits: AtomicU64::new(0),
+            source_ram_misses: AtomicU64::new(0),
+            source_nvme_reads: AtomicU64::new(0),
+            source_nvme_bytes: AtomicU64::new(0),
+            source_set_width_min: AtomicU64::new(u64::MAX),
+            source_set_width_max: AtomicU64::new(0),
+            source_set_width_sum: AtomicU64::new(0),
+            source_acquisition_wall_us: AtomicU64::new(0),
+            individual_source_service_us: AtomicU64::new(0),
+            logical_demand_admission_us: AtomicU64::new(0),
+            physical_demand_install_us: AtomicU64::new(0),
+            total_residency_service_us: AtomicU64::new(0),
+            batch_path_exercises: AtomicU64::new(0),
+            concurrent_source_reads: AtomicU64::new(0),
+            pool_capacity_failures: AtomicU64::new(0),
+            batch_read_failures: AtomicU64::new(0),
+            ordered_commit_violations: AtomicU64::new(0),
+            ram_cache_inserts: AtomicU64::new(0),
+            ram_cache_evictions: AtomicU64::new(0),
+            selected_route_ids: parking_lot::Mutex::new(QualificationOrderedHasher::default()),
+            physical_missing_ids: parking_lot::Mutex::new(QualificationOrderedHasher::default()),
+            demand_source_request_ids: parking_lot::Mutex::new(
+                QualificationOrderedHasher::default(),
+            ),
+            demand_ram_insert_ids: parking_lot::Mutex::new(
+                QualificationOrderedHasher::default(),
+            ),
+            demand_ram_eviction_ids: parking_lot::Mutex::new(
+                QualificationOrderedHasher::default(),
+            ),
+        }
+    }
+
+    fn snapshot(&self) -> GpuNativeDemandSourceQualificationSnapshot {
+        let source_sets = self.source_sets.load(Ordering::Relaxed);
+        let width_min = self.source_set_width_min.load(Ordering::Relaxed);
+        let ordered_commit_violations = self.ordered_commit_violations.load(Ordering::Relaxed);
+        GpuNativeDemandSourceQualificationSnapshot {
+            arm: self.arm,
+            qualification_only: true,
+            production_demand_source_changed: false,
+            single_request_stream: self.overlapping_demand_sets.load(Ordering::Relaxed) == 0,
+            overlapping_demand_sets: self.overlapping_demand_sets.load(Ordering::Relaxed),
+            primary_pool_capacity: self.primary_pool_capacity,
+            shadow_pool_capacity: self.shadow_pool_capacity,
+            demand_sets: self.demand_sets.load(Ordering::Relaxed),
+            physical_missing_experts: self.physical_missing_experts.load(Ordering::Relaxed),
+            physical_probe_us: self.physical_probe_us.load(Ordering::Relaxed),
+            source_sets,
+            source_experts: self.source_experts.load(Ordering::Relaxed),
+            demand_source_requests: self.demand_source_requests.load(Ordering::Relaxed),
+            source_ram_hits: self.source_ram_hits.load(Ordering::Relaxed),
+            source_ram_misses: self.source_ram_misses.load(Ordering::Relaxed),
+            source_nvme_reads: self.source_nvme_reads.load(Ordering::Relaxed),
+            source_nvme_bytes: self.source_nvme_bytes.load(Ordering::Relaxed),
+            source_set_width_min: if source_sets == 0 || width_min == u64::MAX {
+                0
+            } else {
+                width_min
+            },
+            source_set_width_max: self.source_set_width_max.load(Ordering::Relaxed),
+            source_set_width_mean: if source_sets == 0 {
+                0.0
+            } else {
+                self.source_set_width_sum.load(Ordering::Relaxed) as f64 / source_sets as f64
+            },
+            source_acquisition_wall_us: self
+                .source_acquisition_wall_us
+                .load(Ordering::Relaxed),
+            sum_individual_source_service_us: (self.arm
+                == GpuNativeDemandSourceQualificationArm::Control)
+                .then(|| self.individual_source_service_us.load(Ordering::Relaxed)),
+            logical_demand_admission_us: self
+                .logical_demand_admission_us
+                .load(Ordering::Relaxed),
+            physical_demand_install_us: self.physical_demand_install_us.load(Ordering::Relaxed),
+            total_residency_service_us: self.total_residency_service_us.load(Ordering::Relaxed),
+            batch_path_exercises: self.batch_path_exercises.load(Ordering::Relaxed),
+            concurrent_source_reads: self.concurrent_source_reads.load(Ordering::Relaxed),
+            pool_capacity_failures: self.pool_capacity_failures.load(Ordering::Relaxed),
+            batch_read_failures: self.batch_read_failures.load(Ordering::Relaxed),
+            ordered_commit_violations,
+            ram_cache_source_hits: self.source_ram_hits.load(Ordering::Relaxed),
+            ram_cache_source_misses: self.source_ram_misses.load(Ordering::Relaxed),
+            ram_cache_inserts: self.ram_cache_inserts.load(Ordering::Relaxed),
+            ram_cache_evictions: self.ram_cache_evictions.load(Ordering::Relaxed),
+            selected_route_ids_sha256: self.selected_route_ids.lock().hex(),
+            physical_missing_ids_sha256: self.physical_missing_ids.lock().hex(),
+            demand_source_request_ids_sha256: self.demand_source_request_ids.lock().hex(),
+            demand_ram_insert_ids_sha256: self.demand_ram_insert_ids.lock().hex(),
+            demand_ram_eviction_ids_sha256: self.demand_ram_eviction_ids.lock().hex(),
+            deterministic_cache_commit_reconciliation: ordered_commit_violations == 0,
+        }
+    }
+
+    fn record_source_set(&self, ids: &[u32]) {
+        let width = ids.len() as u64;
+        self.source_sets.fetch_add(1, Ordering::Relaxed);
+        self.source_experts.fetch_add(width, Ordering::Relaxed);
+        self.source_set_width_min.fetch_min(width, Ordering::Relaxed);
+        self.source_set_width_max.fetch_max(width, Ordering::Relaxed);
+        self.source_set_width_sum.fetch_add(width, Ordering::Relaxed);
+    }
+
+    fn record_source_request(&self, id: u32) {
+        self.demand_source_requests.fetch_add(1, Ordering::Relaxed);
+        self.demand_source_request_ids.lock().record_id(id);
+    }
+
+    fn record_cache_insert(&self, id: u32) {
+        self.ram_cache_inserts.fetch_add(1, Ordering::Relaxed);
+        self.demand_ram_insert_ids.lock().record_id(id);
+    }
+
+    fn record_cache_eviction(&self, id: u32) {
+        self.ram_cache_evictions.fetch_add(1, Ordering::Relaxed);
+        self.demand_ram_eviction_ids.lock().record_id(id);
+    }
+}
+
+fn qualification_elapsed_us(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+struct QualificationDemandServiceGuard {
+    state: Arc<GpuNativeDemandSourceQualification>,
+    started: Instant,
+}
+
+impl QualificationDemandServiceGuard {
+    fn enter(
+        state: Arc<GpuNativeDemandSourceQualification>,
+    ) -> Result<Self, GpuNativeDemandResidencyError> {
+        if state
+            .active_demand_set
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            state
+                .overlapping_demand_sets
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(GpuNativeDemandResidencyError::QualificationIsolationViolation);
+        }
+        state.demand_sets.fetch_add(1, Ordering::Relaxed);
+        Ok(Self {
+            state,
+            started: Instant::now(),
+        })
+    }
+}
+
+impl Drop for QualificationDemandServiceGuard {
+    fn drop(&mut self) {
+        self.state
+            .total_residency_service_us
+            .fetch_add(qualification_elapsed_us(self.started), Ordering::Relaxed);
+        self.state
+            .active_demand_set
+            .store(false, Ordering::Release);
+    }
+}
+
+struct QualificationDemandPins {
+    cache: Arc<MultiLayerExpertCache>,
+    temporary_ids: Vec<u32>,
+}
+
+impl QualificationDemandPins {
+    fn install(cache: Arc<MultiLayerExpertCache>, ids: &[u32]) -> Self {
+        let mut temporary_ids = Vec::new();
+        for &id in ids {
+            if !cache.is_pinned(id) {
+                cache.pin(id);
+                temporary_ids.push(id);
+            }
+        }
+        Self {
+            cache,
+            temporary_ids,
+        }
+    }
+}
+
+impl Drop for QualificationDemandPins {
+    fn drop(&mut self) {
+        for &id in &self.temporary_ids {
+            self.cache.unpin(id);
+        }
     }
 }
 
@@ -1795,6 +2254,8 @@ pub struct Engine {
     diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64,
     diagnostic_route_capture_armed: std::sync::atomic::AtomicBool,
     diagnostic_route_capture: parking_lot::Mutex<Option<DiagnosticRouteCaptureArm>>,
+    gpu_native_demand_source_qualification:
+        parking_lot::RwLock<Option<Arc<GpuNativeDemandSourceQualification>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2153,6 +2614,7 @@ impl Engine {
             diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64::new(0),
             diagnostic_route_capture_armed: std::sync::atomic::AtomicBool::new(false),
             diagnostic_route_capture: parking_lot::Mutex::new(None),
+            gpu_native_demand_source_qualification: parking_lot::RwLock::new(None),
         }
     }
 
@@ -2972,6 +3434,73 @@ impl Engine {
             .map(|manager| manager.snapshot())
     }
 
+    /// Install PR2-A instrumentation and its explicit source arm on this one
+    /// engine. The dedicated command calls this only after constructing a
+    /// fresh isolated runtime; normal construction leaves the slot `None`.
+    pub(crate) fn enable_gpu_native_demand_source_qualification(
+        &self,
+        arm: GpuNativeDemandSourceQualificationArm,
+    ) -> Result<(), String> {
+        if !self.core.in_flight.is_empty() {
+            return Err(
+                "cannot enable exact-demand source qualification with active singleflight entries"
+                    .into(),
+            );
+        }
+        let mut slot = self.gpu_native_demand_source_qualification.write();
+        if slot.is_some() {
+            return Err("exact-demand source qualification is already enabled".into());
+        }
+        *slot = Some(Arc::new(GpuNativeDemandSourceQualification::new(
+            arm,
+            self.core.pool.capacity(),
+            self.core.pool.shadow_capacity(),
+        )));
+        Ok(())
+    }
+
+    /// Reset qualification-only counters between warmup and measurement.
+    /// Cache, pool, residency, router, and all production state are retained.
+    pub(crate) fn reset_gpu_native_demand_source_qualification(&self) -> Result<(), String> {
+        if !self.core.in_flight.is_empty() {
+            return Err(
+                "cannot reset exact-demand source qualification with active singleflight entries"
+                    .into(),
+            );
+        }
+        let mut slot = self.gpu_native_demand_source_qualification.write();
+        let current = slot
+            .as_ref()
+            .ok_or("exact-demand source qualification is not enabled")?;
+        if current.active_demand_set.load(Ordering::Acquire) {
+            return Err("cannot reset exact-demand source qualification during demand service".into());
+        }
+        *slot = Some(Arc::new(GpuNativeDemandSourceQualification::new(
+            current.arm,
+            current.primary_pool_capacity,
+            current.shadow_pool_capacity,
+        )));
+        Ok(())
+    }
+
+    pub(crate) fn gpu_native_demand_source_qualification_snapshot(
+        &self,
+    ) -> Option<GpuNativeDemandSourceQualificationSnapshot> {
+        self.gpu_native_demand_source_qualification
+            .read()
+            .as_ref()
+            .map(|state| state.snapshot())
+    }
+
+    fn gpu_native_demand_source_qualification(
+        &self,
+    ) -> Option<Arc<GpuNativeDemandSourceQualification>> {
+        self.gpu_native_demand_source_qualification
+            .read()
+            .as_ref()
+            .cloned()
+    }
+
     /// Record actual GPU-native route selections across layers into the engine's
     /// route observation and prefetch infrastructure without requiring CPU hidden state.
     pub(crate) fn record_gpu_native_actual_routes(
@@ -2980,6 +3509,22 @@ impl Engine {
     ) {
         self.core.governor.refresh();
         let per_layer_opt = self.core.storage.config().num_experts_per_layer;
+
+        if let Some(qualification) = self.gpu_native_demand_source_qualification() {
+            let per_layer = per_layer_opt.unwrap_or(0);
+            let mut hasher = qualification.selected_route_ids.lock();
+            for (layer_idx, local_ids) in selected_ids_by_layer.iter().enumerate() {
+                let global_ids = if per_layer > 0 {
+                    local_ids
+                        .iter()
+                        .map(|&local_id| layer_idx as u32 * per_layer + local_id)
+                        .collect::<Vec<_>>()
+                } else {
+                    local_ids.clone()
+                };
+                hasher.record_set(&global_ids);
+            }
+        }
 
         for (layer_idx, local_ids) in selected_ids_by_layer.iter().enumerate() {
             if local_ids.is_empty() {
@@ -4056,15 +4601,321 @@ impl Engine {
         global_id: u32,
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
     ) -> Result<Arc<ExpertResident>, GpuNativeDemandResidencyError> {
+        let qualification = self.gpu_native_demand_source_qualification();
+        if let Some(state) = qualification.as_ref() {
+            state.record_source_request(global_id);
+        }
         if let Some(resident) = residents.get(&global_id) {
             return Ok(resident.clone());
         }
         let resident = match self.core.cache.get(global_id) {
-            Some(resident) => resident,
-            None => self.fetch_with_retry(global_id).await?,
+            Some(resident) => {
+                if let Some(state) = qualification.as_ref() {
+                    state.source_ram_hits.fetch_add(1, Ordering::Relaxed);
+                }
+                resident
+            }
+            None => {
+                if let Some(state) = qualification.as_ref() {
+                    state.source_ram_misses.fetch_add(1, Ordering::Relaxed);
+                }
+                self.fetch_with_retry(global_id).await?
+            }
         };
         residents.insert(global_id, resident.clone());
         Ok(resident)
+    }
+
+    async fn gpu_native_source_physical_missing_set(
+        self: &Arc<Self>,
+        global_ids: &[u32],
+        residents: &mut HashMap<u32, Arc<ExpertResident>>,
+    ) -> Result<(), GpuNativeDemandResidencyError> {
+        let qualification = self.gpu_native_demand_source_qualification();
+        if let Some(state) = qualification.as_ref() {
+            state.record_source_set(global_ids);
+        }
+        let started = Instant::now();
+        let result = match qualification.as_ref().map(|state| state.arm) {
+            Some(GpuNativeDemandSourceQualificationArm::Treatment) => {
+                self.gpu_native_qualification_batch_source(global_ids, residents)
+                    .await
+            }
+            Some(GpuNativeDemandSourceQualificationArm::Control) | None => {
+                let mut result = Ok(());
+                for &global_id in global_ids {
+                    if residents.contains_key(&global_id) {
+                        continue;
+                    }
+                    let individual_started = Instant::now();
+                    let source_result = self
+                        .gpu_native_demand_source(global_id, residents)
+                        .await
+                        .map(|_| ());
+                    if let Some(state) = qualification.as_ref() {
+                        state.individual_source_service_us.fetch_add(
+                            qualification_elapsed_us(individual_started),
+                            Ordering::Relaxed,
+                        );
+                    }
+                    if let Err(error) = source_result {
+                        result = Err(error);
+                        break;
+                    }
+                }
+                result
+            }
+        };
+        if let Some(state) = qualification.as_ref() {
+            state
+                .source_acquisition_wall_us
+                .fetch_add(qualification_elapsed_us(started), Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// PR2-A treatment seam. It probes RAM in original demand order, reserves
+    /// only primary-pool buffers by simulating the existing sequential cache
+    /// victim schedule, dispatches true RAM misses through the existing NVMe
+    /// batch primitive, and commits successful residents in request order.
+    async fn gpu_native_qualification_batch_source(
+        self: &Arc<Self>,
+        global_ids: &[u32],
+        residents: &mut HashMap<u32, Arc<ExpertResident>>,
+    ) -> Result<(), GpuNativeDemandResidencyError> {
+        let qualification = self
+            .gpu_native_demand_source_qualification()
+            .filter(|state| state.arm == GpuNativeDemandSourceQualificationArm::Treatment)
+            .ok_or(GpuNativeDemandResidencyError::QualificationTreatmentNotEnabled)?;
+        qualification
+            .batch_path_exercises
+            .fetch_add(1, Ordering::Relaxed);
+
+        let mut nvme_ids = Vec::new();
+        for &global_id in global_ids {
+            if residents.contains_key(&global_id) {
+                continue;
+            }
+            qualification.record_source_request(global_id);
+            match self.core.cache.get(global_id) {
+                Some(resident) => {
+                    qualification
+                        .source_ram_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    residents.insert(global_id, resident);
+                }
+                None => {
+                    qualification
+                        .source_ram_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                    nvme_ids.push(global_id);
+                }
+            }
+        }
+        if nvme_ids.is_empty() {
+            return Ok(());
+        }
+
+        let _demand_pins =
+            QualificationDemandPins::install(self.core.cache.clone(), global_ids);
+        let mut requested_per_layer = HashMap::<usize, usize>::new();
+        for &global_id in global_ids {
+            *requested_per_layer
+                .entry(self.core.cache.layer_of(global_id))
+                .or_default() += 1;
+        }
+        for (layer, requested) in requested_per_layer {
+            let layer_capacity = self.core.cache.capacity_of_layer(layer);
+            if requested > layer_capacity {
+                qualification
+                    .pool_capacity_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(GpuNativeDemandResidencyError::QualificationBatchCapacity {
+                    requested,
+                    layer_capacity,
+                });
+            }
+        }
+
+        let mut virtual_lengths = self.core.cache.qualification_layer_lengths();
+        let mut virtual_total = virtual_lengths.iter().sum::<usize>();
+        let total_capacity = self.core.cache.capacity();
+        let mut buffers = Vec::with_capacity(nvme_ids.len());
+        for &global_id in &nvme_ids {
+            if virtual_total >= total_capacity {
+                let victim = self
+                    .core
+                    .cache
+                    .qualification_evict_lru_with_virtual_lengths(&virtual_lengths)
+                    .ok_or_else(|| {
+                        qualification
+                            .pool_capacity_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        GpuNativeDemandResidencyError::QualificationBatchVictimUnavailable {
+                            global_id,
+                        }
+                    })?;
+                let victim_layer = self.core.cache.layer_of(victim.id);
+                virtual_lengths[victim_layer] = virtual_lengths[victim_layer].saturating_sub(1);
+                virtual_total = virtual_total.saturating_sub(1);
+                qualification.record_cache_eviction(victim.id);
+                drop(victim);
+            }
+
+            let target_layer = self.core.cache.layer_of(global_id);
+            let target_capacity = self.core.cache.capacity_of_layer(target_layer);
+            if virtual_lengths[target_layer] >= target_capacity {
+                let victim = self
+                    .core
+                    .cache
+                    .qualification_evict_lru_from_layer(target_layer)
+                    .ok_or_else(|| {
+                        qualification
+                            .pool_capacity_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        GpuNativeDemandResidencyError::QualificationBatchVictimUnavailable {
+                            global_id,
+                        }
+                    })?;
+                let victim_layer = self.core.cache.layer_of(victim.id);
+                virtual_lengths[victim_layer] = virtual_lengths[victim_layer].saturating_sub(1);
+                virtual_total = virtual_total.saturating_sub(1);
+                qualification.record_cache_eviction(victim.id);
+                drop(victim);
+            }
+
+            virtual_lengths[target_layer] = virtual_lengths[target_layer].saturating_add(1);
+            virtual_total = virtual_total.saturating_add(1);
+            let Some(buffer) = self.core.pool.try_acquire() else {
+                qualification
+                    .pool_capacity_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(
+                    GpuNativeDemandResidencyError::QualificationPrimaryPoolUnavailable {
+                        requested: nvme_ids.len(),
+                        acquired: buffers.len(),
+                    },
+                );
+            };
+            buffers.push(buffer);
+        }
+
+        if nvme_ids.len() > 1 {
+            qualification
+                .concurrent_source_reads
+                .fetch_add(nvme_ids.len() as u64, Ordering::Relaxed);
+        }
+        const MAX_ATTEMPTS: usize = 3;
+        let batch_started = Instant::now();
+        let mut last_error = None;
+        let mut read_bytes = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut refs = buffers.iter_mut().collect::<Vec<_>>();
+            let _foreground = self.core.governor.foreground_guard();
+            match self
+                .core
+                .storage
+                .read_experts_batch(&nvme_ids, &mut refs)
+                .await
+            {
+                Ok(bytes) => {
+                    read_bytes = Some(bytes);
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        let backoff_ms = (10u64 << (attempt * 2)).min(500);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+        }
+        let batch_wall_us = qualification_elapsed_us(batch_started);
+        let Some(read_bytes) = read_bytes else {
+            qualification
+                .batch_read_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(GpuNativeDemandResidencyError::QualificationBatchRead {
+                global_ids: nvme_ids,
+                attempts: MAX_ATTEMPTS,
+                source: last_error.unwrap_or_else(|| "unknown".into()),
+            });
+        };
+        let expected_bytes = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+        if read_bytes != expected_bytes {
+            qualification
+                .batch_read_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(GpuNativeDemandResidencyError::QualificationBatchRead {
+                global_ids: nvme_ids,
+                attempts: 1,
+                source: format!(
+                    "batch returned {read_bytes} bytes, expected {expected_bytes}"
+                ),
+            });
+        }
+        qualification
+            .source_nvme_reads
+            .fetch_add(buffers.len() as u64, Ordering::Relaxed);
+        qualification
+            .source_nvme_bytes
+            .fetch_add(read_bytes as u64, Ordering::Relaxed);
+        self.metrics
+            .counters
+            .bytes_read
+            .fetch_add(read_bytes as u64, Ordering::Relaxed);
+        let _ = self.metrics.io_hist.lock().record(batch_wall_us.max(1));
+
+        let block_align = self.core.storage.config().block_align;
+        let completed = nvme_ids
+            .iter()
+            .copied()
+            .zip(buffers)
+            .map(|(global_id, buffer)| {
+                (
+                    global_id,
+                    Arc::new(ExpertResident::new_with_block_align(
+                        global_id,
+                        buffer,
+                        block_align,
+                    )),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let staged = qualification_order_completed_residents(&nvme_ids, completed)?;
+        for (global_id, resident) in staged {
+            match self.core.cache.insert(resident.clone()) {
+                Ok(None) => {
+                    qualification.record_cache_insert(global_id);
+                    residents.insert(global_id, resident);
+                }
+                Ok(Some(evicted)) => {
+                    qualification
+                        .ordered_commit_violations
+                        .fetch_add(1, Ordering::Relaxed);
+                    qualification.record_cache_insert(global_id);
+                    qualification.record_cache_eviction(evicted.id);
+                    return Err(
+                        GpuNativeDemandResidencyError::QualificationUnexpectedCommitEviction {
+                            inserted_global_id: global_id,
+                            evicted_global_id: evicted.id,
+                        },
+                    );
+                }
+                Err(_rejected) => {
+                    qualification
+                        .ordered_commit_violations
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(
+                        GpuNativeDemandResidencyError::QualificationCacheCommitRejected {
+                            global_id,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn ensure_gpu_native_logical_demand_set(
@@ -4136,6 +4987,12 @@ impl Engine {
             .as_ref()
             .cloned()
             .ok_or(GpuNativeDemandResidencyError::ManagerNotInstalled)?;
+        let qualification = self.gpu_native_demand_source_qualification();
+        let _qualification_guard = qualification
+            .as_ref()
+            .cloned()
+            .map(QualificationDemandServiceGuard::enter)
+            .transpose()?;
         let num_layers = manager.plan().num_layers();
         let experts_per_layer = manager.plan().geometry().num_experts() as u32;
         let mut seen = HashSet::with_capacity(global_ids.len());
@@ -4163,12 +5020,27 @@ impl Engine {
             // No logical-cache lock is held while probing the physical layer.
             // A probe result may race with a later physical eviction; the
             // fixed one-retry recovery below re-probes the complete set.
+            let physical_probe_started = Instant::now();
             let mut physical_current = Vec::with_capacity(global_ids.len());
             for &global_id in global_ids {
                 let current = manager.has_current_for_demand(global_id)?;
                 physical_current.push(current);
             }
+            if let Some(state) = qualification.as_ref() {
+                state
+                    .physical_probe_us
+                    .fetch_add(qualification_elapsed_us(physical_probe_started), Ordering::Relaxed);
+            }
             let physical_missing = gpu_native_physical_missing_ids(global_ids, &physical_current);
+            if let Some(state) = qualification.as_ref() {
+                state
+                    .physical_missing_experts
+                    .fetch_add(physical_missing.len() as u64, Ordering::Relaxed);
+                state
+                    .physical_missing_ids
+                    .lock()
+                    .record_set(&physical_missing);
+            }
 
             // Physical hits never reach this logical/source block. Protection
             // is metadata-only and releases the logical mutex before every
@@ -4182,13 +5054,20 @@ impl Engine {
                 for &global_id in &physical_missing {
                     if !residents.contains_key(&global_id) {
                         manager.record_physical_source_acquisition();
-                        self.gpu_native_demand_source(global_id, &mut residents)
-                            .await?;
                     }
                 }
+                self.gpu_native_source_physical_missing_set(&physical_missing, &mut residents)
+                    .await?;
+                let logical_admission_started = Instant::now();
                 let (admissions, newly_admitted) = self
                     .ensure_gpu_native_logical_demand_set(&physical_missing, &mut residents)
                     .await?;
+                if let Some(state) = qualification.as_ref() {
+                    state.logical_demand_admission_us.fetch_add(
+                        qualification_elapsed_us(logical_admission_started),
+                        Ordering::Relaxed,
+                    );
+                }
                 manager.record_logical_admissions_for_physical_misses(newly_admitted);
                 admissions_by_id
                     .extend(physical_missing.iter().copied().zip(admissions.into_iter()));
@@ -4218,11 +5097,19 @@ impl Engine {
                 })
                 .collect::<Vec<_>>();
 
-            match manager.ensure_demand_set(
+            let physical_install_started = Instant::now();
+            let physical_install_result = manager.ensure_demand_set(
                 GpuNativeResidencyPriority::Demand,
                 layer_index,
                 &demands,
-            ) {
+            );
+            if let Some(state) = qualification.as_ref() {
+                state.physical_demand_install_us.fetch_add(
+                    qualification_elapsed_us(physical_install_started),
+                    Ordering::Relaxed,
+                );
+            }
+            match physical_install_result {
                 Ok(residencies) => return Ok(residencies),
                 Err(GpuNativeTieredResidencyError::DemandSourceMissing { global_id: _ })
                     if gpu_native_physical_demand_recovery_allowed(recovery_attempts) =>
@@ -4270,6 +5157,9 @@ impl Engine {
         if self.core.cache.len() >= self.core.cache.capacity() {
             if let Some(evicted) = self.core.cache.evict_lru() {
                 debug!(evicted = evicted.id, "evicted LRU to make room");
+                if let Some(qualification) = self.gpu_native_demand_source_qualification() {
+                    qualification.record_cache_eviction(evicted.id);
+                }
                 drop(evicted);
             }
         }
@@ -4284,6 +5174,14 @@ impl Engine {
             Ok(_) => {
                 let io_us = io_start.elapsed().as_micros() as u64;
                 let _ = self.metrics.io_hist.lock().record(io_us.max(1));
+                if let Some(qualification) = self.gpu_native_demand_source_qualification() {
+                    qualification
+                        .source_nvme_reads
+                        .fetch_add(1, Ordering::Relaxed);
+                    qualification
+                        .source_nvme_bytes
+                        .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                }
                 // Track every byte the engine actually pulls off the
                 // SSD — including `fetch_with_retry`'s leader path,
                 // not just the `moe_step` critical path. This is
@@ -4303,8 +5201,23 @@ impl Engine {
                     self.core.storage.config().block_align,
                 ));
                 match self.core.cache.insert(resident.clone()) {
-                    Ok(Some(_evicted)) => debug!(expert = id, "inserted (with eviction)"),
-                    Ok(None) => debug!(expert = id, "inserted"),
+                    Ok(Some(evicted)) => {
+                        if let Some(qualification) =
+                            self.gpu_native_demand_source_qualification()
+                        {
+                            qualification.record_cache_insert(id);
+                            qualification.record_cache_eviction(evicted.id);
+                        }
+                        debug!(expert = id, "inserted (with eviction)")
+                    }
+                    Ok(None) => {
+                        if let Some(qualification) =
+                            self.gpu_native_demand_source_qualification()
+                        {
+                            qualification.record_cache_insert(id);
+                        }
+                        debug!(expert = id, "inserted")
+                    }
                     Err(rejected) => {
                         // Cache is full of pinned entries — surface this
                         // explicitly. The caller still gets a usable
@@ -7062,6 +7975,368 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&ram_hit, &same_request));
         assert_eq!(engine.report().bytes_read, after_nvme);
+    }
+
+    fn enable_source_arm(
+        engine: &Arc<Engine>,
+        arm: GpuNativeDemandSourceQualificationArm,
+    ) {
+        engine
+            .enable_gpu_native_demand_source_qualification(arm)
+            .expect("enable qualification source arm");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qualification_batch_all_ram_hits_issue_zero_nvme_reads() {
+        let dir = TempDir::new("qualification-all-ram");
+        let engine = build_engine(&dir.path, 4, 8, 8, 4, 2, 1, 17);
+        let mut priming = HashMap::new();
+        let first = engine
+            .gpu_native_demand_source(0, &mut priming)
+            .await
+            .unwrap();
+        let second = engine
+            .gpu_native_demand_source(1, &mut priming)
+            .await
+            .unwrap();
+        let before_bytes = engine.report().bytes_read;
+        enable_source_arm(
+            &engine,
+            GpuNativeDemandSourceQualificationArm::Treatment,
+        );
+
+        let mut residents = HashMap::new();
+        engine
+            .gpu_native_source_physical_missing_set(&[0, 1], &mut residents)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &residents[&0]));
+        assert!(Arc::ptr_eq(&second, &residents[&1]));
+        let snapshot = engine
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        assert_eq!(snapshot.source_ram_hits, 2);
+        assert_eq!(snapshot.source_ram_misses, 0);
+        assert_eq!(snapshot.source_nvme_reads, 0);
+        assert_eq!(snapshot.source_nvme_bytes, 0);
+        assert_eq!(snapshot.batch_path_exercises, 1);
+        assert_eq!(engine.report().bytes_read, before_bytes);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qualification_batch_one_miss_matches_sequential_source() {
+        let control_dir = TempDir::new("qualification-one-control");
+        let treatment_dir = TempDir::new("qualification-one-treatment");
+        let control = build_engine(&control_dir.path, 4, 8, 8, 4, 1, 1, 17);
+        let treatment = build_engine(&treatment_dir.path, 4, 8, 8, 4, 1, 1, 17);
+        enable_source_arm(&control, GpuNativeDemandSourceQualificationArm::Control);
+        enable_source_arm(
+            &treatment,
+            GpuNativeDemandSourceQualificationArm::Treatment,
+        );
+
+        let mut control_residents = HashMap::new();
+        control
+            .gpu_native_source_physical_missing_set(&[2], &mut control_residents)
+            .await
+            .unwrap();
+        let mut treatment_residents = HashMap::new();
+        treatment
+            .gpu_native_source_physical_missing_set(&[2], &mut treatment_residents)
+            .await
+            .unwrap();
+        assert_eq!(control_residents[&2].data(), treatment_residents[&2].data());
+        let snapshot = treatment
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        assert_eq!(snapshot.source_nvme_reads, 1);
+        assert_eq!(snapshot.concurrent_source_reads, 0);
+        assert_eq!(snapshot.ram_cache_inserts, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn qualification_batch_multiple_misses_preserve_requested_mapping_and_commit_order() {
+        let dir = TempDir::new("qualification-multi-miss");
+        let engine = build_engine(&dir.path, 6, 8, 8, 4, 3, 1, 17);
+        enable_source_arm(
+            &engine,
+            GpuNativeDemandSourceQualificationArm::Treatment,
+        );
+        let requested = [3, 1, 2];
+        let mut residents = HashMap::new();
+        engine
+            .gpu_native_source_physical_missing_set(&requested, &mut residents)
+            .await
+            .unwrap();
+        assert_eq!(residents.len(), requested.len());
+        for &id in &requested {
+            assert_eq!(residents[&id].id, id);
+            assert_eq!(residents[&id].data()[0], engine.core.cache.get(id).unwrap().data()[0]);
+        }
+        let snapshot = engine
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        let mut expected = QualificationOrderedHasher::default();
+        for &id in &requested {
+            expected.record_id(id);
+        }
+        assert_eq!(snapshot.demand_ram_insert_ids_sha256, expected.hex());
+        assert_eq!(snapshot.source_nvme_reads, 3);
+        assert_eq!(snapshot.concurrent_source_reads, 3);
+        assert!(snapshot.deterministic_cache_commit_reconciliation);
+    }
+
+    #[test]
+    fn qualification_commit_order_ignores_later_request_completing_first() {
+        let pool = BufferPool::new(3, 4096, 4096);
+        let request_order = [3, 1, 2];
+        let mut completed = HashMap::new();
+        for &id in request_order.iter().rev() {
+            completed.insert(id, Arc::new(ExpertResident::new(id, pool.try_acquire().unwrap())));
+        }
+
+        let ordered = qualification_order_completed_residents(&request_order, completed).unwrap();
+        assert_eq!(
+            ordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            request_order
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn qualification_batch_mixed_hit_and_misses_reads_only_true_misses() {
+        let dir = TempDir::new("qualification-mixed");
+        let engine = build_engine(&dir.path, 6, 8, 8, 4, 3, 1, 17);
+        let mut priming = HashMap::new();
+        let hit = engine
+            .gpu_native_demand_source(1, &mut priming)
+            .await
+            .unwrap();
+        enable_source_arm(
+            &engine,
+            GpuNativeDemandSourceQualificationArm::Treatment,
+        );
+        let mut residents = HashMap::new();
+        engine
+            .gpu_native_source_physical_missing_set(&[1, 2, 3], &mut residents)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&hit, &residents[&1]));
+        let snapshot = engine
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        assert_eq!(snapshot.source_ram_hits, 1);
+        assert_eq!(snapshot.source_ram_misses, 2);
+        assert_eq!(snapshot.source_nvme_reads, 2);
+        assert_eq!(snapshot.concurrent_source_reads, 2);
+        assert_eq!(snapshot.ram_cache_inserts, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qualification_batch_never_evicts_a_pinned_cache_victim() {
+        let dir = TempDir::new("qualification-pinned-victim");
+        let engine = build_engine(&dir.path, 4, 8, 8, 2, 1, 1, 17);
+        let mut priming = HashMap::new();
+        engine
+            .gpu_native_demand_source(0, &mut priming)
+            .await
+            .unwrap();
+        engine
+            .gpu_native_demand_source(1, &mut priming)
+            .await
+            .unwrap();
+        drop(priming);
+        engine.core.cache.pin(0);
+        enable_source_arm(
+            &engine,
+            GpuNativeDemandSourceQualificationArm::Treatment,
+        );
+        let mut residents = HashMap::new();
+        engine
+            .gpu_native_source_physical_missing_set(&[2], &mut residents)
+            .await
+            .unwrap();
+        assert!(engine.core.cache.contains(0));
+        assert!(!engine.core.cache.contains(1));
+        assert!(engine.core.cache.contains(2));
+        assert!(engine.core.cache.is_pinned(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qualification_batch_insufficient_safe_primary_capacity_fails_closed() {
+        let dir = TempDir::new("qualification-insufficient-primary");
+        let engine = build_engine(&dir.path, 5, 8, 8, 2, 2, 1, 17);
+        let mut priming = HashMap::new();
+        engine
+            .gpu_native_demand_source(0, &mut priming)
+            .await
+            .unwrap();
+        engine
+            .gpu_native_demand_source(1, &mut priming)
+            .await
+            .unwrap();
+        drop(priming);
+        engine.core.cache.pin(0);
+        enable_source_arm(
+            &engine,
+            GpuNativeDemandSourceQualificationArm::Treatment,
+        );
+        let mut residents = HashMap::new();
+        let error = engine
+            .gpu_native_source_physical_missing_set(&[2, 3], &mut residents)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GpuNativeDemandResidencyError::QualificationBatchVictimUnavailable { .. }
+                | GpuNativeDemandResidencyError::QualificationPrimaryPoolUnavailable { .. }
+        ));
+        let snapshot = engine
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        assert_eq!(snapshot.source_nvme_reads, 0);
+        assert_eq!(snapshot.ram_cache_inserts, 0);
+        assert!(snapshot.pool_capacity_failures > 0);
+        assert_eq!(engine.core.pool.capacity(), 3);
+        assert_eq!(engine.core.pool.shadow_capacity(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qualification_batch_read_error_inserts_no_malformed_resident_and_clears_pins() {
+        let dir = TempDir::new("qualification-read-error");
+        let engine = build_engine(&dir.path, 4, 8, 8, 4, 1, 1, 17);
+        let path = dir.path.join("expert_3.bin");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        enable_source_arm(
+            &engine,
+            GpuNativeDemandSourceQualificationArm::Treatment,
+        );
+        let mut residents = HashMap::new();
+        let error = engine
+            .gpu_native_source_physical_missing_set(&[3], &mut residents)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GpuNativeDemandResidencyError::QualificationBatchRead { .. }
+        ));
+        assert!(residents.is_empty());
+        assert!(!engine.core.cache.contains(3));
+        assert_eq!(engine.core.cache.pinned_count(), 0);
+        let snapshot = engine
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        assert_eq!(snapshot.ram_cache_inserts, 0);
+        assert_eq!(snapshot.batch_read_failures, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qualification_treatment_does_not_call_speculative_source_or_h2d() {
+        let dir = TempDir::new("qualification-no-speculation");
+        let engine = build_engine(&dir.path, 4, 8, 8, 4, 2, 0, 17);
+        enable_source_arm(
+            &engine,
+            GpuNativeDemandSourceQualificationArm::Treatment,
+        );
+        let mut residents = HashMap::new();
+        engine
+            .gpu_native_source_physical_missing_set(&[0, 1], &mut residents)
+            .await
+            .unwrap();
+        assert_eq!(engine.report().prefetch_completed, 0);
+        assert_eq!(engine.report().prefetch_dropped_concurrency, 0);
+        assert_eq!(engine.report().prefetch_dropped_pool_starved, 0);
+        assert!(engine.core.gpu_native_residency.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qualification_control_is_existing_sequential_source_and_normal_path_is_opt_in() {
+        let normal_dir = TempDir::new("qualification-normal-opt-in");
+        let control_dir = TempDir::new("qualification-control-exact");
+        let normal = build_engine(&normal_dir.path, 4, 8, 8, 4, 2, 1, 17);
+        let control = build_engine(&control_dir.path, 4, 8, 8, 4, 2, 1, 17);
+        assert!(normal
+            .gpu_native_demand_source_qualification_snapshot()
+            .is_none());
+        let mut normal_residents = HashMap::new();
+        for id in [2, 0] {
+            normal
+                .gpu_native_demand_source(id, &mut normal_residents)
+                .await
+                .unwrap();
+        }
+        enable_source_arm(&control, GpuNativeDemandSourceQualificationArm::Control);
+        let mut control_residents = HashMap::new();
+        control
+            .gpu_native_source_physical_missing_set(&[2, 0], &mut control_residents)
+            .await
+            .unwrap();
+        for id in [2, 0] {
+            assert_eq!(normal_residents[&id].data(), control_residents[&id].data());
+        }
+        let snapshot = control
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        assert_eq!(snapshot.batch_path_exercises, 0);
+        assert_eq!(snapshot.source_nvme_reads, 2);
+        assert_eq!(snapshot.ram_cache_inserts, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn qualification_control_and_treatment_reconcile_full_cache_victim_order() {
+        let control_dir = TempDir::new("qualification-victim-control");
+        let treatment_dir = TempDir::new("qualification-victim-treatment");
+        let control = build_engine(&control_dir.path, 6, 8, 8, 4, 2, 1, 17);
+        let treatment = build_engine(&treatment_dir.path, 6, 8, 8, 4, 2, 1, 17);
+
+        for engine in [&control, &treatment] {
+            let mut priming = HashMap::new();
+            for id in 0..4 {
+                engine
+                    .gpu_native_demand_source(id, &mut priming)
+                    .await
+                    .unwrap();
+            }
+        }
+        enable_source_arm(&control, GpuNativeDemandSourceQualificationArm::Control);
+        enable_source_arm(
+            &treatment,
+            GpuNativeDemandSourceQualificationArm::Treatment,
+        );
+
+        let requested = [4, 5];
+        let mut control_residents = HashMap::new();
+        control
+            .gpu_native_source_physical_missing_set(&requested, &mut control_residents)
+            .await
+            .unwrap();
+        let mut treatment_residents = HashMap::new();
+        treatment
+            .gpu_native_source_physical_missing_set(&requested, &mut treatment_residents)
+            .await
+            .unwrap();
+
+        let control_snapshot = control
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        let treatment_snapshot = treatment
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        assert_eq!(
+            control_snapshot.demand_ram_insert_ids_sha256,
+            treatment_snapshot.demand_ram_insert_ids_sha256
+        );
+        assert_eq!(
+            control_snapshot.demand_ram_eviction_ids_sha256,
+            treatment_snapshot.demand_ram_eviction_ids_sha256
+        );
+        assert_eq!(control_snapshot.ram_cache_evictions, 2);
+        assert_eq!(treatment_snapshot.ram_cache_evictions, 2);
+        assert_eq!(control.core.cache.resident_ids(), treatment.core.cache.resident_ids());
     }
 
     #[test]

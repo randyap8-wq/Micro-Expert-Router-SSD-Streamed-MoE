@@ -641,7 +641,7 @@ pub(crate) fn routed_delta(
     })
 }
 
-fn gpu_io_delta(
+pub(crate) fn gpu_io_delta(
     before: GpuExpertIoSnapshot,
     after: GpuExpertIoSnapshot,
 ) -> Result<GpuExpertIoSnapshot, BenchmarkFailure> {
@@ -697,7 +697,7 @@ impl EngineStorageSnapshot {
         }
     }
 
-    fn checked_delta(self, before: Self) -> Result<Self, BenchmarkFailure> {
+    pub(crate) fn checked_delta(self, before: Self) -> Result<Self, BenchmarkFailure> {
         Ok(Self {
             ram_hits: checked_delta!(self, before, ram_hits, "engine-storage"),
             ram_misses: checked_delta!(self, before, ram_misses, "engine-storage"),
@@ -738,7 +738,7 @@ pub(crate) struct GpuNativeResidencyDelta {
     pub(crate) speculative_dropped_capacity_or_pressure: u64,
 }
 
-fn gpu_native_residency_delta(
+pub(crate) fn gpu_native_residency_delta(
     before: &GpuNativeTieredResidencySnapshot,
     after: &GpuNativeTieredResidencySnapshot,
 ) -> Result<GpuNativeResidencyDelta, BenchmarkFailure> {
@@ -1643,11 +1643,13 @@ pub(crate) async fn execute_request(
     })
 }
 
-fn is_hex(value: &str, len: usize) -> bool {
+pub(crate) fn is_hex(value: &str, len: usize) -> bool {
     value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn validate_preflight_provenance(build: &BuildProvenance) -> Result<(), BenchmarkFailure> {
+pub(crate) fn validate_preflight_provenance(
+    build: &BuildProvenance,
+) -> Result<(), BenchmarkFailure> {
     if build.dirty != Some(false) || build.git_sha.as_deref().is_none_or(|sha| !is_hex(sha, 40)) {
         return Err(BenchmarkFailure::new(
             "preflight",
@@ -1661,7 +1663,7 @@ fn validate_preflight_provenance(build: &BuildProvenance) -> Result<(), Benchmar
     Ok(())
 }
 
-fn validate_artifacts(
+pub(crate) fn validate_artifacts(
     artifacts: &QualificationArtifacts,
     errors: &[String],
 ) -> Result<(), BenchmarkFailure> {
@@ -1682,7 +1684,9 @@ fn validate_artifacts(
     Ok(())
 }
 
-fn validate_expert_metadata(metadata: &ExpertMetadataEvidence) -> Result<(), BenchmarkFailure> {
+pub(crate) fn validate_expert_metadata(
+    metadata: &ExpertMetadataEvidence,
+) -> Result<(), BenchmarkFailure> {
     if metadata.dtype.as_deref() != Some("q4_0")
         || metadata.q4_0_layout.as_deref() != Some(crate::inference::Q4_0_LAYOUT_STANDARD_V1)
         || metadata.explicitly_synthetic
@@ -1722,7 +1726,7 @@ fn emit_report(
     Ok(())
 }
 
-async fn construct_runtime(
+pub(crate) async fn construct_runtime(
     spec: &crate::ResolvedRealCliSpec,
     tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
     phase: &str,
@@ -1749,7 +1753,7 @@ async fn construct_runtime(
     Ok(runtime)
 }
 
-fn validate_and_record_runtime(
+pub(crate) fn validate_and_record_runtime(
     runtime: &crate::BenchRealRuntime,
     resolved_config_sha256: &str,
     expected_adapter_name: &str,
@@ -1859,7 +1863,7 @@ fn validate_and_record_runtime(
     Ok(())
 }
 
-async fn shutdown_runtime(
+pub(crate) async fn shutdown_runtime(
     runtime: crate::BenchRealRuntime,
     phase: &str,
     run_index: Option<usize>,

@@ -183,6 +183,69 @@ impl MultiLayerExpertCache {
         }
     }
 
+    /// Whether an expert is already pinned in its owning per-layer cache.
+    /// Qualification-only callers use this to install temporary demand-set
+    /// pins without accidentally removing a pre-existing production pin when
+    /// the temporary guard is dropped.
+    pub(crate) fn is_pinned(&self, id: u32) -> bool {
+        self.try_layer_idx(id)
+            .is_some_and(|idx| self.caches[idx].is_pinned(id))
+    }
+
+    /// Snapshot the current resident count of every per-layer cache.
+    ///
+    /// The exact-demand source-concurrency qualifier uses this as the start
+    /// of a private, deterministic simulation of the existing sequential
+    /// `evict -> read -> insert` schedule. It never changes cache capacity or
+    /// policy.
+    pub(crate) fn qualification_layer_lengths(&self) -> Vec<usize> {
+        self.caches.iter().map(|cache| cache.len()).collect()
+    }
+
+    /// Evict from the layer the ordinary global victim selector would choose
+    /// after accounting for qualification-only virtual ordered inserts.
+    /// Ties retain the existing lowest-layer-index rule.
+    pub(crate) fn qualification_evict_lru_with_virtual_lengths(
+        &self,
+        virtual_lengths: &[usize],
+    ) -> Option<Arc<ExpertResident>> {
+        if virtual_lengths.len() != self.caches.len() {
+            return None;
+        }
+        let mut best: Option<(usize, usize)> = None;
+        for (idx, &len) in virtual_lengths.iter().enumerate() {
+            if len == 0 {
+                continue;
+            }
+            match best {
+                Some((_, best_len)) if len <= best_len => {}
+                _ => best = Some((idx, len)),
+            }
+        }
+        let (start, _) = best?;
+        let n = self.caches.len();
+        for offset in 0..n {
+            let idx = (start + offset) % n;
+            if virtual_lengths[idx] == 0 {
+                continue;
+            }
+            if let Some(resident) = self.caches[idx].evict_lru() {
+                return Some(resident);
+            }
+        }
+        None
+    }
+
+    /// Evict the ordinary non-pinned LRU victim from one exact layer.
+    /// This mirrors the victim selection performed by `ExpertCache::insert`
+    /// when that layer is already at capacity.
+    pub(crate) fn qualification_evict_lru_from_layer(
+        &self,
+        layer: usize,
+    ) -> Option<Arc<ExpertResident>> {
+        self.caches.get(layer)?.evict_lru()
+    }
+
     /// **Tier 4 — cost-aware eviction.** Enable or disable the
     /// lowest-heat eviction policy across every per-layer cache. No-op
     /// effect until at least one layer fills; off by default so the
