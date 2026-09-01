@@ -19,8 +19,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(crate) const SCHEMA: &str = "mer.gpu-native-bounded-live-prefetch.v2";
+pub(crate) const SCORE_CEILING_SCHEMA: &str = "mer.gpu-native-bounded-live-prefetch.v3";
 pub(crate) const MODE: &str = "gpu-native-bounded-live-prefetch";
+pub(crate) const SCORE_CEILING_MODE: &str = "gpu-native-bounded-live-prefetch-score-ceiling";
 pub(crate) const COMMAND: &str = "qualify-gpu-native-bounded-live-prefetch";
+pub(crate) const SCORE_CEILING_COMMAND: &str =
+    "qualify-gpu-native-bounded-live-prefetch-score-ceiling";
 pub(crate) const SOURCE_MAIN_COMMIT: &str = "e8b542110693e74aa8f1013bb16d1bed0bdd8ba7";
 pub(crate) const TESTED_PR1BB_COMMIT: &str = "c7006c5c6fbcee74c91526f89a8c2b5b06d8a9c5";
 pub(crate) const TESTED_PR1BB_REPORT_SHA256: &str =
@@ -33,6 +37,13 @@ pub(crate) const PR1CB_REPORT_SHA256: &str =
     "bca66b00ecb54e815aa5a5c5fdd3f6ae1317ae267f96b39484cb41e11c300811";
 pub(crate) const PR1CC_COMMIT: &str = "7309e53c3687f997a2143206e9e574858d4decaf";
 pub(crate) const PR1CD2_COMMIT: &str = "8cb3cbe2ffd561e37add6815a3e8c646d24c772d";
+pub(crate) const PR1CE1_COMMIT: &str = "a434cc84c0a75fda8e16af48d6dd74fa1d23a026";
+pub(crate) const PR1CE1_REPORT_SHA256: &str =
+    "76bd74c00754032da22ceb49973a5f5a13864b4065db7ccf123c15146f7bc066";
+pub(crate) const PR1CE1_LOG_SHA256: &str =
+    "3dd56a71f9dca30c5619a2cfbd754cebb3e9bd60358d1f903411de49511eebc9";
+pub(crate) const FROZEN_CANDIDATE_SCORE_CEILING: f64 = 0.002777777777777778;
+pub(crate) const SCORE_CEILING_COMPARISON: &str = "candidate.score < threshold";
 
 pub(crate) const FROZEN_PREDICTOR: &str = "predictive-loader-second-order";
 pub(crate) const FROZEN_FANOUT: usize = 8;
@@ -53,6 +64,7 @@ pub(crate) struct CommandArgs {
     pub(crate) greedy: bool,
     pub(crate) expected_adapter_name: String,
     pub(crate) replacement_policy: GpuNativeLiveReplacementPolicy,
+    pub(crate) score_ceiling_gate: bool,
     pub(crate) report_out: Option<PathBuf>,
     pub(crate) progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
 }
@@ -106,6 +118,7 @@ pub(crate) struct LiveControllerConfig {
     pub(crate) top_k: usize,
     pub(crate) markov_min_prob: f64,
     pub(crate) bounds: LiveResourceBounds,
+    pub(crate) candidate_score_ceiling: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +152,13 @@ enum CandidateState {
     PhysicalInstallationStarted,
     PhysicalInstallationCompleted,
     Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScoreGateDecision {
+    NotEvaluated,
+    Admitted,
+    Rejected,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +197,7 @@ struct CandidateRecord {
     first_demand_at_us: Option<u64>,
     state: CandidateState,
     source_bytes: u64,
+    score_gate_decision: ScoreGateDecision,
     accepted: bool,
     terminal: bool,
     installed: bool,
@@ -291,6 +312,50 @@ pub(crate) struct LiveLifecycleCounters {
     pub(crate) demand_miss_boundaries: u64,
     pub(crate) accepted_candidates: u64,
     pub(crate) completed_tasks: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScoreGateCounters {
+    eligible_nonresident_candidates: u64,
+    admitted: u64,
+    rejected: u64,
+    admitted_score_min: Option<f64>,
+    admitted_score_max: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ScoreGateRunEvidence {
+    pub(crate) eligible_nonresident_candidates: u64,
+    pub(crate) admitted: u64,
+    pub(crate) rejected: u64,
+    pub(crate) admitted_score_min: Option<f64>,
+    pub(crate) admitted_score_max: Option<f64>,
+    pub(crate) frozen_threshold: f64,
+    pub(crate) strict_comparison: &'static str,
+    pub(crate) admitted_plus_rejected_equals_eligible: bool,
+    pub(crate) rejected_candidates_zero_source_h2d_and_replacement_work: bool,
+    pub(crate) reconciliation_pass: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ScoreGateContractEvidence {
+    pub(crate) enabled: bool,
+    pub(crate) qualification_only: bool,
+    pub(crate) pr1ce1_commit: &'static str,
+    pub(crate) authoritative_report_sha256: &'static str,
+    pub(crate) authoritative_log_sha256: &'static str,
+    pub(crate) frozen_threshold: f64,
+    pub(crate) strict_comparison: &'static str,
+    pub(crate) eligible_candidate_semantics: &'static str,
+    pub(crate) already_physically_resident_semantics: &'static str,
+    pub(crate) historical_evidence_diagnostic_only: bool,
+    pub(crate) counterfactual_performance_claim: bool,
+    pub(crate) historical_complement_replacements: u64,
+    pub(crate) historical_complement_direct_physical_payoffs: u64,
+    pub(crate) historical_complement_evicted_unused_candidates: u64,
+    pub(crate) historical_complement_victim_harm_events: u64,
+    pub(crate) historical_complement_introduced_misses: u64,
+    pub(crate) historical_complement_introduced_miss_boundaries: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -518,6 +583,8 @@ pub(crate) struct LiveRunEvidence {
     pub(crate) counters: LiveLifecycleCounters,
     pub(crate) timing: LiveTimingEvidence,
     pub(crate) lifecycle_samples: Vec<LiveLifecycleSample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) score_gate: Option<ScoreGateRunEvidence>,
     pub(crate) destructive_admission_calibration: DestructiveAdmissionCalibrationEvidence,
     #[serde(skip_serializing)]
     calibration_events: Vec<DestructiveReplacementEvent>,
@@ -563,6 +630,7 @@ struct ActiveRun {
     counters: LiveLifecycleCounters,
     timing: TimingValues,
     samples: Vec<LiveLifecycleSample>,
+    score_gate: ScoreGateCounters,
     failure: Option<String>,
 }
 
@@ -599,6 +667,9 @@ impl GpuNativeBoundedLivePrefetchController {
             || config.bounds.max_installations_per_boundary == 0
             || config.bounds.max_replacements_per_boundary == 0
             || config.bounds.max_in_flight_source_acquisitions == 0
+            || config
+                .candidate_score_ceiling
+                .is_some_and(|threshold| !threshold.is_finite() || threshold <= 0.0)
         {
             return Err(ShadowObserverError::new(format!(
                 "invalid bounded live-prefetch config: {config:?}"
@@ -634,6 +705,73 @@ impl GpuNativeBoundedLivePrefetchController {
         self.config.policy
     }
 
+    pub(crate) fn score_gate_enabled(&self) -> bool {
+        self.config.candidate_score_ceiling.is_some()
+    }
+
+    /// PR1C-F's qualification-only admission decision. The engine calls this
+    /// only after the existing physical probe returned `Miss`, and before any
+    /// governor, permit, task-spawn, source, logical-admission, H2D, or victim
+    /// work. A physical hit therefore never enters this accounting surface.
+    pub(crate) fn admit_score_gated_nonresident_candidate(
+        &self,
+        ticket_id: u64,
+    ) -> Result<bool, ShadowObserverError> {
+        let Some(threshold) = self.config.candidate_score_ceiling else {
+            return Ok(true);
+        };
+        let admitted = {
+            let mut inner = self.inner.lock();
+            let run = inner.run.as_mut().ok_or_else(|| {
+                ShadowObserverError::new("score-gate decision occurred without an active run")
+            })?;
+            let record = run.candidates.get_mut(&ticket_id).ok_or_else(|| {
+                ShadowObserverError::new(format!(
+                    "score-gate decision referenced unknown ticket {ticket_id}"
+                ))
+            })?;
+            if record.terminal || record.score_gate_decision != ScoreGateDecision::NotEvaluated {
+                return Err(ShadowObserverError::new(format!(
+                    "score-gate ticket {ticket_id} was terminal or already decided"
+                )));
+            }
+            run.score_gate.eligible_nonresident_candidates = run
+                .score_gate
+                .eligible_nonresident_candidates
+                .checked_add(1)
+                .ok_or_else(|| ShadowObserverError::new("score-gate eligible counter overflow"))?;
+            if record.score < threshold {
+                record.score_gate_decision = ScoreGateDecision::Admitted;
+                run.score_gate.admitted =
+                    run.score_gate.admitted.checked_add(1).ok_or_else(|| {
+                        ShadowObserverError::new("score-gate admitted counter overflow")
+                    })?;
+                run.score_gate.admitted_score_min = Some(
+                    run.score_gate
+                        .admitted_score_min
+                        .map_or(record.score, |value| value.min(record.score)),
+                );
+                run.score_gate.admitted_score_max = Some(
+                    run.score_gate
+                        .admitted_score_max
+                        .map_or(record.score, |value| value.max(record.score)),
+                );
+                true
+            } else {
+                record.score_gate_decision = ScoreGateDecision::Rejected;
+                run.score_gate.rejected =
+                    run.score_gate.rejected.checked_add(1).ok_or_else(|| {
+                        ShadowObserverError::new("score-gate rejected counter overflow")
+                    })?;
+                false
+            }
+        };
+        if !admitted {
+            self.finish_ticket(ticket_id, "rejected-score-ceiling", |_, _, _| {});
+        }
+        Ok(admitted)
+    }
+
     pub(crate) fn begin_run(
         &self,
         phase: ShadowPhase,
@@ -661,6 +799,7 @@ impl GpuNativeBoundedLivePrefetchController {
             counters: LiveLifecycleCounters::default(),
             timing: TimingValues::default(),
             samples: Vec::new(),
+            score_gate: ScoreGateCounters::default(),
             failure: None,
         });
         Ok(())
@@ -901,6 +1040,7 @@ impl GpuNativeBoundedLivePrefetchController {
                 first_demand_at_us: None,
                 state: CandidateState::PredictionEmitted,
                 source_bytes: 0,
+                score_gate_decision: ScoreGateDecision::NotEvaluated,
                 accepted: true,
                 terminal: false,
                 installed: false,
@@ -1436,6 +1576,11 @@ impl GpuNativeBoundedLivePrefetchController {
                 run.counters.source_acquisition_cancelled_stale
             )));
         }
+        let score_gate = self
+            .config
+            .candidate_score_ceiling
+            .map(|threshold| build_score_gate_run_evidence(&run, threshold))
+            .transpose()?;
         run.counters.prediction_unused = run
             .candidates
             .values()
@@ -1474,6 +1619,7 @@ impl GpuNativeBoundedLivePrefetchController {
             counters: run.counters,
             timing,
             lifecycle_samples: run.samples,
+            score_gate,
             destructive_admission_calibration,
             calibration_events,
             postconditions,
@@ -1484,6 +1630,67 @@ impl GpuNativeBoundedLivePrefetchController {
             no_leaked_install_reservations: true,
         })
     }
+}
+
+fn build_score_gate_run_evidence(
+    run: &ActiveRun,
+    threshold: f64,
+) -> Result<ScoreGateRunEvidence, ShadowObserverError> {
+    let admitted_records = run
+        .candidates
+        .values()
+        .filter(|candidate| candidate.score_gate_decision == ScoreGateDecision::Admitted)
+        .count() as u64;
+    let rejected_records = run
+        .candidates
+        .values()
+        .filter(|candidate| candidate.score_gate_decision == ScoreGateDecision::Rejected)
+        .count() as u64;
+    let admitted_plus_rejected_equals_eligible =
+        run.score_gate.admitted.checked_add(run.score_gate.rejected)
+            == Some(run.score_gate.eligible_nonresident_candidates);
+    let rejected_candidates_zero_source_h2d_and_replacement_work = run
+        .candidates
+        .values()
+        .filter(|candidate| candidate.score_gate_decision == ScoreGateDecision::Rejected)
+        .all(|candidate| {
+            candidate.terminal
+                && candidate.source_started_at_us.is_none()
+                && candidate.source_bytes == 0
+                && !candidate.installed
+                && candidate.installed_identity.is_none()
+                && candidate.victim_decision.is_none()
+        });
+    let admitted_score_bounds_reconcile = if run.score_gate.admitted == 0 {
+        run.score_gate.admitted_score_min.is_none() && run.score_gate.admitted_score_max.is_none()
+    } else {
+        run.score_gate.admitted_score_min.is_some() && run.score_gate.admitted_score_max.is_some()
+    };
+    let reconciliation_pass = admitted_plus_rejected_equals_eligible
+        && admitted_records == run.score_gate.admitted
+        && rejected_records == run.score_gate.rejected
+        && rejected_candidates_zero_source_h2d_and_replacement_work
+        && admitted_score_bounds_reconcile;
+    if !reconciliation_pass {
+        return Err(ShadowObserverError::new(format!(
+            "score-gate accounting did not reconcile: eligible={} admitted={} rejected={} admitted_records={admitted_records} rejected_records={rejected_records} zero_work={rejected_candidates_zero_source_h2d_and_replacement_work}",
+            run.score_gate.eligible_nonresident_candidates,
+            run.score_gate.admitted,
+            run.score_gate.rejected,
+        )));
+    }
+    Ok(ScoreGateRunEvidence {
+        eligible_nonresident_candidates: run.score_gate.eligible_nonresident_candidates,
+        admitted: run.score_gate.admitted,
+        rejected: run.score_gate.rejected,
+        admitted_score_min: run.score_gate.admitted_score_min,
+        admitted_score_max: run.score_gate.admitted_score_max,
+        frozen_threshold: threshold,
+        strict_comparison: SCORE_CEILING_COMPARISON,
+        admitted_plus_rejected_equals_eligible,
+        rejected_candidates_zero_source_h2d_and_replacement_work,
+        reconciliation_pass,
+    })
 }
 
 fn record_completion_timing(run: &mut ActiveRun, record: &CandidateRecord, now: u64) {
@@ -2266,6 +2473,8 @@ pub(crate) struct LiveArmEvidence {
     pub(crate) measured_aggregate: crate::gpu_native_real_benchmark::Aggregate,
     pub(crate) measured_live_totals: LiveLifecycleCounters,
     pub(crate) measured_live_fractions: LiveDerivedFractions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) measured_score_gate: Option<ScoreGateRunEvidence>,
     pub(crate) measured_destructive_admission_calibration:
         DestructiveAdmissionCalibrationEvidence,
     pub(crate) measured_source_attribution: DemandSourceEvidence,
@@ -2431,6 +2640,10 @@ pub(crate) struct BoundedLivePrefetchReport {
     pub(crate) qualification_resources: QualificationResourceEvidence,
     pub(crate) off_on_resource_layout_identical: bool,
     pub(crate) replacement_policy_semantics: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) score_gate_contract: Option<ScoreGateContractEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) score_gate_reconciliation_pass: Option<bool>,
     pub(crate) normal_production_default_remains_disabled: bool,
     pub(crate) production_semantics: LiveProductionSemantics,
     pub(crate) cache_reset: crate::BenchRealCacheReset,
@@ -2528,6 +2741,103 @@ fn aggregate_live_runs(
         checked_add_counters(&mut total, &run.live.counters)?;
     }
     Ok(total)
+}
+
+fn aggregate_score_gate(
+    runs: &[LiveQualifiedRunEvidence],
+) -> Result<Option<ScoreGateRunEvidence>, crate::gpu_native_real_benchmark::BenchmarkFailure> {
+    use crate::gpu_native_real_benchmark::BenchmarkFailure;
+    let enabled = runs.iter().any(|run| run.live.score_gate.is_some());
+    if !enabled {
+        return Ok(None);
+    }
+    if runs.iter().any(|run| run.live.score_gate.is_none()) {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "score-gate-run-evidence-missing",
+            "score-gated arm mixed enabled and disabled run evidence",
+        ));
+    }
+    let mut eligible_nonresident_candidates = 0u64;
+    let mut admitted = 0u64;
+    let mut rejected = 0u64;
+    let mut admitted_score_min: Option<f64> = None;
+    let mut admitted_score_max: Option<f64> = None;
+    let mut rejected_candidates_zero_source_h2d_and_replacement_work = true;
+    for evidence in runs.iter().filter_map(|run| run.live.score_gate.as_ref()) {
+        if evidence.frozen_threshold != FROZEN_CANDIDATE_SCORE_CEILING
+            || evidence.strict_comparison != SCORE_CEILING_COMPARISON
+            || !evidence.reconciliation_pass
+        {
+            return Err(BenchmarkFailure::new(
+                "postcondition",
+                "score-gate-run-contract-mismatch",
+                format!("score-gate run evidence differed from the frozen contract: {evidence:?}"),
+            ));
+        }
+        eligible_nonresident_candidates = eligible_nonresident_candidates
+            .checked_add(evidence.eligible_nonresident_candidates)
+            .ok_or_else(|| {
+                BenchmarkFailure::new(
+                    "postcondition",
+                    "score-gate-counter-overflow",
+                    "eligible nonresident candidate counter overflowed",
+                )
+            })?;
+        admitted = admitted.checked_add(evidence.admitted).ok_or_else(|| {
+            BenchmarkFailure::new(
+                "postcondition",
+                "score-gate-counter-overflow",
+                "admitted counter overflowed",
+            )
+        })?;
+        rejected = rejected.checked_add(evidence.rejected).ok_or_else(|| {
+            BenchmarkFailure::new(
+                "postcondition",
+                "score-gate-counter-overflow",
+                "rejected counter overflowed",
+            )
+        })?;
+        if let Some(value) = evidence.admitted_score_min {
+            admitted_score_min = Some(admitted_score_min.map_or(value, |min| min.min(value)));
+        }
+        if let Some(value) = evidence.admitted_score_max {
+            admitted_score_max = Some(admitted_score_max.map_or(value, |max| max.max(value)));
+        }
+        rejected_candidates_zero_source_h2d_and_replacement_work &=
+            evidence.rejected_candidates_zero_source_h2d_and_replacement_work;
+    }
+    let admitted_plus_rejected_equals_eligible =
+        admitted.checked_add(rejected) == Some(eligible_nonresident_candidates);
+    let admitted_score_bounds_reconcile = if admitted == 0 {
+        admitted_score_min.is_none() && admitted_score_max.is_none()
+    } else {
+        admitted_score_min.is_some() && admitted_score_max.is_some()
+    };
+    let reconciliation_pass = admitted_plus_rejected_equals_eligible
+        && admitted_score_bounds_reconcile
+        && rejected_candidates_zero_source_h2d_and_replacement_work;
+    if !reconciliation_pass {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "score-gate-aggregate-reconciliation-failed",
+            format!(
+                "eligible={eligible_nonresident_candidates} admitted={admitted} rejected={rejected} zero_work={rejected_candidates_zero_source_h2d_and_replacement_work}"
+            ),
+        ));
+    }
+    Ok(Some(ScoreGateRunEvidence {
+        eligible_nonresident_candidates,
+        admitted,
+        rejected,
+        admitted_score_min,
+        admitted_score_max,
+        frozen_threshold: FROZEN_CANDIDATE_SCORE_CEILING,
+        strict_comparison: SCORE_CEILING_COMPARISON,
+        admitted_plus_rejected_equals_eligible,
+        rejected_candidates_zero_source_h2d_and_replacement_work,
+        reconciliation_pass,
+    }))
 }
 
 fn aggregate_destructive_admission_calibration(
@@ -2881,6 +3191,7 @@ async fn run_arm(
     policy: GpuNativeLiveReplacementPolicy,
     bounds: LiveResourceBounds,
     markov_min_prob: f64,
+    score_ceiling_gate: bool,
     prompt_ids: &[u32],
     output_tokens: usize,
     warmup_runs: usize,
@@ -2967,6 +3278,7 @@ async fn run_arm(
         top_k: geometry.top_k,
         markov_min_prob,
         bounds,
+        candidate_score_ceiling: score_ceiling_gate.then_some(FROZEN_CANDIDATE_SCORE_CEILING),
     });
     let controller = match controller {
         Ok(controller) => controller,
@@ -3077,6 +3389,7 @@ async fn run_arm(
     let measured_aggregate = crate::gpu_native_real_benchmark::aggregate(&measured_production)?;
     let measured_live_totals = aggregate_live_runs(&measured_run_evidence)?;
     let measured_live_fractions = live_derived_fractions(&measured_live_totals);
+    let measured_score_gate = aggregate_score_gate(&measured_run_evidence)?;
     let measured_destructive_admission_calibration =
         aggregate_destructive_admission_calibration(&measured_run_evidence)?;
     if measured_destructive_admission_calibration.replacement_count
@@ -3121,6 +3434,7 @@ async fn run_arm(
         measured_aggregate,
         measured_live_totals,
         measured_live_fractions,
+        measured_score_gate,
         measured_destructive_admission_calibration,
         measured_source_attribution,
         runtime_shutdown,
@@ -3497,12 +3811,17 @@ fn emit_report(
 
 pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::error::Error>> {
     use crate::gpu_native_real_benchmark::{BenchmarkFailure, BenchmarkProvenance};
+    let command = if args.score_ceiling_gate {
+        SCORE_CEILING_COMMAND
+    } else {
+        COMMAND
+    };
 
     if !args.greedy {
         return Err(BenchmarkFailure::new(
             "preflight",
             "greedy-required",
-            format!("{COMMAND} requires the explicit --greedy flag"),
+            format!("{command} requires the explicit --greedy flag"),
         )
         .into());
     }
@@ -3510,7 +3829,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         return Err(BenchmarkFailure::new(
             "preflight",
             "measured-runs-required",
-            format!("{COMMAND} requires --measured-runs > 0"),
+            format!("{command} requires --measured-runs > 0"),
         )
         .into());
     }
@@ -3534,7 +3853,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         .into());
     }
     let request_input = crate::load_real_cli_request_input(
-        COMMAND,
+        command,
         args.prompt.as_ref(),
         args.request_json.as_deref(),
         args.output_tokens,
@@ -3543,7 +3862,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         return Err(BenchmarkFailure::new(
             "preflight",
             "insufficient-output-tokens",
-            format!("{COMMAND} requires --output-tokens >= 2"),
+            format!("{command} requires --output-tokens >= 2"),
         )
         .into());
     }
@@ -3556,7 +3875,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
             "preflight",
             "production-prefetch-must-remain-disabled",
             format!(
-                "{COMMAND} requires source storage.predict_fanout=0; observed {}",
+                "{command} requires source storage.predict_fanout=0; observed {}",
                 cfg.storage.predict_fanout
             ),
         )
@@ -3644,9 +3963,17 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         max_in_flight_source_acquisitions: bounds.max_in_flight_source_acquisitions,
     };
     let mut report = BoundedLivePrefetchReport {
-        schema: SCHEMA,
-        mode: MODE,
-        command: COMMAND,
+        schema: if args.score_ceiling_gate {
+            SCORE_CEILING_SCHEMA
+        } else {
+            SCHEMA
+        },
+        mode: if args.score_ceiling_gate {
+            SCORE_CEILING_MODE
+        } else {
+            MODE
+        },
+        command,
         source_main_commit: SOURCE_MAIN_COMMIT,
         tested_pr1bb_commit: TESTED_PR1BB_COMMIT,
         tested_pr1bb_report_sha256: TESTED_PR1BB_REPORT_SHA256,
@@ -3694,6 +4021,26 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         qualification_resources,
         off_on_resource_layout_identical: false,
         replacement_policy_semantics: replacement_semantics(args.replacement_policy),
+        score_gate_contract: args.score_ceiling_gate.then_some(ScoreGateContractEvidence {
+            enabled: true,
+            qualification_only: true,
+            pr1ce1_commit: PR1CE1_COMMIT,
+            authoritative_report_sha256: PR1CE1_REPORT_SHA256,
+            authoritative_log_sha256: PR1CE1_LOG_SHA256,
+            frozen_threshold: FROZEN_CANDIDATE_SCORE_CEILING,
+            strict_comparison: SCORE_CEILING_COMPARISON,
+            eligible_candidate_semantics: "controller-accepted candidate whose existing physical residency probe returned miss; decision occurs before governor, semaphore, task spawn, source acquisition, logical admission, H2D, or replacement",
+            already_physically_resident_semantics: "an existing physical hit bypasses the score gate and completes without speculative source, H2D, or replacement work",
+            historical_evidence_diagnostic_only: true,
+            counterfactual_performance_claim: false,
+            historical_complement_replacements: 5_833,
+            historical_complement_direct_physical_payoffs: 4_242,
+            historical_complement_evicted_unused_candidates: 1_591,
+            historical_complement_victim_harm_events: 1_472,
+            historical_complement_introduced_misses: 1_057,
+            historical_complement_introduced_miss_boundaries: 1_004,
+        }),
+        score_gate_reconciliation_pass: args.score_ceiling_gate.then_some(false),
         normal_production_default_remains_disabled: true,
         production_semantics: LiveProductionSemantics {
             normal_runtime_default_enabled: false,
@@ -3730,6 +4077,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         args.replacement_policy,
         bounds,
         markov_min_prob,
+        args.score_ceiling_gate,
         &prompt_ids,
         request_input.output_tokens,
         args.warmup_runs,
@@ -3756,6 +4104,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         args.replacement_policy,
         bounds,
         markov_min_prob,
+        args.score_ceiling_gate,
         &prompt_ids,
         request_input.output_tokens,
         args.warmup_runs,
@@ -3824,11 +4173,17 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     report.residency_effectiveness_pass = residency.pass;
     report.performance_pass = performance.pass;
     report.performance_claim = performance.pass;
+    let score_gate_reconciliation_pass = treatment
+        .measured_score_gate
+        .as_ref()
+        .map(|evidence| evidence.reconciliation_pass);
+    report.score_gate_reconciliation_pass = score_gate_reconciliation_pass;
     report.qualification_complete = true;
     report.qualification_pass = control.complete
         && treatment.complete
         && behavioral.pass
         && live_path.pass
+        && score_gate_reconciliation_pass.unwrap_or(true)
         && control.runtime_shutdown.all_runtime_resources_released
         && treatment.runtime_shutdown.all_runtime_resources_released;
     report.behavioral_equivalence = Some(behavioral);
@@ -3850,6 +4205,13 @@ mod tests {
     }
 
     fn controller_for_arm(arm: LiveArm) -> Arc<GpuNativeBoundedLivePrefetchController> {
+        controller_for_arm_and_score_gate(arm, false)
+    }
+
+    fn controller_for_arm_and_score_gate(
+        arm: LiveArm,
+        score_ceiling_gate: bool,
+    ) -> Arc<GpuNativeBoundedLivePrefetchController> {
         GpuNativeBoundedLivePrefetchController::new(LiveControllerConfig {
             arm,
             policy: GpuNativeLiveReplacementPolicy::PhysicalLru,
@@ -3858,6 +4220,7 @@ mod tests {
             top_k: 1,
             markov_min_prob: 0.0,
             bounds: LiveResourceBounds::default(),
+            candidate_score_ceiling: score_ceiling_gate.then_some(FROZEN_CANDIDATE_SCORE_CEILING),
         })
         .unwrap()
     }
@@ -3970,6 +4333,142 @@ mod tests {
             .unwrap()
             .counters
             .clone()
+    }
+
+    fn accepted_score_ticket(
+        controller: &GpuNativeBoundedLivePrefetchController,
+        score: f64,
+    ) -> LiveCandidateTicket {
+        controller.begin_run(ShadowPhase::Measured, 0).unwrap();
+        let mut pending = pending(4);
+        pending.candidates[0].score = score;
+        accept(controller, &pending)
+    }
+
+    #[test]
+    fn pr1cf_score_below_frozen_threshold_is_admitted() {
+        let controller = controller_for_arm_and_score_gate(LiveArm::On, true);
+        let score = FROZEN_CANDIDATE_SCORE_CEILING / 2.0;
+        let ticket = accepted_score_ticket(&controller, score);
+        assert!(controller
+            .admit_score_gated_nonresident_candidate(ticket.ticket_id)
+            .unwrap());
+        let inner = controller.inner.lock();
+        let evidence = build_score_gate_run_evidence(
+            inner.run.as_ref().unwrap(),
+            FROZEN_CANDIDATE_SCORE_CEILING,
+        )
+        .unwrap();
+        assert_eq!(evidence.eligible_nonresident_candidates, 1);
+        assert_eq!(evidence.admitted, 1);
+        assert_eq!(evidence.rejected, 0);
+        assert_eq!(evidence.admitted_score_min, Some(score));
+        assert_eq!(evidence.admitted_score_max, Some(score));
+        assert!(evidence.reconciliation_pass);
+    }
+
+    #[test]
+    fn pr1cf_score_exactly_equal_to_frozen_threshold_is_rejected() {
+        let controller = controller_for_arm_and_score_gate(LiveArm::On, true);
+        let ticket = accepted_score_ticket(&controller, FROZEN_CANDIDATE_SCORE_CEILING);
+        assert!(!controller
+            .admit_score_gated_nonresident_candidate(ticket.ticket_id)
+            .unwrap());
+        let inner = controller.inner.lock();
+        let evidence = build_score_gate_run_evidence(
+            inner.run.as_ref().unwrap(),
+            FROZEN_CANDIDATE_SCORE_CEILING,
+        )
+        .unwrap();
+        assert_eq!(evidence.eligible_nonresident_candidates, 1);
+        assert_eq!(evidence.admitted, 0);
+        assert_eq!(evidence.rejected, 1);
+        assert_eq!(evidence.strict_comparison, "candidate.score < threshold");
+        assert!(evidence.reconciliation_pass);
+    }
+
+    #[test]
+    fn pr1cf_score_above_frozen_threshold_is_rejected_with_zero_source_or_install_work() {
+        let controller = controller_for_arm_and_score_gate(LiveArm::On, true);
+        let ticket = accepted_score_ticket(&controller, FROZEN_CANDIDATE_SCORE_CEILING * 2.0);
+        assert!(!controller
+            .admit_score_gated_nonresident_candidate(ticket.ticket_id)
+            .unwrap());
+
+        // The engine returns before governor/semaphore/task spawn, so no source
+        // or install callback can be issued for this terminal rejection.
+        assert!(!controller.reserve_install(ticket.ticket_id, true));
+
+        let counters = counters(&controller);
+        assert_eq!(counters.source_acquisition_started, 0);
+        assert_eq!(counters.speculative_nvme_operations, 0);
+        assert_eq!(counters.speculative_nvme_bytes, 0);
+        assert_eq!(counters.physical_installation_started, 0);
+        assert_eq!(counters.speculative_h2d_installs, 0);
+        assert_eq!(counters.speculative_h2d_bytes, 0);
+        assert_eq!(counters.speculative_replacements, 0);
+        let inner = controller.inner.lock();
+        let evidence = build_score_gate_run_evidence(
+            inner.run.as_ref().unwrap(),
+            FROZEN_CANDIDATE_SCORE_CEILING,
+        )
+        .unwrap();
+        assert!(evidence.rejected_candidates_zero_source_h2d_and_replacement_work);
+    }
+
+    #[test]
+    fn pr1cf_already_physically_resident_high_score_bypasses_gate_accounting_and_work() {
+        let controller = controller_for_arm_and_score_gate(LiveArm::On, true);
+        let ticket = accepted_score_ticket(&controller, FROZEN_CANDIDATE_SCORE_CEILING * 2.0);
+        controller.record_already_physically_resident(ticket.ticket_id);
+        let counters = counters(&controller);
+        assert_eq!(counters.already_physically_resident, 1);
+        assert_eq!(counters.source_acquisition_started, 0);
+        assert_eq!(counters.speculative_nvme_operations, 0);
+        assert_eq!(counters.speculative_h2d_installs, 0);
+        assert_eq!(counters.speculative_replacements, 0);
+        let inner = controller.inner.lock();
+        let evidence = build_score_gate_run_evidence(
+            inner.run.as_ref().unwrap(),
+            FROZEN_CANDIDATE_SCORE_CEILING,
+        )
+        .unwrap();
+        assert_eq!(evidence.eligible_nonresident_candidates, 0);
+        assert_eq!(evidence.admitted, 0);
+        assert_eq!(evidence.rejected, 0);
+        assert!(evidence.reconciliation_pass);
+    }
+
+    #[test]
+    fn pr1cf_gate_accounting_fails_closed_on_reconciliation_drift() {
+        let controller = controller_for_arm_and_score_gate(LiveArm::On, true);
+        let ticket = accepted_score_ticket(&controller, FROZEN_CANDIDATE_SCORE_CEILING);
+        assert!(!controller
+            .admit_score_gated_nonresident_candidate(ticket.ticket_id)
+            .unwrap());
+        let mut inner = controller.inner.lock();
+        let run = inner.run.as_mut().unwrap();
+        assert!(build_score_gate_run_evidence(run, FROZEN_CANDIDATE_SCORE_CEILING).is_ok());
+        run.score_gate.eligible_nonresident_candidates += 1;
+        let error = build_score_gate_run_evidence(run, FROZEN_CANDIDATE_SCORE_CEILING).unwrap_err();
+        assert!(error.to_string().contains("did not reconcile"));
+    }
+
+    #[test]
+    fn pr1ce1_command_keeps_score_gate_disabled_and_unaccounted() {
+        let controller = controller_for_arm_and_score_gate(LiveArm::On, false);
+        let ticket = accepted_score_ticket(&controller, 1.0);
+        assert!(!controller.score_gate_enabled());
+        assert!(controller
+            .admit_score_gated_nonresident_candidate(ticket.ticket_id)
+            .unwrap());
+        let inner = controller.inner.lock();
+        let run = inner.run.as_ref().unwrap();
+        assert_eq!(run.score_gate.eligible_nonresident_candidates, 0);
+        assert_eq!(
+            run.candidates[&ticket.ticket_id].score_gate_decision,
+            ScoreGateDecision::NotEvaluated
+        );
     }
 
     #[test]
@@ -4456,6 +4955,12 @@ mod tests {
     fn pr1cd2_resource_and_predictor_contracts_remain_frozen() {
         assert_eq!(SCHEMA, "mer.gpu-native-bounded-live-prefetch.v2");
         assert_eq!(
+            SCORE_CEILING_SCHEMA,
+            "mer.gpu-native-bounded-live-prefetch.v3"
+        );
+        assert_eq!(FROZEN_CANDIDATE_SCORE_CEILING, 0.002777777777777778);
+        assert_eq!(SCORE_CEILING_COMPARISON, "candidate.score < threshold");
+        assert_eq!(
             PR1CD2_COMMIT,
             "8cb3cbe2ffd561e37add6815a3e8c646d24c772d"
         );
@@ -4701,9 +5206,10 @@ mod tests {
         .into_iter()
         .map(std::ffi::OsString::from)
         .collect::<Vec<_>>();
-        let (normalized, requested, replacement_policy) =
+        let (normalized, requested, replacement_policy, score_ceiling_requested) =
             crate::normalize_bounded_live_prefetch_command(&raw).unwrap();
         assert!(requested);
+        assert!(!score_ceiling_requested);
         let parsed = crate::Cli::try_parse_from(normalized).unwrap();
         assert!(matches!(
             parsed.cmd,
@@ -4733,9 +5239,10 @@ mod tests {
         .into_iter()
         .map(std::ffi::OsString::from)
         .collect::<Vec<_>>();
-        let (normalized, requested, replacement_policy) =
+        let (normalized, requested, replacement_policy, score_ceiling_requested) =
             crate::normalize_bounded_live_prefetch_command(&raw).unwrap();
         assert!(requested);
+        assert!(!score_ceiling_requested);
         let parsed = crate::Cli::try_parse_from(normalized).unwrap();
         assert!(matches!(
             parsed.cmd,
@@ -4745,5 +5252,40 @@ mod tests {
             require_explicit_replacement_policy(replacement_policy),
             Ok(GpuNativeLiveReplacementPolicy::RouteRecencyPredictionProtected)
         ));
+    }
+
+    #[test]
+    fn cli_parses_dedicated_pr1cf_score_ceiling_command() {
+        let raw = [
+            "micro-expert-router",
+            SCORE_CEILING_COMMAND,
+            "--config",
+            "config.toml",
+            "--prompt",
+            "hello",
+            "--output-tokens",
+            "2",
+            "--greedy",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--replacement-policy",
+            "physical-lru-prediction-protected",
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+        let (normalized, requested, replacement_policy, score_ceiling_requested) =
+            crate::normalize_bounded_live_prefetch_command(&raw).unwrap();
+        assert!(requested);
+        assert!(score_ceiling_requested);
+        let parsed = crate::Cli::try_parse_from(normalized).unwrap();
+        assert!(matches!(
+            parsed.cmd,
+            crate::Cmd::QualifyGpuNativePrefetchMultipredictorShadow { .. }
+        ));
+        assert_eq!(
+            require_explicit_replacement_policy(replacement_policy).unwrap(),
+            GpuNativeLiveReplacementPolicy::PhysicalLruPredictionProtected
+        );
     }
 }

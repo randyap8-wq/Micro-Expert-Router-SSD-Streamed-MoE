@@ -4499,6 +4499,20 @@ impl Engine {
                 return;
             }
         }
+        // PR1C-F qualification-only gate: the physical miss above is the
+        // earliest safe point that excludes already-current candidates. A
+        // rejection returns before governor/semaphore/task/source/H2D/install
+        // work. The ordinary PR1C-E.1 command leaves this gate disabled.
+        if controller.score_gate_enabled() {
+            match controller.admit_score_gated_nonresident_candidate(ticket.ticket_id) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    controller.record_fatal(ticket.ticket_id, error.to_string());
+                    return;
+                }
+            }
+        }
         if !self.core.governor.admit(ticket.score) {
             self.metrics
                 .counters

@@ -226,6 +226,8 @@ const MULTIPREDICTOR_SHADOW_COMMAND: &str =
     "qualify-gpu-native-prefetch-multipredictor-shadow";
 const BOUNDED_LIVE_PREFETCH_COMMAND: &str =
     "qualify-gpu-native-bounded-live-prefetch";
+const BOUNDED_LIVE_PREFETCH_SCORE_CEILING_COMMAND: &str =
+    "qualify-gpu-native-bounded-live-prefetch-score-ceiling";
 
 fn normalize_stateful_replacement_shadow_command(
     raw_args: &[OsString],
@@ -248,15 +250,21 @@ fn normalize_bounded_live_prefetch_command(
         Vec<OsString>,
         bool,
         Option<crate::gpu_native_residency::GpuNativeLiveReplacementPolicy>,
+        bool,
     ),
     String,
 > {
     let Some(command_index) = raw_args
         .iter()
-        .position(|arg| arg == BOUNDED_LIVE_PREFETCH_COMMAND)
+        .position(|arg| {
+            arg == BOUNDED_LIVE_PREFETCH_COMMAND
+                || arg == BOUNDED_LIVE_PREFETCH_SCORE_CEILING_COMMAND
+        })
     else {
-        return Ok((raw_args.to_vec(), false, None));
+        return Ok((raw_args.to_vec(), false, None, false));
     };
+    let score_ceiling_requested =
+        raw_args[command_index] == BOUNDED_LIVE_PREFETCH_SCORE_CEILING_COMMAND;
     let mut normalized = Vec::with_capacity(raw_args.len());
     let mut policy = None;
     let mut index = 0usize;
@@ -296,7 +304,7 @@ fn normalize_bounded_live_prefetch_command(
         }
         index += 1;
     }
-    Ok((normalized, true, policy))
+    Ok((normalized, true, policy, score_ceiling_requested))
 }
 
 /// MoE execution engine that streams experts from NVMe via O_DIRECT pread(2).
@@ -2040,6 +2048,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         normalized_args,
         bounded_live_prefetch_requested,
         bounded_live_replacement_policy,
+        bounded_live_score_ceiling_requested,
     ) = normalize_bounded_live_prefetch_command(&stateful_normalized_args)?;
     let cli = Cli::parse_from(normalized_args);
     let worker_protocol_stdout = matches!(
@@ -2507,6 +2516,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         greedy,
                         expected_adapter_name,
                         replacement_policy,
+                        score_ceiling_gate: bounded_live_score_ceiling_requested,
                         report_out,
                         progress_watchdog,
                     },
