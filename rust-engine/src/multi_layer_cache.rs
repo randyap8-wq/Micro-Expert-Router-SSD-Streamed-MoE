@@ -21,6 +21,7 @@
 //! `expert_<id>.bin`, written by the existing extractor).
 
 use crate::expert_cache::{ExpertCache, ExpertResident};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 /// Fixed `(layer, expert)` key for a multi-layer expert lookup.
@@ -200,6 +201,29 @@ impl MultiLayerExpertCache {
     /// policy.
     pub(crate) fn qualification_layer_lengths(&self) -> Vec<usize> {
         self.caches.iter().map(|cache| cache.len()).collect()
+    }
+
+    /// Stable qualification-only hash of the complete RAM-cache state.
+    /// Layers are visited by index and every per-layer resident list is
+    /// encoded in the cache's authoritative MRU-to-LRU order. Explicit domain,
+    /// layer, count, id, and end markers make the encoding unambiguous and do
+    /// not depend on hash-map iteration order.
+    pub(crate) fn qualification_state_sha256(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"mer.pr2a.ram-cache-state.v1\0");
+        hasher.update((self.caches.len() as u64).to_le_bytes());
+        for (layer_index, cache) in self.caches.iter().enumerate() {
+            let resident_ids_mru_to_lru = cache.resident_ids();
+            hasher.update([0x4c]);
+            hasher.update((layer_index as u64).to_le_bytes());
+            hasher.update((resident_ids_mru_to_lru.len() as u64).to_le_bytes());
+            for global_id in resident_ids_mru_to_lru {
+                hasher.update([0x49]);
+                hasher.update(global_id.to_le_bytes());
+            }
+            hasher.update([0x45]);
+        }
+        format!("{:x}", hasher.finalize())
     }
 
     /// Evict from the layer the ordinary global victim selector would choose
@@ -475,6 +499,31 @@ mod tests {
         let mut ids = mlc.resident_ids();
         ids.sort();
         assert_eq!(ids, vec![7, 42]);
+    }
+
+    #[test]
+    fn qualification_state_hash_preserves_mru_to_lru_order_and_contains_is_non_mutating() {
+        let pool = BufferPool::new(2, 4096, 4096);
+        let cache = MultiLayerExpertCache::single_layer(2);
+        for id in [1u32, 0] {
+            assert!(cache
+                .insert(Arc::new(ExpertResident::new(
+                    id,
+                    pool.try_acquire().unwrap(),
+                )))
+                .is_ok());
+        }
+        assert_eq!(cache.resident_ids(), vec![0, 1]);
+        let initial = cache.qualification_state_sha256();
+        assert_eq!(initial.len(), 64);
+
+        assert!(cache.contains(1));
+        assert_eq!(cache.resident_ids(), vec![0, 1]);
+        assert_eq!(cache.qualification_state_sha256(), initial);
+
+        cache.get(1).expect("resident");
+        assert_eq!(cache.resident_ids(), vec![1, 0]);
+        assert_ne!(cache.qualification_state_sha256(), initial);
     }
 
     #[test]

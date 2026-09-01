@@ -383,6 +383,9 @@ pub(crate) enum GpuNativeDemandResidencyError {
     ManagerNotInstalled,
     QualificationIsolationViolation,
     QualificationTreatmentNotEnabled,
+    QualificationMixedRamStateBatchAttempt {
+        global_ids: Vec<u32>,
+    },
     QualificationBatchCapacity {
         requested: usize,
         layer_capacity: usize,
@@ -435,6 +438,10 @@ impl std::fmt::Display for GpuNativeDemandResidencyError {
             ),
             Self::QualificationTreatmentNotEnabled => f.write_str(
                 "qualification-only concurrent exact-demand source was called outside its explicit treatment arm",
+            ),
+            Self::QualificationMixedRamStateBatchAttempt { global_ids } => write!(
+                f,
+                "qualification-only exact-demand batch was attempted with RAM-resident experts in {global_ids:?}"
             ),
             Self::QualificationBatchCapacity {
                 requested,
@@ -565,8 +572,16 @@ pub(crate) struct GpuNativeDemandSourceQualificationSnapshot {
     pub(crate) logical_demand_admission_us: u64,
     pub(crate) physical_demand_install_us: u64,
     pub(crate) total_residency_service_us: u64,
+    pub(crate) batch_eligible_all_ram_miss_source_sets: u64,
+    pub(crate) sequential_fallback_source_sets_due_ram_residency: u64,
+    pub(crate) batch_eligible_source_experts: u64,
+    pub(crate) sequential_fallback_source_experts: u64,
     pub(crate) batch_path_exercises: u64,
     pub(crate) concurrent_source_reads: u64,
+    pub(crate) actual_batch_nvme_width_min: u64,
+    pub(crate) actual_batch_nvme_width_max: u64,
+    pub(crate) actual_batch_nvme_width_mean: f64,
+    pub(crate) mixed_ram_state_batch_attempts: u64,
     pub(crate) pool_capacity_failures: u64,
     pub(crate) batch_read_failures: u64,
     pub(crate) ordered_commit_violations: u64,
@@ -682,8 +697,16 @@ struct GpuNativeDemandSourceQualification {
     logical_demand_admission_us: AtomicU64,
     physical_demand_install_us: AtomicU64,
     total_residency_service_us: AtomicU64,
+    batch_eligible_all_ram_miss_source_sets: AtomicU64,
+    sequential_fallback_source_sets_due_ram_residency: AtomicU64,
+    batch_eligible_source_experts: AtomicU64,
+    sequential_fallback_source_experts: AtomicU64,
     batch_path_exercises: AtomicU64,
     concurrent_source_reads: AtomicU64,
+    actual_batch_nvme_width_min: AtomicU64,
+    actual_batch_nvme_width_max: AtomicU64,
+    actual_batch_nvme_width_sum: AtomicU64,
+    mixed_ram_state_batch_attempts: AtomicU64,
     pool_capacity_failures: AtomicU64,
     batch_read_failures: AtomicU64,
     ordered_commit_violations: AtomicU64,
@@ -726,8 +749,16 @@ impl GpuNativeDemandSourceQualification {
             logical_demand_admission_us: AtomicU64::new(0),
             physical_demand_install_us: AtomicU64::new(0),
             total_residency_service_us: AtomicU64::new(0),
+            batch_eligible_all_ram_miss_source_sets: AtomicU64::new(0),
+            sequential_fallback_source_sets_due_ram_residency: AtomicU64::new(0),
+            batch_eligible_source_experts: AtomicU64::new(0),
+            sequential_fallback_source_experts: AtomicU64::new(0),
             batch_path_exercises: AtomicU64::new(0),
             concurrent_source_reads: AtomicU64::new(0),
+            actual_batch_nvme_width_min: AtomicU64::new(u64::MAX),
+            actual_batch_nvme_width_max: AtomicU64::new(0),
+            actual_batch_nvme_width_sum: AtomicU64::new(0),
+            mixed_ram_state_batch_attempts: AtomicU64::new(0),
             pool_capacity_failures: AtomicU64::new(0),
             batch_read_failures: AtomicU64::new(0),
             ordered_commit_violations: AtomicU64::new(0),
@@ -750,6 +781,8 @@ impl GpuNativeDemandSourceQualification {
     fn snapshot(&self) -> GpuNativeDemandSourceQualificationSnapshot {
         let source_sets = self.source_sets.load(Ordering::Relaxed);
         let width_min = self.source_set_width_min.load(Ordering::Relaxed);
+        let batch_path_exercises = self.batch_path_exercises.load(Ordering::Relaxed);
+        let actual_batch_width_min = self.actual_batch_nvme_width_min.load(Ordering::Relaxed);
         let ordered_commit_violations = self.ordered_commit_violations.load(Ordering::Relaxed);
         GpuNativeDemandSourceQualificationSnapshot {
             arm: self.arm,
@@ -791,8 +824,39 @@ impl GpuNativeDemandSourceQualification {
                 .load(Ordering::Relaxed),
             physical_demand_install_us: self.physical_demand_install_us.load(Ordering::Relaxed),
             total_residency_service_us: self.total_residency_service_us.load(Ordering::Relaxed),
-            batch_path_exercises: self.batch_path_exercises.load(Ordering::Relaxed),
+            batch_eligible_all_ram_miss_source_sets: self
+                .batch_eligible_all_ram_miss_source_sets
+                .load(Ordering::Relaxed),
+            sequential_fallback_source_sets_due_ram_residency: self
+                .sequential_fallback_source_sets_due_ram_residency
+                .load(Ordering::Relaxed),
+            batch_eligible_source_experts: self
+                .batch_eligible_source_experts
+                .load(Ordering::Relaxed),
+            sequential_fallback_source_experts: self
+                .sequential_fallback_source_experts
+                .load(Ordering::Relaxed),
+            batch_path_exercises,
             concurrent_source_reads: self.concurrent_source_reads.load(Ordering::Relaxed),
+            actual_batch_nvme_width_min: if batch_path_exercises == 0
+                || actual_batch_width_min == u64::MAX
+            {
+                0
+            } else {
+                actual_batch_width_min
+            },
+            actual_batch_nvme_width_max: self
+                .actual_batch_nvme_width_max
+                .load(Ordering::Relaxed),
+            actual_batch_nvme_width_mean: if batch_path_exercises == 0 {
+                0.0
+            } else {
+                self.actual_batch_nvme_width_sum.load(Ordering::Relaxed) as f64
+                    / batch_path_exercises as f64
+            },
+            mixed_ram_state_batch_attempts: self
+                .mixed_ram_state_batch_attempts
+                .load(Ordering::Relaxed),
             pool_capacity_failures: self.pool_capacity_failures.load(Ordering::Relaxed),
             batch_read_failures: self.batch_read_failures.load(Ordering::Relaxed),
             ordered_commit_violations,
@@ -831,6 +895,17 @@ impl GpuNativeDemandSourceQualification {
     fn record_cache_eviction(&self, id: u32) {
         self.ram_cache_evictions.fetch_add(1, Ordering::Relaxed);
         self.demand_ram_eviction_ids.lock().record_id(id);
+    }
+
+    fn record_actual_batch_nvme_width(&self, width: usize) {
+        let width = width as u64;
+        self.batch_path_exercises.fetch_add(1, Ordering::Relaxed);
+        self.actual_batch_nvme_width_min
+            .fetch_min(width, Ordering::Relaxed);
+        self.actual_batch_nvme_width_max
+            .fetch_max(width, Ordering::Relaxed);
+        self.actual_batch_nvme_width_sum
+            .fetch_add(width, Ordering::Relaxed);
     }
 }
 
@@ -873,35 +948,6 @@ impl Drop for QualificationDemandServiceGuard {
         self.state
             .active_demand_set
             .store(false, Ordering::Release);
-    }
-}
-
-struct QualificationDemandPins {
-    cache: Arc<MultiLayerExpertCache>,
-    temporary_ids: Vec<u32>,
-}
-
-impl QualificationDemandPins {
-    fn install(cache: Arc<MultiLayerExpertCache>, ids: &[u32]) -> Self {
-        let mut temporary_ids = Vec::new();
-        for &id in ids {
-            if !cache.is_pinned(id) {
-                cache.pin(id);
-                temporary_ids.push(id);
-            }
-        }
-        Self {
-            cache,
-            temporary_ids,
-        }
-    }
-}
-
-impl Drop for QualificationDemandPins {
-    fn drop(&mut self) {
-        for &id in &self.temporary_ids {
-            self.cache.unpin(id);
-        }
     }
 }
 
@@ -3492,6 +3538,15 @@ impl Engine {
             .map(|state| state.snapshot())
     }
 
+    pub(crate) fn gpu_native_demand_source_qualification_ram_cache_state_sha256(
+        &self,
+    ) -> Option<String> {
+        self.gpu_native_demand_source_qualification
+            .read()
+            .as_ref()
+            .map(|_| self.core.cache.qualification_state_sha256())
+    }
+
     fn gpu_native_demand_source_qualification(
         &self,
     ) -> Option<Arc<GpuNativeDemandSourceQualification>> {
@@ -4638,32 +4693,42 @@ impl Engine {
         let started = Instant::now();
         let result = match qualification.as_ref().map(|state| state.arm) {
             Some(GpuNativeDemandSourceQualificationArm::Treatment) => {
-                self.gpu_native_qualification_batch_source(global_ids, residents)
-                    .await
+                let unresolved = global_ids
+                    .iter()
+                    .copied()
+                    .filter(|global_id| !residents.contains_key(global_id))
+                    .collect::<Vec<_>>();
+                if unresolved.is_empty() {
+                    self.gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                        .await
+                } else if unresolved
+                    .iter()
+                    .any(|global_id| self.core.cache.contains(*global_id))
+                {
+                    let state = qualification.as_ref().expect("treatment state exists");
+                    state
+                        .sequential_fallback_source_sets_due_ram_residency
+                        .fetch_add(1, Ordering::Relaxed);
+                    state
+                        .sequential_fallback_source_experts
+                        .fetch_add(unresolved.len() as u64, Ordering::Relaxed);
+                    self.gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                        .await
+                } else {
+                    let state = qualification.as_ref().expect("treatment state exists");
+                    state
+                        .batch_eligible_all_ram_miss_source_sets
+                        .fetch_add(1, Ordering::Relaxed);
+                    state
+                        .batch_eligible_source_experts
+                        .fetch_add(unresolved.len() as u64, Ordering::Relaxed);
+                    self.gpu_native_qualification_batch_source(&unresolved, residents)
+                        .await
+                }
             }
             Some(GpuNativeDemandSourceQualificationArm::Control) | None => {
-                let mut result = Ok(());
-                for &global_id in global_ids {
-                    if residents.contains_key(&global_id) {
-                        continue;
-                    }
-                    let individual_started = Instant::now();
-                    let source_result = self
-                        .gpu_native_demand_source(global_id, residents)
-                        .await
-                        .map(|_| ());
-                    if let Some(state) = qualification.as_ref() {
-                        state.individual_source_service_us.fetch_add(
-                            qualification_elapsed_us(individual_started),
-                            Ordering::Relaxed,
-                        );
-                    }
-                    if let Err(error) = source_result {
-                        result = Err(error);
-                        break;
-                    }
-                }
-                result
+                self.gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                    .await
             }
         };
         if let Some(state) = qualification.as_ref() {
@@ -4674,10 +4739,40 @@ impl Engine {
         result
     }
 
-    /// PR2-A treatment seam. It probes RAM in original demand order, reserves
+    /// The exact ordinary foreground source loop shared by control and the
+    /// treatment's conservative RAM-residency fallback. It owns every real
+    /// recency mutation, hit/miss classification, retry, eviction, insertion,
+    /// and request-order side effect.
+    async fn gpu_native_sequential_source_physical_missing_set(
+        self: &Arc<Self>,
+        global_ids: &[u32],
+        residents: &mut HashMap<u32, Arc<ExpertResident>>,
+    ) -> Result<(), GpuNativeDemandResidencyError> {
+        for &global_id in global_ids {
+            if residents.contains_key(&global_id) {
+                continue;
+            }
+            let individual_started = Instant::now();
+            let source_result = self
+                .gpu_native_demand_source(global_id, residents)
+                .await
+                .map(|_| ());
+            if let Some(state) = self.gpu_native_demand_source_qualification() {
+                state.individual_source_service_us.fetch_add(
+                    qualification_elapsed_us(individual_started),
+                    Ordering::Relaxed,
+                );
+            }
+            source_result?;
+        }
+        Ok(())
+    }
+
+    /// PR2-A treatment seam for a source set already proven to be entirely
+    /// absent from RAM by a non-recency-mutating eligibility scan. It reserves
     /// only primary-pool buffers by simulating the existing sequential cache
-    /// victim schedule, dispatches true RAM misses through the existing NVMe
-    /// batch primitive, and commits successful residents in request order.
+    /// victim schedule, dispatches the unavoidable misses through the existing
+    /// NVMe batch primitive, and commits successful residents in request order.
     async fn gpu_native_qualification_batch_source(
         self: &Arc<Self>,
         global_ids: &[u32],
@@ -4687,37 +4782,31 @@ impl Engine {
             .gpu_native_demand_source_qualification()
             .filter(|state| state.arm == GpuNativeDemandSourceQualificationArm::Treatment)
             .ok_or(GpuNativeDemandResidencyError::QualificationTreatmentNotEnabled)?;
-        qualification
-            .batch_path_exercises
-            .fetch_add(1, Ordering::Relaxed);
-
-        let mut nvme_ids = Vec::new();
-        for &global_id in global_ids {
-            if residents.contains_key(&global_id) {
-                continue;
-            }
-            qualification.record_source_request(global_id);
-            match self.core.cache.get(global_id) {
-                Some(resident) => {
-                    qualification
-                        .source_ram_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                    residents.insert(global_id, resident);
-                }
-                None => {
-                    qualification
-                        .source_ram_misses
-                        .fetch_add(1, Ordering::Relaxed);
-                    nvme_ids.push(global_id);
-                }
-            }
-        }
-        if nvme_ids.is_empty() {
+        if global_ids.is_empty() {
             return Ok(());
         }
+        if global_ids
+            .iter()
+            .any(|global_id| self.core.cache.contains(*global_id))
+        {
+            qualification
+                .mixed_ram_state_batch_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(
+                GpuNativeDemandResidencyError::QualificationMixedRamStateBatchAttempt {
+                    global_ids: global_ids.to_vec(),
+                },
+            );
+        }
 
-        let _demand_pins =
-            QualificationDemandPins::install(self.core.cache.clone(), global_ids);
+        let nvme_ids = global_ids.to_vec();
+        for &global_id in global_ids {
+            qualification.record_source_request(global_id);
+            qualification
+                .source_ram_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
         let mut requested_per_layer = HashMap::<usize, usize>::new();
         for &global_id in global_ids {
             *requested_per_layer
@@ -4800,6 +4889,7 @@ impl Engine {
             buffers.push(buffer);
         }
 
+        qualification.record_actual_batch_nvme_width(nvme_ids.len());
         if nvme_ids.len() > 1 {
             qualification
                 .concurrent_source_reads
@@ -8019,7 +8109,13 @@ mod tests {
         assert_eq!(snapshot.source_ram_misses, 0);
         assert_eq!(snapshot.source_nvme_reads, 0);
         assert_eq!(snapshot.source_nvme_bytes, 0);
-        assert_eq!(snapshot.batch_path_exercises, 1);
+        assert_eq!(snapshot.batch_path_exercises, 0);
+        assert_eq!(
+            snapshot.sequential_fallback_source_sets_due_ram_residency,
+            1
+        );
+        assert_eq!(snapshot.sequential_fallback_source_experts, 2);
+        assert_eq!(snapshot.mixed_ram_state_batch_attempts, 0);
         assert_eq!(engine.report().bytes_read, before_bytes);
     }
 
@@ -8052,6 +8148,13 @@ mod tests {
         assert_eq!(snapshot.source_nvme_reads, 1);
         assert_eq!(snapshot.concurrent_source_reads, 0);
         assert_eq!(snapshot.ram_cache_inserts, 1);
+        assert_eq!(snapshot.batch_eligible_all_ram_miss_source_sets, 1);
+        assert_eq!(snapshot.batch_eligible_source_experts, 1);
+        assert_eq!(snapshot.batch_path_exercises, 1);
+        assert_eq!(snapshot.actual_batch_nvme_width_min, 1);
+        assert_eq!(snapshot.actual_batch_nvme_width_max, 1);
+        assert_eq!(snapshot.actual_batch_nvme_width_mean, 1.0);
+        assert_eq!(snapshot.mixed_ram_state_batch_attempts, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -8083,6 +8186,13 @@ mod tests {
         assert_eq!(snapshot.demand_ram_insert_ids_sha256, expected.hex());
         assert_eq!(snapshot.source_nvme_reads, 3);
         assert_eq!(snapshot.concurrent_source_reads, 3);
+        assert_eq!(snapshot.batch_eligible_all_ram_miss_source_sets, 1);
+        assert_eq!(snapshot.batch_eligible_source_experts, 3);
+        assert_eq!(snapshot.batch_path_exercises, 1);
+        assert_eq!(snapshot.actual_batch_nvme_width_min, 3);
+        assert_eq!(snapshot.actual_batch_nvme_width_max, 3);
+        assert_eq!(snapshot.actual_batch_nvme_width_mean, 3.0);
+        assert_eq!(snapshot.mixed_ram_state_batch_attempts, 0);
         assert!(snapshot.deterministic_cache_commit_reconciliation);
     }
 
@@ -8103,32 +8213,169 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn qualification_batch_mixed_hit_and_misses_reads_only_true_misses() {
-        let dir = TempDir::new("qualification-mixed");
-        let engine = build_engine(&dir.path, 6, 8, 8, 4, 3, 1, 17);
-        let mut priming = HashMap::new();
-        let hit = engine
-            .gpu_native_demand_source(1, &mut priming)
-            .await
-            .unwrap();
+    async fn qualification_mixed_hit_and_misses_use_exact_sequential_fallback() {
+        let control_dir = TempDir::new("qualification-mixed-control");
+        let treatment_dir = TempDir::new("qualification-mixed-treatment");
+        let control = build_engine(&control_dir.path, 6, 8, 8, 4, 3, 1, 17);
+        let treatment = build_engine(&treatment_dir.path, 6, 8, 8, 4, 3, 1, 17);
+        for engine in [&control, &treatment] {
+            let mut priming = HashMap::new();
+            engine
+                .gpu_native_demand_source(1, &mut priming)
+                .await
+                .unwrap();
+            drop(priming);
+        }
+        enable_source_arm(&control, GpuNativeDemandSourceQualificationArm::Control);
         enable_source_arm(
-            &engine,
+            &treatment,
             GpuNativeDemandSourceQualificationArm::Treatment,
         );
-        let mut residents = HashMap::new();
-        engine
-            .gpu_native_source_physical_missing_set(&[1, 2, 3], &mut residents)
+
+        let requested = [1, 2, 3];
+        let mut control_residents = HashMap::new();
+        control
+            .gpu_native_source_physical_missing_set(&requested, &mut control_residents)
             .await
             .unwrap();
-        assert!(Arc::ptr_eq(&hit, &residents[&1]));
-        let snapshot = engine
+        let mut treatment_residents = HashMap::new();
+        treatment
+            .gpu_native_source_physical_missing_set(&requested, &mut treatment_residents)
+            .await
+            .unwrap();
+        for id in requested {
+            assert_eq!(control_residents[&id].data(), treatment_residents[&id].data());
+        }
+
+        let control_snapshot = control
             .gpu_native_demand_source_qualification_snapshot()
             .unwrap();
-        assert_eq!(snapshot.source_ram_hits, 1);
-        assert_eq!(snapshot.source_ram_misses, 2);
-        assert_eq!(snapshot.source_nvme_reads, 2);
-        assert_eq!(snapshot.concurrent_source_reads, 2);
-        assert_eq!(snapshot.ram_cache_inserts, 2);
+        let treatment_snapshot = treatment
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        assert_eq!(control_snapshot.source_ram_hits, treatment_snapshot.source_ram_hits);
+        assert_eq!(control_snapshot.source_ram_hits, 1);
+        assert_eq!(control_snapshot.source_ram_misses, treatment_snapshot.source_ram_misses);
+        assert_eq!(control_snapshot.source_ram_misses, 2);
+        assert_eq!(control_snapshot.source_nvme_reads, treatment_snapshot.source_nvme_reads);
+        assert_eq!(control_snapshot.source_nvme_reads, 2);
+        assert_eq!(control_snapshot.source_nvme_bytes, treatment_snapshot.source_nvme_bytes);
+        assert_eq!(control_snapshot.ram_cache_inserts, treatment_snapshot.ram_cache_inserts);
+        assert_eq!(control_snapshot.ram_cache_inserts, 2);
+        assert_eq!(treatment_snapshot.batch_path_exercises, 0);
+        assert_eq!(treatment_snapshot.concurrent_source_reads, 0);
+        assert_eq!(
+            treatment_snapshot.sequential_fallback_source_sets_due_ram_residency,
+            1
+        );
+        assert_eq!(treatment_snapshot.sequential_fallback_source_experts, 3);
+        assert_eq!(treatment_snapshot.mixed_ram_state_batch_attempts, 0);
+        assert_eq!(
+            control_snapshot.demand_ram_insert_ids_sha256,
+            treatment_snapshot.demand_ram_insert_ids_sha256
+        );
+        assert_eq!(
+            control_snapshot.demand_ram_eviction_ids_sha256,
+            treatment_snapshot.demand_ram_eviction_ids_sha256
+        );
+        assert_eq!(control.core.cache.resident_ids(), treatment.core.cache.resident_ids());
+        assert_eq!(
+            control.core.cache.qualification_state_sha256(),
+            treatment.core.cache.qualification_state_sha256()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qualification_mixed_eviction_falls_back_before_mutating_classification() {
+        let control_dir = TempDir::new("qualification-mixed-eviction-control");
+        let treatment_dir = TempDir::new("qualification-mixed-eviction-treatment");
+        let control = build_engine(&control_dir.path, 4, 8, 8, 2, 1, 1, 17);
+        let treatment = build_engine(&treatment_dir.path, 4, 8, 8, 2, 1, 1, 17);
+        for engine in [&control, &treatment] {
+            let mut priming = HashMap::new();
+            for id in [1, 0] {
+                engine
+                    .gpu_native_demand_source(id, &mut priming)
+                    .await
+                    .unwrap();
+            }
+            drop(priming);
+            assert_eq!(engine.core.cache.resident_ids(), vec![0, 1]);
+        }
+        let treatment_state_before_probe = treatment.core.cache.qualification_state_sha256();
+        assert!(treatment.core.cache.contains(1));
+        assert_eq!(
+            treatment.core.cache.qualification_state_sha256(),
+            treatment_state_before_probe
+        );
+
+        enable_source_arm(&control, GpuNativeDemandSourceQualificationArm::Control);
+        enable_source_arm(
+            &treatment,
+            GpuNativeDemandSourceQualificationArm::Treatment,
+        );
+        let requested = [2, 1];
+        let mut control_residents = HashMap::new();
+        control
+            .gpu_native_source_physical_missing_set(&requested, &mut control_residents)
+            .await
+            .unwrap();
+        let mut treatment_residents = HashMap::new();
+        treatment
+            .gpu_native_source_physical_missing_set(&requested, &mut treatment_residents)
+            .await
+            .unwrap();
+
+        let control_snapshot = control
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        let treatment_snapshot = treatment
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        assert_eq!(control_snapshot.source_ram_hits, 0);
+        assert_eq!(treatment_snapshot.source_ram_hits, 0);
+        assert_eq!(control_snapshot.source_ram_misses, 2);
+        assert_eq!(treatment_snapshot.source_ram_misses, 2);
+        assert_eq!(control_snapshot.source_nvme_reads, 2);
+        assert_eq!(treatment_snapshot.source_nvme_reads, 2);
+        assert_eq!(control_snapshot.source_nvme_bytes, treatment_snapshot.source_nvme_bytes);
+        assert_eq!(control_snapshot.ram_cache_inserts, 2);
+        assert_eq!(treatment_snapshot.ram_cache_inserts, 2);
+        assert_eq!(control_snapshot.ram_cache_evictions, 2);
+        assert_eq!(treatment_snapshot.ram_cache_evictions, 2);
+        assert_eq!(
+            control_snapshot.demand_ram_insert_ids_sha256,
+            treatment_snapshot.demand_ram_insert_ids_sha256
+        );
+        assert_eq!(
+            control_snapshot.demand_ram_eviction_ids_sha256,
+            treatment_snapshot.demand_ram_eviction_ids_sha256
+        );
+        let mut expected_inserts = QualificationOrderedHasher::default();
+        expected_inserts.record_id(2);
+        expected_inserts.record_id(1);
+        assert_eq!(treatment_snapshot.demand_ram_insert_ids_sha256, expected_inserts.hex());
+        let mut expected_evictions = QualificationOrderedHasher::default();
+        expected_evictions.record_id(1);
+        expected_evictions.record_id(0);
+        assert_eq!(
+            treatment_snapshot.demand_ram_eviction_ids_sha256,
+            expected_evictions.hex()
+        );
+        assert_eq!(treatment_snapshot.batch_path_exercises, 0);
+        assert_eq!(
+            treatment_snapshot.sequential_fallback_source_sets_due_ram_residency,
+            1
+        );
+        assert_eq!(treatment_snapshot.sequential_fallback_source_experts, 2);
+        assert_eq!(treatment_snapshot.mixed_ram_state_batch_attempts, 0);
+        assert_eq!(treatment.core.cache.pinned_count(), 0);
+        assert_eq!(control.core.cache.resident_ids(), vec![1, 2]);
+        assert_eq!(control.core.cache.resident_ids(), treatment.core.cache.resident_ids());
+        assert_eq!(
+            control.core.cache.qualification_state_sha256(),
+            treatment.core.cache.qualification_state_sha256()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8201,7 +8448,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn qualification_batch_read_error_inserts_no_malformed_resident_and_clears_pins() {
+    async fn qualification_batch_read_error_inserts_no_malformed_resident_or_stale_state() {
         let dir = TempDir::new("qualification-read-error");
         let engine = build_engine(&dir.path, 4, 8, 8, 4, 1, 1, 17);
         let path = dir.path.join("expert_3.bin");

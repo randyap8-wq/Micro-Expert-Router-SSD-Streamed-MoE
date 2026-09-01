@@ -91,6 +91,9 @@ pub(crate) struct ArmReport {
     failure: Option<BenchmarkFailure>,
     isolated_runtime: bool,
     warmup_results: Vec<WarmupEvidence>,
+    warmup_source: Option<GpuNativeDemandSourceQualificationSnapshot>,
+    warmup_ram_cache_state_sha256: Option<String>,
+    warmup_work: Option<ArmWorkEvidence>,
     source: Option<GpuNativeDemandSourceQualificationSnapshot>,
     work: Option<ArmWorkEvidence>,
     benchmark: BenchmarkReport,
@@ -101,6 +104,19 @@ pub(crate) struct Reconciliation {
     generated_tokens_exact: bool,
     generated_token_hashes_exact: bool,
     warmup_token_hashes_exact: bool,
+    warmup_source_requests_exact: bool,
+    warmup_ram_source_hits_exact: bool,
+    warmup_ram_source_misses_exact: bool,
+    warmup_nvme_reads_exact: bool,
+    warmup_nvme_bytes_exact: bool,
+    warmup_ram_cache_inserts_exact: bool,
+    warmup_ram_cache_evictions_exact: bool,
+    warmup_ordered_ram_insert_ids_exact: bool,
+    warmup_ordered_ram_eviction_ids_exact: bool,
+    warmup_physical_missing_sequence_exact: bool,
+    warmup_demand_source_sequence_exact: bool,
+    warmup_ram_cache_state_exact: bool,
+    warmup_all_speculative_work_zero: bool,
     selected_route_sequence_exact: bool,
     selected_route_counts_exact: bool,
     physical_missing_sequence_exact: bool,
@@ -157,10 +173,12 @@ pub(crate) struct WorkEquivalenceGate {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct MechanismGate {
-    treatment_source_set_width_gt_one: bool,
+    treatment_batch_eligible_all_ram_miss_source_sets_gt_zero: bool,
     treatment_batch_path_exercised: bool,
     control_batch_path_not_exercised: bool,
     concurrent_source_reads_gt_zero: bool,
+    treatment_actual_batch_nvme_width_max_gt_one: bool,
+    treatment_mixed_ram_state_batch_attempts_zero: bool,
     deterministic_cache_commit_reconciliation: bool,
     no_pool_capacity_failure: bool,
     no_batch_read_failure: bool,
@@ -382,6 +400,37 @@ fn validate_isolation_config(cfg: &crate::config::Config) -> Result<(), Benchmar
             "PR2-A requires storage.predict_fanout=0 and every locality/speculator/affinity/pregate/static-residency arm disabled",
         ));
     }
+    if cfg.storage.pin_after_observations != 0 {
+        return Err(BenchmarkFailure::new(
+            "preflight",
+            "observation-pinning-must-be-disabled",
+            format!(
+                "PR2-A requires storage.pin_after_observations=0; observed {}",
+                cfg.storage.pin_after_observations
+            ),
+        ));
+    }
+    if predictive.cost_aware_eviction {
+        return Err(BenchmarkFailure::new(
+            "preflight",
+            "cost-aware-eviction-must-be-disabled",
+            "PR2-A requires predictive.cost_aware_eviction=false so victim ordering is strict LRU",
+        ));
+    }
+    if cfg.storage.packed_blob.is_some() {
+        return Err(BenchmarkFailure::new(
+            "preflight",
+            "packed-blob-must-be-disabled",
+            "PR2-A requires storage.packed_blob to be unset so the treatment measures ordinary per-file reads",
+        ));
+    }
+    if cfg.storage.packed_manifest.is_some() {
+        return Err(BenchmarkFailure::new(
+            "preflight",
+            "packed-manifest-must-be-disabled",
+            "PR2-A requires storage.packed_manifest to be unset so the treatment measures ordinary per-file reads",
+        ));
+    }
     Ok(())
 }
 
@@ -552,36 +601,83 @@ async fn run_arm(
 
     let mut warmup_results = Vec::with_capacity(FROZEN_WARMUP_RUNS);
     let mut execution_failure = None;
-    for index in 0..FROZEN_WARMUP_RUNS {
-        let result = crate::with_progress_timeout(
-            format!("{MODE} {arm_name} warmup {index}"),
-            args.progress_watchdog,
-            crate::gpu_native_real_benchmark::execute_request(
-                &runtime,
-                &prepared.prompt_ids,
-                FROZEN_OUTPUT_TOKENS,
-                index,
-            ),
-        )
-        .await;
-        match result {
-            Ok(run) => {
-                warmup_results.push(WarmupEvidence {
-                    run_index: index,
-                    generated_tokens: run.generated_tokens,
-                    generated_token_ids_sha256: run.generated_token_ids_sha256,
-                    generated_text_sha256: run.generated_text_sha256,
-                });
-                benchmark.warmup_runs_completed += 1;
+    let mut warmup_start = match ArmStart::capture(&runtime) {
+        Ok(captured) => Some(captured),
+        Err(error) => {
+            execution_failure = Some(error);
+            None
+        }
+    };
+    if execution_failure.is_none() {
+        for index in 0..FROZEN_WARMUP_RUNS {
+            let result = crate::with_progress_timeout(
+                format!("{MODE} {arm_name} warmup {index}"),
+                args.progress_watchdog,
+                crate::gpu_native_real_benchmark::execute_request(
+                    &runtime,
+                    &prepared.prompt_ids,
+                    FROZEN_OUTPUT_TOKENS,
+                    index,
+                ),
+            )
+            .await;
+            match result {
+                Ok(run) => {
+                    warmup_results.push(WarmupEvidence {
+                        run_index: index,
+                        generated_tokens: run.generated_tokens,
+                        generated_token_ids_sha256: run.generated_token_ids_sha256,
+                        generated_text_sha256: run.generated_text_sha256,
+                    });
+                    benchmark.warmup_runs_completed += 1;
+                }
+                Err(error) => {
+                    execution_failure = Some(BenchmarkFailure::new(
+                        "inference",
+                        "warmup-request-failed",
+                        error.to_string(),
+                    ));
+                    break;
+                }
             }
-            Err(error) => {
-                execution_failure = Some(BenchmarkFailure::new(
-                    "inference",
-                    "warmup-request-failed",
-                    error.to_string(),
-                ));
-                break;
-            }
+        }
+    }
+
+    let mut warmup_source = None;
+    let mut warmup_ram_cache_state_sha256 = None;
+    let mut warmup_work = None;
+    if execution_failure.is_none() {
+        warmup_source = runtime
+            .engine
+            .gpu_native_demand_source_qualification_snapshot();
+        if warmup_source.is_none() {
+            execution_failure = Some(BenchmarkFailure::new(
+                "postcondition",
+                "missing-warmup-source-snapshot",
+                "PR2-A qualification source counters disappeared after warmup",
+            ));
+        }
+    }
+    if execution_failure.is_none() {
+        warmup_ram_cache_state_sha256 = runtime
+            .engine
+            .gpu_native_demand_source_qualification_ram_cache_state_sha256();
+        if warmup_ram_cache_state_sha256.is_none() {
+            execution_failure = Some(BenchmarkFailure::new(
+                "postcondition",
+                "missing-warmup-ram-cache-state",
+                "PR2-A RAM-cache state could not be hashed before the warmup counter reset",
+            ));
+        }
+    }
+    if execution_failure.is_none() {
+        match warmup_start
+            .take()
+            .expect("warmup start captured")
+            .finish(&runtime)
+        {
+            Ok(work) => warmup_work = Some(work),
+            Err(error) => execution_failure = Some(error),
         }
     }
 
@@ -674,6 +770,9 @@ async fn run_arm(
         failure: execution_failure,
         isolated_runtime: true,
         warmup_results,
+        warmup_source,
+        warmup_ram_cache_state_sha256,
+        warmup_work,
         source,
         work,
         benchmark,
@@ -696,6 +795,17 @@ fn recovery_semantics_equal(a: GpuNativeRecoverySnapshot, b: GpuNativeRecoverySn
         && a.invalid_tail_layers_encoded == b.invalid_tail_layers_encoded
 }
 
+fn arm_all_speculative_work_zero(work: &ArmWorkEvidence) -> bool {
+    work.gpu_native_residency.speculative_requests == 0
+        && work.gpu_native_residency.speculative_vram_hits == 0
+        && work.gpu_native_residency.speculative_ram_to_vram_installs == 0
+        && work
+            .gpu_native_residency
+            .speculative_dropped_capacity_or_pressure
+            == 0
+        && work.engine_storage.prefetch_completed == 0
+}
+
 fn reconcile(control: &ArmReport, treatment: &ArmReport) -> Reconciliation {
     let c = control.work.as_ref().expect("complete control work");
     let t = treatment.work.as_ref().expect("complete treatment work");
@@ -704,6 +814,22 @@ fn reconcile(control: &ArmReport, treatment: &ArmReport) -> Reconciliation {
         .source
         .as_ref()
         .expect("complete treatment source");
+    let cws = control
+        .warmup_source
+        .as_ref()
+        .expect("complete control warmup source");
+    let tws = treatment
+        .warmup_source
+        .as_ref()
+        .expect("complete treatment warmup source");
+    let cww = control
+        .warmup_work
+        .as_ref()
+        .expect("complete control warmup work");
+    let tww = treatment
+        .warmup_work
+        .as_ref()
+        .expect("complete treatment warmup work");
     let generated_tokens_exact = generated_results(control)
         .iter()
         .map(|run| run.generated_tokens)
@@ -741,24 +867,32 @@ fn reconcile(control: &ArmReport, treatment: &ArmReport) -> Reconciliation {
         && t.token_loop.fatal_failures == 0
         && c.token_loop.no_progress_failures == 0
         && t.token_loop.no_progress_failures == 0;
-    let all_speculative_work_zero = c.gpu_native_residency.speculative_requests == 0
-        && t.gpu_native_residency.speculative_requests == 0
-        && c.gpu_native_residency.speculative_vram_hits == 0
-        && t.gpu_native_residency.speculative_vram_hits == 0
-        && c.gpu_native_residency.speculative_ram_to_vram_installs == 0
-        && t.gpu_native_residency.speculative_ram_to_vram_installs == 0
-        && c.gpu_native_residency
-            .speculative_dropped_capacity_or_pressure
-            == 0
-        && t.gpu_native_residency
-            .speculative_dropped_capacity_or_pressure
-            == 0
-        && c.engine_storage.prefetch_completed == 0
-        && t.engine_storage.prefetch_completed == 0;
+    let all_speculative_work_zero =
+        arm_all_speculative_work_zero(c) && arm_all_speculative_work_zero(t);
+    let warmup_all_speculative_work_zero =
+        arm_all_speculative_work_zero(cww) && arm_all_speculative_work_zero(tww);
     let mut result = Reconciliation {
         generated_tokens_exact,
         generated_token_hashes_exact,
         warmup_token_hashes_exact,
+        warmup_source_requests_exact: cws.demand_source_requests == tws.demand_source_requests,
+        warmup_ram_source_hits_exact: cws.source_ram_hits == tws.source_ram_hits,
+        warmup_ram_source_misses_exact: cws.source_ram_misses == tws.source_ram_misses,
+        warmup_nvme_reads_exact: cws.source_nvme_reads == tws.source_nvme_reads,
+        warmup_nvme_bytes_exact: cws.source_nvme_bytes == tws.source_nvme_bytes,
+        warmup_ram_cache_inserts_exact: cws.ram_cache_inserts == tws.ram_cache_inserts,
+        warmup_ram_cache_evictions_exact: cws.ram_cache_evictions == tws.ram_cache_evictions,
+        warmup_ordered_ram_insert_ids_exact: cws.demand_ram_insert_ids_sha256
+            == tws.demand_ram_insert_ids_sha256,
+        warmup_ordered_ram_eviction_ids_exact: cws.demand_ram_eviction_ids_sha256
+            == tws.demand_ram_eviction_ids_sha256,
+        warmup_physical_missing_sequence_exact: cws.physical_missing_ids_sha256
+            == tws.physical_missing_ids_sha256,
+        warmup_demand_source_sequence_exact: cws.demand_source_request_ids_sha256
+            == tws.demand_source_request_ids_sha256,
+        warmup_ram_cache_state_exact: control.warmup_ram_cache_state_sha256
+            == treatment.warmup_ram_cache_state_sha256,
+        warmup_all_speculative_work_zero,
         selected_route_sequence_exact,
         selected_route_counts_exact,
         physical_missing_sequence_exact,
@@ -806,6 +940,19 @@ fn reconcile(control: &ArmReport, treatment: &ArmReport) -> Reconciliation {
     result.all_invariants_pass = result.generated_tokens_exact
         && result.generated_token_hashes_exact
         && result.warmup_token_hashes_exact
+        && result.warmup_source_requests_exact
+        && result.warmup_ram_source_hits_exact
+        && result.warmup_ram_source_misses_exact
+        && result.warmup_nvme_reads_exact
+        && result.warmup_nvme_bytes_exact
+        && result.warmup_ram_cache_inserts_exact
+        && result.warmup_ram_cache_evictions_exact
+        && result.warmup_ordered_ram_insert_ids_exact
+        && result.warmup_ordered_ram_eviction_ids_exact
+        && result.warmup_physical_missing_sequence_exact
+        && result.warmup_demand_source_sequence_exact
+        && result.warmup_ram_cache_state_exact
+        && result.warmup_all_speculative_work_zero
         && result.selected_route_sequence_exact
         && result.selected_route_counts_exact
         && result.physical_missing_sequence_exact
@@ -861,10 +1008,12 @@ fn gates(reconciliation: &Reconciliation, control: &ArmReport, treatment: &ArmRe
         && reconciliation.recovery_semantics_exact
         && reconciliation.ordered_ram_insert_ids_exact
         && reconciliation.ordered_ram_eviction_ids_exact;
-    let mechanism_pass = ts.source_set_width_max > 1
+    let mechanism_pass = ts.batch_eligible_all_ram_miss_source_sets > 0
         && ts.batch_path_exercises > 0
         && cs.batch_path_exercises == 0
         && ts.concurrent_source_reads > 0
+        && ts.actual_batch_nvme_width_max > 1
+        && ts.mixed_ram_state_batch_attempts == 0
         && ts.deterministic_cache_commit_reconciliation
         && ts.pool_capacity_failures == 0
         && ts.batch_read_failures == 0;
@@ -893,10 +1042,14 @@ fn gates(reconciliation: &Reconciliation, control: &ArmReport, treatment: &ArmRe
             passed: work_pass,
         },
         mechanism: MechanismGate {
-            treatment_source_set_width_gt_one: ts.source_set_width_max > 1,
+            treatment_batch_eligible_all_ram_miss_source_sets_gt_zero: ts
+                .batch_eligible_all_ram_miss_source_sets
+                > 0,
             treatment_batch_path_exercised: ts.batch_path_exercises > 0,
             control_batch_path_not_exercised: cs.batch_path_exercises == 0,
             concurrent_source_reads_gt_zero: ts.concurrent_source_reads > 0,
+            treatment_actual_batch_nvme_width_max_gt_one: ts.actual_batch_nvme_width_max > 1,
+            treatment_mixed_ram_state_batch_attempts_zero: ts.mixed_ram_state_batch_attempts == 0,
             deterministic_cache_commit_reconciliation: ts.deterministic_cache_commit_reconciliation,
             no_pool_capacity_failure: ts.pool_capacity_failures == 0,
             no_batch_read_failure: ts.batch_read_failures == 0,
@@ -1120,6 +1273,48 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
 mod tests {
     use super::*;
 
+    fn isolation_config() -> crate::config::Config {
+        crate::config::Config {
+            server: crate::config::ServerConfig {
+                bind: "127.0.0.1:8080".into(),
+                max_tokens: 128,
+                session_ttl_secs: 0,
+                max_concurrent_requests: 0,
+                admission_min_free_blocks: 0,
+            },
+            performance: crate::config::PerformanceConfig::default(),
+            model: crate::config::ModelConfig {
+                data_dir: PathBuf::from("./data"),
+                num_experts: 8,
+                top_k: 2,
+                d_model: 64,
+                d_ff: 256,
+                expert_size: 4096,
+                num_layers: 1,
+                dtype: crate::inference::WeightDtype::F32,
+            },
+            storage: crate::config::StorageConfigToml {
+                cache_slots: 4,
+                block_align: 4096,
+                no_direct: false,
+                predict_fanout: 0,
+                pipeline_depth: crate::engine::DEFAULT_PIPELINE_DEPTH,
+                predict_min_prob: 0.0,
+                partial_load_fraction: 1.0,
+                pin_after_observations: 0,
+                packed_blob: None,
+                packed_manifest: None,
+            },
+            tokenizer: crate::config::TokenizerConfig::default(),
+            real_transformer: crate::config::RealTransformerConfig::default(),
+            sampling: crate::config::SamplingConfig::default(),
+            predictive: crate::config::PredictiveConfig::default(),
+            security: crate::config::SecurityConfig::default(),
+            gpu_cache: crate::config::GpuCacheConfig::default(),
+            distributed: crate::config::DistributedConfig::default(),
+        }
+    }
+
     #[test]
     fn frozen_workload_contract_is_literal() {
         assert_eq!(SCHEMA, "mer.gpu-native-demand-source-concurrency.v1");
@@ -1138,5 +1333,43 @@ mod tests {
         assert_eq!(comparison(10.0, 12.0).delta_percent, 20.0);
         assert_eq!(comparison(10.0, 8.0).delta_percent, -20.0);
         assert_eq!(comparison(0.0, 8.0).delta_percent, 0.0);
+    }
+
+    #[test]
+    fn preflight_rejects_source_mechanisms_that_confound_pr2a() {
+        let cfg = isolation_config();
+        validate_isolation_config(&cfg).expect("literal PR2-A isolation config");
+
+        let mut observation_pinning = cfg.clone();
+        observation_pinning.storage.pin_after_observations = 1;
+        assert_eq!(
+            validate_isolation_config(&observation_pinning)
+                .unwrap_err()
+                .code,
+            "observation-pinning-must-be-disabled"
+        );
+
+        let mut cost_aware = cfg.clone();
+        cost_aware.predictive.cost_aware_eviction = true;
+        assert_eq!(
+            validate_isolation_config(&cost_aware).unwrap_err().code,
+            "cost-aware-eviction-must-be-disabled"
+        );
+
+        let mut packed_blob = cfg.clone();
+        packed_blob.storage.packed_blob = Some(PathBuf::from("experts.bin"));
+        assert_eq!(
+            validate_isolation_config(&packed_blob).unwrap_err().code,
+            "packed-blob-must-be-disabled"
+        );
+
+        let mut packed_manifest = cfg;
+        packed_manifest.storage.packed_manifest = Some(PathBuf::from("experts.json"));
+        assert_eq!(
+            validate_isolation_config(&packed_manifest)
+                .unwrap_err()
+                .code,
+            "packed-manifest-must-be-disabled"
+        );
     }
 }
