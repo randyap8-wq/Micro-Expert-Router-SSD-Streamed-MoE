@@ -443,12 +443,27 @@ pub(crate) enum GpuNativeLiveSpeculativeInstall {
     Hit(GpuNativeQ4ExpertResidency),
     Installed {
         residency: GpuNativeQ4ExpertResidency,
-        replaced_global_id: Option<u32>,
+        victim_decision: Option<GpuNativeLiveVictimDecision>,
         prediction_protected_victim_skips: u64,
         forced_prediction_protected_eviction: bool,
     },
     DroppedCapacityOrPressure,
     StaleLogicalGeneration,
+}
+
+/// PR1C-E diagnostic-only snapshot captured under the physical layer lock at
+/// the exact destructive replacement decision. It is returned to the isolated
+/// live controller only; ordinary residency snapshots and schemas are
+/// intentionally unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativeLiveVictimDecision {
+    pub(crate) global_id: u32,
+    /// One-based position in the physical MRU-to-LRU order (MRU is rank 1).
+    pub(crate) physical_lru_rank: usize,
+    pub(crate) prediction_protected: bool,
+    pub(crate) last_actual_route_token_position: Option<usize>,
+    pub(crate) age_in_completed_tokens: Option<usize>,
+    pub(crate) never_observed: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -695,6 +710,22 @@ impl GpuNativeTieredResidencyManager {
             .is_some())
     }
 
+    /// PR1C-E qualification-only read of the exact current physical identity.
+    /// Like `has_current_for_demand`, this does not touch physical recency or
+    /// any production counter. The identity distinguishes direct reuse of the
+    /// original speculative install from later restoration of the same expert.
+    pub(crate) fn live_current_residency_for_diagnostic(
+        &self,
+        global_id: u32,
+    ) -> Result<Option<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
+        let identity = self.identity(global_id)?;
+        let layer = &self.layers[identity.layer_index];
+        let mut state = layer.state.lock();
+        Ok(self
+            .current_record_locked(global_id, layer, &mut state, false)?
+            .map(|record| record.residency))
+    }
+
     pub(crate) fn record_physical_source_acquisition(&self) {
         self.counters
             .physical_source_acquisitions
@@ -933,6 +964,8 @@ impl GpuNativeTieredResidencyManager {
         policy: GpuNativeLiveReplacementPolicy,
         protected_prediction_ids: &HashSet<u32>,
         route_last_seen_clock: &HashMap<u32, u64>,
+        route_last_seen_token_position: &HashMap<u32, usize>,
+        completed_token_position: usize,
         replacement_authorized: bool,
     ) -> Result<GpuNativeLiveSpeculativeInstall, GpuNativeTieredResidencyError> {
         let GpuNativeResidencyPriority::Speculative { score: _ } = priority else {
@@ -971,7 +1004,7 @@ impl GpuNativeTieredResidencyManager {
             return Ok(GpuNativeLiveSpeculativeInstall::StaleLogicalGeneration);
         }
 
-        let mut replaced_global_id = None;
+        let mut victim_decision = None;
         let mut prediction_protected_victim_skips = 0u64;
         let mut forced_prediction_protected_eviction = false;
         if state.residents.len() >= layer.arena.slot_capacity() {
@@ -988,8 +1021,15 @@ impl GpuNativeTieredResidencyManager {
             .ok_or(GpuNativeTieredResidencyError::NoPhysicalSlot {
                 layer_index: identity.layer_index,
             })?;
+            victim_decision = Some(live_victim_decision_evidence(
+                &state.residents,
+                victim,
+                policy,
+                protected_prediction_ids,
+                route_last_seen_token_position,
+                completed_token_position,
+            )?);
             self.retire_metadata_record_locked(victim, layer, &mut state, true)?;
-            replaced_global_id = Some(victim);
             prediction_protected_victim_skips = skipped;
             forced_prediction_protected_eviction = forced;
         }
@@ -1013,7 +1053,7 @@ impl GpuNativeTieredResidencyManager {
         };
         Ok(GpuNativeLiveSpeculativeInstall::Installed {
             residency,
-            replaced_global_id,
+            victim_decision,
             prediction_protected_victim_skips,
             forced_prediction_protected_eviction,
         })
@@ -1497,6 +1537,44 @@ fn select_live_speculative_victim<T>(
     Some((first, skipped, true))
 }
 
+fn live_victim_decision_evidence<T>(
+    residents: &LruCache<u32, T>,
+    victim: u32,
+    policy: GpuNativeLiveReplacementPolicy,
+    protected: &HashSet<u32>,
+    route_last_seen_token_position: &HashMap<u32, usize>,
+    completed_token_position: usize,
+) -> Result<GpuNativeLiveVictimDecision, GpuNativeTieredResidencyError> {
+    let physical_lru_rank = residents
+        .iter()
+        .position(|(&global_id, _)| global_id == victim)
+        .map(|rank| rank + 1)
+        .ok_or_else(|| GpuNativeTieredResidencyError::LivePostconditionFailed {
+            detail: format!("selected live speculative victim {victim} was not resident"),
+        })?;
+    let last_actual_route_token_position =
+        route_last_seen_token_position.get(&victim).copied();
+    let age_in_completed_tokens = last_actual_route_token_position
+        .map(|last| {
+            completed_token_position.checked_sub(last).ok_or_else(|| {
+                GpuNativeTieredResidencyError::LivePostconditionFailed {
+                    detail: format!(
+                        "live speculative victim {victim} last-route token {last} exceeds replacement token {completed_token_position}"
+                    ),
+                }
+            })
+        })
+        .transpose()?;
+    Ok(GpuNativeLiveVictimDecision {
+        global_id: victim,
+        physical_lru_rank,
+        prediction_protected: policy.prediction_protected() && protected.contains(&victim),
+        last_actual_route_token_position,
+        age_in_completed_tokens,
+        never_observed: last_actual_route_token_position.is_none(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1822,6 +1900,62 @@ mod tests {
             before
         );
         assert_eq!(oldest_unprotected(&residents, &HashSet::new()), Some(128));
+    }
+
+    #[test]
+    fn live_victim_decision_captures_locked_age_and_rank_without_touching_lru() {
+        let mut residents = LruCache::unbounded();
+        for id in 128..132 {
+            residents.put(id, ());
+        }
+        let before = residents
+            .iter()
+            .map(|(&global_id, _)| global_id)
+            .collect::<Vec<_>>();
+        let protected = HashSet::from([128]);
+        let selected = select_live_speculative_victim(
+            &residents,
+            GpuNativeLiveReplacementPolicy::PhysicalLruPredictionProtected,
+            &protected,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(selected, (129, 1, false));
+        let evidence = live_victim_decision_evidence(
+            &residents,
+            selected.0,
+            GpuNativeLiveReplacementPolicy::PhysicalLruPredictionProtected,
+            &protected,
+            &HashMap::from([(129, 17usize)]),
+            23,
+        )
+        .unwrap();
+        assert_eq!(evidence.global_id, 129);
+        assert_eq!(evidence.physical_lru_rank, 3);
+        assert!(!evidence.prediction_protected);
+        assert_eq!(evidence.last_actual_route_token_position, Some(17));
+        assert_eq!(evidence.age_in_completed_tokens, Some(6));
+        assert!(!evidence.never_observed);
+        assert_eq!(
+            residents
+                .iter()
+                .map(|(&global_id, _)| global_id)
+                .collect::<Vec<_>>(),
+            before
+        );
+
+        let never = live_victim_decision_evidence(
+            &residents,
+            130,
+            GpuNativeLiveReplacementPolicy::PhysicalLru,
+            &HashSet::new(),
+            &HashMap::new(),
+            23,
+        )
+        .unwrap();
+        assert_eq!(never.last_actual_route_token_position, None);
+        assert_eq!(never.age_in_completed_tokens, None);
+        assert!(never.never_observed);
     }
 
     #[test]

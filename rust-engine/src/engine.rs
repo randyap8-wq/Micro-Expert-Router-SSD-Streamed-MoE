@@ -4355,7 +4355,7 @@ impl Engine {
             ) {
                 Ok(residencies) => {
                     if let Some(controller) = live_controller {
-                        controller.record_demand_service_completed(global_ids);
+                        controller.record_demand_service_completed(global_ids, &residencies);
                     }
                     return Ok(residencies);
                 }
@@ -4687,6 +4687,8 @@ impl Engine {
                 task_controller.policy(),
                 ticket.protected_prediction_ids.as_ref(),
                 ticket.route_last_seen_clock.as_ref(),
+                ticket.route_last_seen_token_position.as_ref(),
+                ticket.completed_token_position,
                 replacement_needed,
             );
             match outcome {

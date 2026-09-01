@@ -7,8 +7,8 @@
 use crate::gpu_native_prefetch_shadow::{ShadowObserverError, ShadowPhase};
 use crate::gpu_native_residency::{
     GpuNativeLivePostconditionEvidence, GpuNativeLiveReplacementPolicy,
-    GpuNativeLiveSpeculativeInstall, GpuNativeQualificationInstallByteSnapshot,
-    GpuNativeTieredResidencyManager,
+    GpuNativeLiveSpeculativeInstall, GpuNativeLiveVictimDecision,
+    GpuNativeQualificationInstallByteSnapshot, GpuNativeTieredResidencyManager,
 };
 use crate::router::PredictiveLoader;
 use parking_lot::Mutex;
@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub(crate) const SCHEMA: &str = "mer.gpu-native-bounded-live-prefetch.v1";
+pub(crate) const SCHEMA: &str = "mer.gpu-native-bounded-live-prefetch.v2";
 pub(crate) const MODE: &str = "gpu-native-bounded-live-prefetch";
 pub(crate) const COMMAND: &str = "qualify-gpu-native-bounded-live-prefetch";
 pub(crate) const SOURCE_MAIN_COMMIT: &str = "e8b542110693e74aa8f1013bb16d1bed0bdd8ba7";
@@ -32,6 +32,7 @@ pub(crate) const PR1CB_COMMIT: &str = "7f313a5777b5cdb7394bcade1882abab54f0d797"
 pub(crate) const PR1CB_REPORT_SHA256: &str =
     "bca66b00ecb54e815aa5a5c5fdd3f6ae1317ae267f96b39484cb41e11c300811";
 pub(crate) const PR1CC_COMMIT: &str = "7309e53c3687f997a2143206e9e574858d4decaf";
+pub(crate) const PR1CD2_COMMIT: &str = "8cb3cbe2ffd561e37add6815a3e8c646d24c772d";
 
 pub(crate) const FROZEN_PREDICTOR: &str = "predictive-loader-second-order";
 pub(crate) const FROZEN_FANOUT: usize = 8;
@@ -168,6 +169,7 @@ struct CandidateRecord {
     boundary: u64,
     target_layer: usize,
     global_id: u32,
+    candidate_rank: usize,
     score: f64,
     prediction_at_us: u64,
     source_started_at_us: Option<u64>,
@@ -179,12 +181,44 @@ struct CandidateRecord {
     terminal: bool,
     installed: bool,
     used: bool,
+    installed_identity: Option<PhysicalInstallIdentity>,
+    directly_reused_by_demand: bool,
+    evicted_before_direct_reuse: bool,
+    used_only_after_later_restoration: bool,
     demand_join_counted: bool,
     victim_demand_harm_counted: bool,
+    victim_demanded_before_direct_payoff: bool,
     victim_restored_after_speculation: bool,
     unused_eviction_counted: bool,
-    replaced_global_id: Option<u32>,
+    victim_decision: Option<GpuNativeLiveVictimDecision>,
+    miss_introduced_by_victim_eviction: bool,
+    miss_boundary_introduced_by_victim_eviction: bool,
     abort_handle: Option<tokio::task::AbortHandle>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PhysicalInstallIdentity {
+    layer_index: usize,
+    local_expert_id: u32,
+    logical_generation: u64,
+    bank: u32,
+    slot: u32,
+    slot_epoch: u32,
+}
+
+impl From<crate::backend::gpu_native::GpuNativeQ4ExpertResidency> for PhysicalInstallIdentity {
+    fn from(residency: crate::backend::gpu_native::GpuNativeQ4ExpertResidency) -> Self {
+        let key = residency.key();
+        let location = residency.location();
+        Self {
+            layer_index: key.layer_index(),
+            local_expert_id: key.expert_id(),
+            logical_generation: key.logical_generation(),
+            bank: location.bank(),
+            slot: location.slot(),
+            slot_epoch: residency.slot_epoch(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -194,6 +228,7 @@ pub(crate) struct LiveLifecycleSample {
     pub(crate) boundary: u64,
     pub(crate) target_layer: usize,
     pub(crate) global_id: u32,
+    pub(crate) candidate_rank: usize,
     pub(crate) score: f64,
     pub(crate) terminal_classification: String,
 }
@@ -233,6 +268,12 @@ pub(crate) struct LiveLifecycleCounters {
     pub(crate) misses_introduced_by_speculative_eviction: u64,
     pub(crate) miss_boundaries_introduced_by_speculative_eviction: u64,
     pub(crate) speculative_expert_evicted_unused: u64,
+    pub(crate) speculative_install_directly_reused_by_demand: u64,
+    pub(crate) speculative_install_evicted_before_direct_reuse: u64,
+    pub(crate) speculative_install_never_directly_reused: u64,
+    pub(crate) speculative_install_used_only_after_later_reinstallation_or_non_speculative_restoration:
+        u64,
+    pub(crate) victim_demanded_before_candidate_direct_payoff: u64,
     pub(crate) prediction_protected_victim_skips: u64,
     pub(crate) forced_prediction_protected_evictions: u64,
     pub(crate) demand_independently_won_install_race: u64,
@@ -290,6 +331,185 @@ pub(crate) struct LiveTimingEvidence {
     pub(crate) lead_time_before_first_demand: LiveTimingSummary,
 }
 
+#[derive(Clone, Debug)]
+struct DestructiveReplacementEvent {
+    ticket_id: u64,
+    run_index: usize,
+    candidate_rank: usize,
+    candidate_score: f64,
+    victim_global_id: u32,
+    victim_physical_lru_rank: usize,
+    victim_prediction_protected: bool,
+    victim_last_actual_route_token_position: Option<usize>,
+    victim_age_in_completed_tokens: Option<usize>,
+    victim_never_observed: bool,
+    candidate_direct_payoff: bool,
+    candidate_evicted_unused: bool,
+    victim_demanded_before_payoff: bool,
+    miss_introduced: bool,
+    miss_boundary_introduced: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum DestructiveReplacementOutcomeClass {
+    CandidateDirectPayoffOnly,
+    CandidateEvictedUnusedWithoutVictimHarm,
+    VictimHarmWithoutCandidateDirectPayoff,
+    BothCandidateDirectPayoffAndVictimHarm,
+    NoCandidateDirectPayoffAndNoObservedVictimHarm,
+}
+
+impl DestructiveReplacementEvent {
+    fn outcome_class(&self) -> DestructiveReplacementOutcomeClass {
+        match (
+            self.candidate_direct_payoff,
+            self.candidate_evicted_unused,
+            self.victim_demanded_before_payoff,
+        ) {
+            (true, _, true) => {
+                DestructiveReplacementOutcomeClass::BothCandidateDirectPayoffAndVictimHarm
+            }
+            (true, _, false) => DestructiveReplacementOutcomeClass::CandidateDirectPayoffOnly,
+            (false, _, true) => {
+                DestructiveReplacementOutcomeClass::VictimHarmWithoutCandidateDirectPayoff
+            }
+            (false, true, false) => {
+                DestructiveReplacementOutcomeClass::CandidateEvictedUnusedWithoutVictimHarm
+            }
+            (false, false, false) => {
+                DestructiveReplacementOutcomeClass::NoCandidateDirectPayoffAndNoObservedVictimHarm
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct CandidateScoreSummary {
+    pub(crate) count: u64,
+    pub(crate) min: Option<f64>,
+    pub(crate) p50: Option<f64>,
+    pub(crate) p75: Option<f64>,
+    pub(crate) p90: Option<f64>,
+    pub(crate) p95: Option<f64>,
+    pub(crate) p99: Option<f64>,
+    pub(crate) max: Option<f64>,
+    pub(crate) mean: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct CandidateScoreCalibration {
+    pub(crate) all_replacements: CandidateScoreSummary,
+    pub(crate) direct_payoff_replacements: CandidateScoreSummary,
+    pub(crate) candidate_evicted_unused_replacements: CandidateScoreSummary,
+    pub(crate) victim_harm_replacements: CandidateScoreSummary,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct ReplacementOutcomeCounts {
+    pub(crate) replacement_count: u64,
+    pub(crate) candidate_direct_payoffs: u64,
+    pub(crate) candidate_evicted_unused: u64,
+    pub(crate) victim_demanded_before_payoff: u64,
+    pub(crate) both_candidate_direct_payoff_and_victim_harm: u64,
+    pub(crate) misses_introduced: u64,
+    pub(crate) miss_boundaries_introduced: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct MutuallyExclusiveReplacementOutcomes {
+    pub(crate) candidate_direct_payoff_only: u64,
+    pub(crate) candidate_evicted_unused_without_victim_harm: u64,
+    pub(crate) victim_harm_without_candidate_direct_payoff: u64,
+    pub(crate) both_candidate_direct_payoff_and_victim_harm: u64,
+    pub(crate) no_candidate_direct_payoff_and_no_observed_victim_harm: u64,
+    pub(crate) reconciliation_pass: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct CandidateRankOutcome {
+    pub(crate) candidate_rank: usize,
+    #[serde(flatten)]
+    pub(crate) outcomes: ReplacementOutcomeCounts,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct VictimAgeBucketOutcome {
+    pub(crate) victim_age_bucket: String,
+    #[serde(flatten)]
+    pub(crate) outcomes: ReplacementOutcomeCounts,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct CandidateRankVictimAgeOutcome {
+    pub(crate) candidate_rank: usize,
+    pub(crate) victim_age_bucket: String,
+    #[serde(flatten)]
+    pub(crate) outcomes: ReplacementOutcomeCounts,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct BoundedDestructiveReplacementSample {
+    pub(crate) ticket_id: u64,
+    pub(crate) run_index: usize,
+    pub(crate) candidate_rank: usize,
+    pub(crate) candidate_score: f64,
+    pub(crate) victim_global_id: u32,
+    pub(crate) victim_physical_lru_rank: usize,
+    pub(crate) victim_prediction_protected: bool,
+    pub(crate) victim_last_actual_route_token_position: Option<usize>,
+    pub(crate) victim_age_in_completed_tokens: Option<usize>,
+    pub(crate) victim_never_observed: bool,
+    pub(crate) outcome_class: DestructiveReplacementOutcomeClass,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct HistoricalEventFilterResult {
+    #[serde(flatten)]
+    pub(crate) outcomes: ReplacementOutcomeCounts,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct DiagnosticThresholdCalibrationRow {
+    pub(crate) candidate_score_percentile: String,
+    pub(crate) candidate_score_threshold_inclusive: f64,
+    pub(crate) victim_age_threshold_inclusive_completed_tokens: usize,
+    pub(crate) never_observed_victim_satisfies_age_threshold: bool,
+    pub(crate) admitted_historical_events: HistoricalEventFilterResult,
+    pub(crate) rejected_historical_events: HistoricalEventFilterResult,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct CalibrationReconciliationEvidence {
+    pub(crate) outcome_classes_sum_to_replacements: bool,
+    pub(crate) all_score_count_matches_replacements: bool,
+    pub(crate) candidate_rank_histogram_matches_replacements: bool,
+    pub(crate) victim_age_histogram_matches_replacements: bool,
+    pub(crate) joint_histogram_matches_replacements: bool,
+    pub(crate) every_replacement_has_rank_score_and_victim_decision: bool,
+    pub(crate) pass: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct DestructiveAdmissionCalibrationEvidence {
+    pub(crate) diagnostic_only: bool,
+    pub(crate) unbounded_replacement_event_log_emitted: bool,
+    pub(crate) replacement_count: u64,
+    pub(crate) direct_payoff_semantics: &'static str,
+    pub(crate) victim_age_semantics: &'static str,
+    pub(crate) physical_lru_rank_semantics: &'static str,
+    pub(crate) threshold_table_semantics: &'static str,
+    pub(crate) candidate_scores: CandidateScoreCalibration,
+    pub(crate) mutually_exclusive_outcomes: MutuallyExclusiveReplacementOutcomes,
+    pub(crate) candidate_rank_outcomes: Vec<CandidateRankOutcome>,
+    pub(crate) victim_age_outcomes: Vec<VictimAgeBucketOutcome>,
+    pub(crate) candidate_rank_x_victim_age_outcomes: Vec<CandidateRankVictimAgeOutcome>,
+    pub(crate) diagnostic_event_filter_threshold_table: Vec<DiagnosticThresholdCalibrationRow>,
+    pub(crate) bounded_replacement_samples: Vec<BoundedDestructiveReplacementSample>,
+    pub(crate) bounded_replacement_sample_limit: usize,
+    pub(crate) reconciliation: CalibrationReconciliationEvidence,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct LiveRunEvidence {
     pub(crate) arm: LiveArm,
@@ -298,6 +518,9 @@ pub(crate) struct LiveRunEvidence {
     pub(crate) counters: LiveLifecycleCounters,
     pub(crate) timing: LiveTimingEvidence,
     pub(crate) lifecycle_samples: Vec<LiveLifecycleSample>,
+    pub(crate) destructive_admission_calibration: DestructiveAdmissionCalibrationEvidence,
+    #[serde(skip_serializing)]
+    calibration_events: Vec<DestructiveReplacementEvent>,
     pub(crate) postconditions: GpuNativeLivePostconditionEvidence,
     pub(crate) counter_reconciliation_pass: bool,
     pub(crate) cancellation_reason_reconciliation_pass: bool,
@@ -333,6 +556,7 @@ struct ActiveRun {
     last_route: Option<RouteHistory>,
     route_clock: u64,
     route_last_seen_clock: HashMap<u32, u64>,
+    route_last_seen_token_position: HashMap<u32, usize>,
     candidates: BTreeMap<u64, CandidateRecord>,
     installs_reserved_by_boundary: HashMap<u64, usize>,
     replacements_reserved_by_boundary: HashMap<u64, usize>,
@@ -352,9 +576,11 @@ struct ControllerInner {
 pub(crate) struct LiveCandidateTicket {
     pub(crate) ticket_id: u64,
     pub(crate) global_id: u32,
+    pub(crate) completed_token_position: usize,
     pub(crate) score: f64,
     pub(crate) protected_prediction_ids: Arc<HashSet<u32>>,
     pub(crate) route_last_seen_clock: Arc<HashMap<u32, u64>>,
+    pub(crate) route_last_seen_token_position: Arc<HashMap<u32, usize>>,
 }
 
 pub(crate) struct GpuNativeBoundedLivePrefetchController {
@@ -428,6 +654,7 @@ impl GpuNativeBoundedLivePrefetchController {
             last_route: None,
             route_clock: 0,
             route_last_seen_clock: HashMap::new(),
+            route_last_seen_token_position: HashMap::new(),
             candidates: BTreeMap::new(),
             installs_reserved_by_boundary: HashMap::new(),
             replacements_reserved_by_boundary: HashMap::new(),
@@ -536,6 +763,8 @@ impl GpuNativeBoundedLivePrefetchController {
                 run.route_clock = run.route_clock.saturating_add(1);
                 for &global_id in &global_ids {
                     run.route_last_seen_clock.insert(global_id, run.route_clock);
+                    run.route_last_seen_token_position
+                        .insert(global_id, completed_token_position);
                 }
                 run.last_last_route = run.last_route.take();
                 run.last_route = Some(RouteHistory {
@@ -619,7 +848,8 @@ impl GpuNativeBoundedLivePrefetchController {
                 }
                 continue;
             }
-            let Some(ticket) = self.accept_candidate(&pending, candidate, protected.clone())?
+            let Some(ticket) =
+                self.accept_candidate(&pending, candidate, rank + 1, protected.clone())?
             else {
                 continue;
             };
@@ -632,6 +862,7 @@ impl GpuNativeBoundedLivePrefetchController {
         &self,
         pending: &PendingTarget,
         candidate: &FrozenCandidate,
+        candidate_rank: usize,
         protected: Arc<HashSet<u32>>,
     ) -> Result<Option<LiveCandidateTicket>, ShadowObserverError> {
         let mut inner = self.inner.lock();
@@ -662,6 +893,7 @@ impl GpuNativeBoundedLivePrefetchController {
                 boundary: pending.boundary,
                 target_layer: pending.target_layer,
                 global_id: candidate.global_id,
+                candidate_rank,
                 score: candidate.score,
                 prediction_at_us: pending.prediction_at_us,
                 source_started_at_us: None,
@@ -673,20 +905,31 @@ impl GpuNativeBoundedLivePrefetchController {
                 terminal: false,
                 installed: false,
                 used: false,
+                installed_identity: None,
+                directly_reused_by_demand: false,
+                evicted_before_direct_reuse: false,
+                used_only_after_later_restoration: false,
                 demand_join_counted: false,
                 victim_demand_harm_counted: false,
+                victim_demanded_before_direct_payoff: false,
                 victim_restored_after_speculation: false,
                 unused_eviction_counted: false,
-                replaced_global_id: None,
+                victim_decision: None,
+                miss_introduced_by_victim_eviction: false,
+                miss_boundary_introduced_by_victim_eviction: false,
                 abort_handle: None,
             },
         );
         Ok(Some(LiveCandidateTicket {
             ticket_id,
             global_id: candidate.global_id,
+            completed_token_position: pending.completed_token_position,
             score: candidate.score,
             protected_prediction_ids: protected,
             route_last_seen_clock: Arc::new(run.route_last_seen_clock.clone()),
+            route_last_seen_token_position: Arc::new(
+                run.route_last_seen_token_position.clone(),
+            ),
         }))
     }
 
@@ -792,15 +1035,43 @@ impl GpuNativeBoundedLivePrefetchController {
     /// complete selected set. This closes the race where a speculative install
     /// finishes after the target probe but early enough for that same demand
     /// transaction to reuse it.
-    pub(crate) fn record_demand_service_completed(&self, global_ids: &[u32]) {
-        let selected = global_ids.iter().copied().collect::<HashSet<_>>();
+    pub(crate) fn record_demand_service_completed(
+        &self,
+        global_ids: &[u32],
+        residencies: &[crate::backend::gpu_native::GpuNativeQ4ExpertResidency],
+    ) {
+        if global_ids.len() != residencies.len() {
+            let mut inner = self.inner.lock();
+            if let Some(run) = inner.run.as_mut() {
+                run.failure.get_or_insert_with(|| {
+                    format!(
+                        "demand service returned {} physical identities for {} selected experts",
+                        residencies.len(),
+                        global_ids.len()
+                    )
+                });
+            }
+            return;
+        }
+        let selected = global_ids
+            .iter()
+            .copied()
+            .zip(residencies.iter().copied().map(PhysicalInstallIdentity::from))
+            .collect::<HashMap<_, _>>();
+        self.record_demand_service_completed_with_identities(&selected);
+    }
+
+    fn record_demand_service_completed_with_identities(
+        &self,
+        selected: &HashMap<u32, PhysicalInstallIdentity>,
+    ) {
         let mut inner = self.inner.lock();
         let Some(run) = inner.run.as_mut() else {
             return;
         };
         for record in run.candidates.values_mut() {
             if record.first_demand_at_us.is_some()
-                && selected.contains(&record.global_id)
+                && selected.contains_key(&record.global_id)
                 && record.installed
                 && !record.used
             {
@@ -810,6 +1081,15 @@ impl GpuNativeBoundedLivePrefetchController {
                     .demand_reused_speculative_result
                     .saturating_add(1);
                 run.counters.prediction_useful = run.counters.prediction_useful.saturating_add(1);
+            }
+            if record.installed {
+                if let Some(&current_identity) = selected.get(&record.global_id) {
+                    classify_direct_or_restored_reuse(
+                        &mut run.counters,
+                        record,
+                        Some(current_identity),
+                    );
+                }
             }
         }
     }
@@ -879,15 +1159,16 @@ impl GpuNativeBoundedLivePrefetchController {
                 self.record_demand_or_peer_won_install_race(ticket_id);
             }
             GpuNativeLiveSpeculativeInstall::Installed {
-                residency: _,
-                replaced_global_id,
+                residency,
+                victim_decision,
                 prediction_protected_victim_skips,
                 forced_prediction_protected_eviction,
             } => {
-                self.record_installed(
+                self.record_installed_with_identity(
                     ticket_id,
                     h2d_bytes,
-                    replaced_global_id,
+                    PhysicalInstallIdentity::from(residency),
+                    victim_decision,
                     prediction_protected_victim_skips,
                     forced_prediction_protected_eviction,
                 );
@@ -926,11 +1207,12 @@ impl GpuNativeBoundedLivePrefetchController {
         );
     }
 
-    fn record_installed(
+    fn record_installed_with_identity(
         &self,
         ticket_id: u64,
         h2d_bytes: u64,
-        replaced_global_id: Option<u32>,
+        installed_identity: PhysicalInstallIdentity,
+        victim_decision: Option<GpuNativeLiveVictimDecision>,
         prediction_protected_victim_skips: u64,
         forced_prediction_protected_eviction: bool,
     ) {
@@ -941,7 +1223,8 @@ impl GpuNativeBoundedLivePrefetchController {
                 record.state = CandidateState::PhysicalInstallationCompleted;
                 record.physical_current_at_us = Some(now);
                 record.installed = true;
-                record.replaced_global_id = replaced_global_id;
+                record.installed_identity = Some(installed_identity);
+                record.victim_decision = victim_decision;
                 run.counters.physical_installation_completed = run
                     .counters
                     .physical_installation_completed
@@ -950,7 +1233,7 @@ impl GpuNativeBoundedLivePrefetchController {
                     run.counters.speculative_h2d_installs.saturating_add(1);
                 run.counters.speculative_h2d_bytes =
                     run.counters.speculative_h2d_bytes.saturating_add(h2d_bytes);
-                if replaced_global_id.is_some() {
+                if victim_decision.is_some() {
                     run.counters.speculative_replacements =
                         run.counters.speculative_replacements.saturating_add(1);
                     run.counters.speculative_evictions =
@@ -1039,6 +1322,7 @@ impl GpuNativeBoundedLivePrefetchController {
                 boundary: record.boundary,
                 target_layer: record.target_layer,
                 global_id: record.global_id,
+                candidate_rank: record.candidate_rank,
                 score: record.score,
                 terminal_classification: classification.to_string(),
             });
@@ -1107,6 +1391,19 @@ impl GpuNativeBoundedLivePrefetchController {
                 "live-prefetch invariant failed closed: {failure}"
             )));
         }
+        for record in run.candidates.values_mut() {
+            if record.installed && !record.directly_reused_by_demand {
+                let current_identity = residency
+                    .live_current_residency_for_diagnostic(record.global_id)?
+                    .map(PhysicalInstallIdentity::from);
+                mark_original_install_evicted_if_needed(
+                    &mut run.counters,
+                    record,
+                    current_identity,
+                );
+            }
+        }
+        finalize_direct_reuse_accounting(&mut run)?;
         let accepted_terminal = run
             .candidates
             .values()
@@ -1144,6 +1441,18 @@ impl GpuNativeBoundedLivePrefetchController {
             .values()
             .filter(|candidate| candidate.installed && !candidate.used)
             .count() as u64;
+        let calibration_events = destructive_replacement_events(&run);
+        let destructive_admission_calibration =
+            build_destructive_admission_calibration(&calibration_events)?;
+        if destructive_admission_calibration.replacement_count
+            != run.counters.speculative_replacements
+        {
+            return Err(ShadowObserverError::new(format!(
+                "destructive replacement calibration count {} did not match speculative replacements {}",
+                destructive_admission_calibration.replacement_count,
+                run.counters.speculative_replacements
+            )));
+        }
         let timing = LiveTimingEvidence {
             prediction_to_source_start: LiveTimingSummary::from_values(
                 &run.timing.prediction_to_source_start,
@@ -1165,6 +1474,8 @@ impl GpuNativeBoundedLivePrefetchController {
             counters: run.counters,
             timing,
             lifecycle_samples: run.samples,
+            destructive_admission_calibration,
+            calibration_events,
             postconditions,
             counter_reconciliation_pass,
             cancellation_reason_reconciliation_pass,
@@ -1220,7 +1531,8 @@ fn score_actual_demand(
 
     classify_candidate_demand(run, pending, &selected_set, demand_at, |global_id| {
         residency
-            .has_current_for_demand(global_id)
+            .live_current_residency_for_diagnostic(global_id)
+            .map(|residency| residency.map(PhysicalInstallIdentity::from))
             .map_err(ShadowObserverError::from)
     })
 }
@@ -1233,13 +1545,18 @@ fn classify_candidate_demand<F>(
     mut is_current: F,
 ) -> Result<(), ShadowObserverError>
 where
-    F: FnMut(u32) -> Result<bool, ShadowObserverError>,
+    F: FnMut(u32) -> Result<Option<PhysicalInstallIdentity>, ShadowObserverError>,
 {
     let mut attributed_miss_boundary = false;
     for record in run.candidates.values_mut() {
+        let candidate_current_identity = if record.installed {
+            is_current(record.global_id)?
+        } else {
+            None
+        };
         if record.boundary == pending.boundary && selected_set.contains(&record.global_id) {
             record.first_demand_at_us.get_or_insert(demand_at);
-            if record.terminal && record.installed && is_current(record.global_id)? {
+            if record.terminal && record.installed && candidate_current_identity.is_some() {
                 record.used = true;
                 run.counters.demand_reused_speculative_result = run
                     .counters
@@ -1262,21 +1579,46 @@ where
                     .saturating_add(1);
             }
         }
+        if record.installed && selected_set.contains(&record.global_id) {
+            classify_direct_or_restored_reuse(
+                &mut run.counters,
+                record,
+                candidate_current_identity,
+            );
+        } else if record.installed {
+            mark_original_install_evicted_if_needed(
+                &mut run.counters,
+                record,
+                candidate_current_identity,
+            );
+        }
         if record.boundary != pending.boundary
             && record.installed
             && !record.used
             && selected_set.contains(&record.global_id)
-            && is_current(record.global_id)?
+            && candidate_current_identity.is_some()
         {
             record.used = true;
             run.counters.prediction_useful = run.counters.prediction_useful.saturating_add(1);
             run.counters.prediction_useful_later =
                 run.counters.prediction_useful_later.saturating_add(1);
         }
-        if let Some(victim) = record.replaced_global_id {
-            let victim_current = is_current(victim)?;
+        if let Some(victim) = record.victim_decision {
+            let victim_current = is_current(victim.global_id)?.is_some();
             record.victim_restored_after_speculation |= victim_current;
-            if selected_set.contains(&victim) && !record.used && !record.victim_demand_harm_counted
+            if selected_set.contains(&victim.global_id)
+                && !record.directly_reused_by_demand
+                && !record.victim_demanded_before_direct_payoff
+            {
+                record.victim_demanded_before_direct_payoff = true;
+                run.counters.victim_demanded_before_candidate_direct_payoff = run
+                    .counters
+                    .victim_demanded_before_candidate_direct_payoff
+                    .saturating_add(1);
+            }
+            if selected_set.contains(&victim.global_id)
+                && !record.used
+                && !record.victim_demand_harm_counted
             {
                 record.victim_demand_harm_counted = true;
                 run.counters.evicted_expert_demanded_before_payoff = run
@@ -1288,14 +1630,18 @@ where
                         .counters
                         .misses_introduced_by_speculative_eviction
                         .saturating_add(1);
-                    attributed_miss_boundary = true;
+                    record.miss_introduced_by_victim_eviction = true;
+                    if !attributed_miss_boundary {
+                        record.miss_boundary_introduced_by_victim_eviction = true;
+                        attributed_miss_boundary = true;
+                    }
                 }
             }
         }
         if record.installed
             && !record.used
             && !record.unused_eviction_counted
-            && !is_current(record.global_id)?
+            && candidate_current_identity.is_none()
         {
             record.unused_eviction_counted = true;
             run.counters.speculative_expert_evicted_unused = run
@@ -1312,6 +1658,464 @@ where
             .saturating_add(1);
     }
     Ok(())
+}
+
+fn mark_original_install_evicted_if_needed(
+    counters: &mut LiveLifecycleCounters,
+    record: &mut CandidateRecord,
+    current_identity: Option<PhysicalInstallIdentity>,
+) {
+    let Some(installed_identity) = record.installed_identity else {
+        return;
+    };
+    if !record.directly_reused_by_demand
+        && current_identity != Some(installed_identity)
+        && !record.evicted_before_direct_reuse
+    {
+        record.evicted_before_direct_reuse = true;
+        counters.speculative_install_evicted_before_direct_reuse = counters
+            .speculative_install_evicted_before_direct_reuse
+            .saturating_add(1);
+    }
+}
+
+fn classify_direct_or_restored_reuse(
+    counters: &mut LiveLifecycleCounters,
+    record: &mut CandidateRecord,
+    current_identity: Option<PhysicalInstallIdentity>,
+) {
+    let Some(installed_identity) = record.installed_identity else {
+        return;
+    };
+    if current_identity == Some(installed_identity) && !record.evicted_before_direct_reuse {
+        if !record.directly_reused_by_demand {
+            record.directly_reused_by_demand = true;
+            counters.speculative_install_directly_reused_by_demand = counters
+                .speculative_install_directly_reused_by_demand
+                .saturating_add(1);
+        }
+        return;
+    }
+    mark_original_install_evicted_if_needed(counters, record, current_identity);
+    if current_identity.is_some() && !record.used_only_after_later_restoration {
+        record.used_only_after_later_restoration = true;
+        counters
+            .speculative_install_used_only_after_later_reinstallation_or_non_speculative_restoration = counters
+            .speculative_install_used_only_after_later_reinstallation_or_non_speculative_restoration
+            .saturating_add(1);
+    }
+}
+
+fn finalize_direct_reuse_accounting(run: &mut ActiveRun) -> Result<(), ShadowObserverError> {
+    let installed = run
+        .candidates
+        .values()
+        .filter(|record| record.installed)
+        .count() as u64;
+    let directly_reused = run
+        .candidates
+        .values()
+        .filter(|record| record.installed && record.directly_reused_by_demand)
+        .count() as u64;
+    let never_directly_reused = installed.checked_sub(directly_reused).ok_or_else(|| {
+        ShadowObserverError::new("direct speculative reuse count exceeded completed installations")
+    })?;
+    let evicted_before_direct_reuse = run
+        .candidates
+        .values()
+        .filter(|record| record.installed && record.evicted_before_direct_reuse)
+        .count() as u64;
+    let used_after_restoration = run
+        .candidates
+        .values()
+        .filter(|record| record.installed && record.used_only_after_later_restoration)
+        .count() as u64;
+    let victim_harm = run
+        .candidates
+        .values()
+        .filter(|record| record.victim_demanded_before_direct_payoff)
+        .count() as u64;
+    let misses_introduced = run
+        .candidates
+        .values()
+        .filter(|record| record.miss_introduced_by_victim_eviction)
+        .count() as u64;
+    let miss_boundaries_introduced = run
+        .candidates
+        .values()
+        .filter(|record| record.miss_boundary_introduced_by_victim_eviction)
+        .count() as u64;
+    if directly_reused != run.counters.speculative_install_directly_reused_by_demand
+        || evicted_before_direct_reuse
+            != run
+                .counters
+                .speculative_install_evicted_before_direct_reuse
+        || used_after_restoration
+            != run
+                .counters
+                .speculative_install_used_only_after_later_reinstallation_or_non_speculative_restoration
+        || evicted_before_direct_reuse > never_directly_reused
+        || used_after_restoration > evicted_before_direct_reuse
+        || victim_harm != run.counters.victim_demanded_before_candidate_direct_payoff
+        || misses_introduced != run.counters.misses_introduced_by_speculative_eviction
+        || miss_boundaries_introduced
+            != run
+                .counters
+                .miss_boundaries_introduced_by_speculative_eviction
+    {
+        return Err(ShadowObserverError::new(format!(
+            "direct speculative reuse counters did not reconcile: installed={installed} direct={directly_reused} never={never_directly_reused} evicted_before_direct={evicted_before_direct_reuse} restored_only={used_after_restoration} counters={:?}",
+            run.counters
+        )));
+    }
+    run.counters.speculative_install_never_directly_reused = never_directly_reused;
+    Ok(())
+}
+
+fn destructive_replacement_events(run: &ActiveRun) -> Vec<DestructiveReplacementEvent> {
+    run.candidates
+        .iter()
+        .filter_map(|(&ticket_id, record)| {
+            let victim = record.victim_decision?;
+            Some(DestructiveReplacementEvent {
+                ticket_id,
+                run_index: run.run_index,
+                candidate_rank: record.candidate_rank,
+                candidate_score: record.score,
+                victim_global_id: victim.global_id,
+                victim_physical_lru_rank: victim.physical_lru_rank,
+                victim_prediction_protected: victim.prediction_protected,
+                victim_last_actual_route_token_position: victim
+                    .last_actual_route_token_position,
+                victim_age_in_completed_tokens: victim.age_in_completed_tokens,
+                victim_never_observed: victim.never_observed,
+                candidate_direct_payoff: record.directly_reused_by_demand,
+                candidate_evicted_unused: record.evicted_before_direct_reuse,
+                victim_demanded_before_payoff: record
+                    .victim_demanded_before_direct_payoff,
+                miss_introduced: record.miss_introduced_by_victim_eviction,
+                miss_boundary_introduced: record
+                    .miss_boundary_introduced_by_victim_eviction,
+            })
+        })
+        .collect()
+}
+
+fn percentile(sorted: &[f64], quantile: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let index = ((sorted.len() - 1) as f64 * quantile).ceil() as usize;
+    sorted.get(index.min(sorted.len() - 1)).copied()
+}
+
+fn score_summary<'a, I>(events: I) -> CandidateScoreSummary
+where
+    I: IntoIterator<Item = &'a DestructiveReplacementEvent>,
+{
+    let mut scores = events
+        .into_iter()
+        .map(|event| event.candidate_score)
+        .collect::<Vec<_>>();
+    scores.sort_by(f64::total_cmp);
+    let sum = scores.iter().sum::<f64>();
+    CandidateScoreSummary {
+        count: scores.len() as u64,
+        min: scores.first().copied(),
+        p50: percentile(&scores, 0.50),
+        p75: percentile(&scores, 0.75),
+        p90: percentile(&scores, 0.90),
+        p95: percentile(&scores, 0.95),
+        p99: percentile(&scores, 0.99),
+        max: scores.last().copied(),
+        mean: (!scores.is_empty()).then_some(sum / scores.len() as f64),
+    }
+}
+
+fn outcome_counts<'a, I>(events: I) -> ReplacementOutcomeCounts
+where
+    I: IntoIterator<Item = &'a DestructiveReplacementEvent>,
+{
+    events
+        .into_iter()
+        .fold(ReplacementOutcomeCounts::default(), |mut total, event| {
+            total.replacement_count = total.replacement_count.saturating_add(1);
+            total.candidate_direct_payoffs = total
+                .candidate_direct_payoffs
+                .saturating_add(u64::from(event.candidate_direct_payoff));
+            total.candidate_evicted_unused = total
+                .candidate_evicted_unused
+                .saturating_add(u64::from(event.candidate_evicted_unused));
+            total.victim_demanded_before_payoff = total
+                .victim_demanded_before_payoff
+                .saturating_add(u64::from(event.victim_demanded_before_payoff));
+            total.both_candidate_direct_payoff_and_victim_harm = total
+                .both_candidate_direct_payoff_and_victim_harm
+                .saturating_add(u64::from(
+                    event.candidate_direct_payoff && event.victim_demanded_before_payoff,
+                ));
+            total.misses_introduced = total
+                .misses_introduced
+                .saturating_add(u64::from(event.miss_introduced));
+            total.miss_boundaries_introduced = total
+                .miss_boundaries_introduced
+                .saturating_add(u64::from(event.miss_boundary_introduced));
+            total
+        })
+}
+
+fn victim_age_bucket_index(age: Option<usize>) -> usize {
+    match age {
+        None => 0,
+        Some(0) => 1,
+        Some(1) => 2,
+        Some(2) => 3,
+        Some(3..=4) => 4,
+        Some(5..=8) => 5,
+        Some(9..=16) => 6,
+        Some(17..=32) => 7,
+        Some(33..) => 8,
+    }
+}
+
+fn victim_age_bucket_label(index: usize) -> &'static str {
+    match index {
+        0 => "never-seen",
+        1 => "0-tokens",
+        2 => "1-token",
+        3 => "2-tokens",
+        4 => "3-4-tokens",
+        5 => "5-8-tokens",
+        6 => "9-16-tokens",
+        7 => "17-32-tokens",
+        8 => ">32-tokens",
+        _ => "invalid",
+    }
+}
+
+fn build_destructive_admission_calibration(
+    events: &[DestructiveReplacementEvent],
+) -> Result<DestructiveAdmissionCalibrationEvidence, ShadowObserverError> {
+    let every_replacement_has_rank_score_and_victim_decision = events.iter().all(|event| {
+        (1..=FROZEN_FANOUT).contains(&event.candidate_rank)
+            && event.candidate_score.is_finite()
+            && event.victim_physical_lru_rank > 0
+            && event.victim_never_observed
+                == event
+                    .victim_last_actual_route_token_position
+                    .is_none()
+            && event.victim_never_observed == event.victim_age_in_completed_tokens.is_none()
+    });
+    if !every_replacement_has_rank_score_and_victim_decision {
+        return Err(ShadowObserverError::new(
+            "destructive replacement event omitted or corrupted rank, score, or victim decision evidence",
+        ));
+    }
+
+    let candidate_scores = CandidateScoreCalibration {
+        all_replacements: score_summary(events),
+        direct_payoff_replacements: score_summary(
+            events.iter().filter(|event| event.candidate_direct_payoff),
+        ),
+        candidate_evicted_unused_replacements: score_summary(
+            events.iter().filter(|event| event.candidate_evicted_unused),
+        ),
+        victim_harm_replacements: score_summary(
+            events
+                .iter()
+                .filter(|event| event.victim_demanded_before_payoff),
+        ),
+    };
+
+    let mut mutually_exclusive_outcomes = MutuallyExclusiveReplacementOutcomes::default();
+    for event in events {
+        let counter = match event.outcome_class() {
+            DestructiveReplacementOutcomeClass::CandidateDirectPayoffOnly => {
+                &mut mutually_exclusive_outcomes.candidate_direct_payoff_only
+            }
+            DestructiveReplacementOutcomeClass::CandidateEvictedUnusedWithoutVictimHarm => {
+                &mut mutually_exclusive_outcomes
+                    .candidate_evicted_unused_without_victim_harm
+            }
+            DestructiveReplacementOutcomeClass::VictimHarmWithoutCandidateDirectPayoff => {
+                &mut mutually_exclusive_outcomes
+                    .victim_harm_without_candidate_direct_payoff
+            }
+            DestructiveReplacementOutcomeClass::BothCandidateDirectPayoffAndVictimHarm => {
+                &mut mutually_exclusive_outcomes
+                    .both_candidate_direct_payoff_and_victim_harm
+            }
+            DestructiveReplacementOutcomeClass::NoCandidateDirectPayoffAndNoObservedVictimHarm => {
+                &mut mutually_exclusive_outcomes
+                    .no_candidate_direct_payoff_and_no_observed_victim_harm
+            }
+        };
+        *counter = counter.saturating_add(1);
+    }
+    let outcome_class_sum = mutually_exclusive_outcomes
+        .candidate_direct_payoff_only
+        .saturating_add(
+            mutually_exclusive_outcomes.candidate_evicted_unused_without_victim_harm,
+        )
+        .saturating_add(
+            mutually_exclusive_outcomes.victim_harm_without_candidate_direct_payoff,
+        )
+        .saturating_add(
+            mutually_exclusive_outcomes.both_candidate_direct_payoff_and_victim_harm,
+        )
+        .saturating_add(
+            mutually_exclusive_outcomes
+                .no_candidate_direct_payoff_and_no_observed_victim_harm,
+        );
+    mutually_exclusive_outcomes.reconciliation_pass = outcome_class_sum == events.len() as u64;
+
+    let candidate_rank_outcomes = (1..=FROZEN_FANOUT)
+        .map(|candidate_rank| CandidateRankOutcome {
+            candidate_rank,
+            outcomes: outcome_counts(
+                events
+                    .iter()
+                    .filter(|event| event.candidate_rank == candidate_rank),
+            ),
+        })
+        .collect::<Vec<_>>();
+    let victim_age_outcomes = (0..9)
+        .map(|bucket| VictimAgeBucketOutcome {
+            victim_age_bucket: victim_age_bucket_label(bucket).to_string(),
+            outcomes: outcome_counts(events.iter().filter(|event| {
+                victim_age_bucket_index(event.victim_age_in_completed_tokens) == bucket
+            })),
+        })
+        .collect::<Vec<_>>();
+    let candidate_rank_x_victim_age_outcomes = (1..=FROZEN_FANOUT)
+        .flat_map(|candidate_rank| {
+            (0..9).map(move |bucket| CandidateRankVictimAgeOutcome {
+                candidate_rank,
+                victim_age_bucket: victim_age_bucket_label(bucket).to_string(),
+                outcomes: outcome_counts(events.iter().filter(|event| {
+                    event.candidate_rank == candidate_rank
+                        && victim_age_bucket_index(event.victim_age_in_completed_tokens) == bucket
+                })),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut sorted_scores = events
+        .iter()
+        .map(|event| event.candidate_score)
+        .collect::<Vec<_>>();
+    sorted_scores.sort_by(f64::total_cmp);
+    let score_thresholds = [
+        ("p50", percentile(&sorted_scores, 0.50)),
+        ("p75", percentile(&sorted_scores, 0.75)),
+        ("p90", percentile(&sorted_scores, 0.90)),
+        ("p95", percentile(&sorted_scores, 0.95)),
+        ("p99", percentile(&sorted_scores, 0.99)),
+    ];
+    let mut diagnostic_event_filter_threshold_table = Vec::new();
+    for (label, threshold) in score_thresholds {
+        let Some(threshold) = threshold else {
+            continue;
+        };
+        for age_threshold in [0usize, 1, 2, 4, 8, 16, 32] {
+            let admitted = events.iter().filter(|event| {
+                event.candidate_score >= threshold
+                    && event
+                        .victim_age_in_completed_tokens
+                        .is_none_or(|age| age >= age_threshold)
+            });
+            let rejected = events.iter().filter(|event| {
+                !(event.candidate_score >= threshold
+                    && event
+                        .victim_age_in_completed_tokens
+                        .is_none_or(|age| age >= age_threshold))
+            });
+            diagnostic_event_filter_threshold_table.push(DiagnosticThresholdCalibrationRow {
+                candidate_score_percentile: label.to_string(),
+                candidate_score_threshold_inclusive: threshold,
+                victim_age_threshold_inclusive_completed_tokens: age_threshold,
+                never_observed_victim_satisfies_age_threshold: true,
+                admitted_historical_events: HistoricalEventFilterResult {
+                    outcomes: outcome_counts(admitted),
+                },
+                rejected_historical_events: HistoricalEventFilterResult {
+                    outcomes: outcome_counts(rejected),
+                },
+            });
+        }
+    }
+
+    let bounded_replacement_samples = events
+        .iter()
+        .take(MAX_LIFECYCLE_SAMPLES)
+        .map(|event| BoundedDestructiveReplacementSample {
+            ticket_id: event.ticket_id,
+            run_index: event.run_index,
+            candidate_rank: event.candidate_rank,
+            candidate_score: event.candidate_score,
+            victim_global_id: event.victim_global_id,
+            victim_physical_lru_rank: event.victim_physical_lru_rank,
+            victim_prediction_protected: event.victim_prediction_protected,
+            victim_last_actual_route_token_position: event
+                .victim_last_actual_route_token_position,
+            victim_age_in_completed_tokens: event.victim_age_in_completed_tokens,
+            victim_never_observed: event.victim_never_observed,
+            outcome_class: event.outcome_class(),
+        })
+        .collect::<Vec<_>>();
+
+    let replacement_count = events.len() as u64;
+    let candidate_rank_sum = candidate_rank_outcomes
+        .iter()
+        .map(|bucket| bucket.outcomes.replacement_count)
+        .sum::<u64>();
+    let victim_age_sum = victim_age_outcomes
+        .iter()
+        .map(|bucket| bucket.outcomes.replacement_count)
+        .sum::<u64>();
+    let joint_sum = candidate_rank_x_victim_age_outcomes
+        .iter()
+        .map(|bucket| bucket.outcomes.replacement_count)
+        .sum::<u64>();
+    let mut reconciliation = CalibrationReconciliationEvidence {
+        outcome_classes_sum_to_replacements: mutually_exclusive_outcomes.reconciliation_pass,
+        all_score_count_matches_replacements: candidate_scores.all_replacements.count
+            == replacement_count,
+        candidate_rank_histogram_matches_replacements: candidate_rank_sum == replacement_count,
+        victim_age_histogram_matches_replacements: victim_age_sum == replacement_count,
+        joint_histogram_matches_replacements: joint_sum == replacement_count,
+        every_replacement_has_rank_score_and_victim_decision,
+        pass: false,
+    };
+    reconciliation.pass = reconciliation.outcome_classes_sum_to_replacements
+        && reconciliation.all_score_count_matches_replacements
+        && reconciliation.candidate_rank_histogram_matches_replacements
+        && reconciliation.victim_age_histogram_matches_replacements
+        && reconciliation.joint_histogram_matches_replacements
+        && reconciliation.every_replacement_has_rank_score_and_victim_decision;
+    if !reconciliation.pass {
+        return Err(ShadowObserverError::new(format!(
+            "destructive replacement calibration did not reconcile: {reconciliation:?}"
+        )));
+    }
+    Ok(DestructiveAdmissionCalibrationEvidence {
+        diagnostic_only: true,
+        unbounded_replacement_event_log_emitted: false,
+        replacement_count,
+        direct_payoff_semantics: "the exact physical slot/generation/epoch identity installed speculatively remained current until a selected foreground demand reused it; same global ID after any different physical identity is not direct payoff",
+        victim_age_semantics: "completed-token position at the locked replacement decision minus the victim's last actual-route completed-token position; never-observed is separate and cross-layer route-clock deltas are not used",
+        physical_lru_rank_semantics: "one-based position in the locked physical MRU-to-LRU order at replacement decision; MRU=1 and LRU=resident-count",
+        threshold_table_semantics: "DIAGNOSTIC-ONLY historical event filter, not a counterfactual residency or performance simulation; rejecting one replacement would change later physical state",
+        candidate_scores,
+        mutually_exclusive_outcomes,
+        candidate_rank_outcomes,
+        victim_age_outcomes,
+        candidate_rank_x_victim_age_outcomes,
+        diagnostic_event_filter_threshold_table,
+        bounded_replacement_samples,
+        bounded_replacement_sample_limit: MAX_LIFECYCLE_SAMPLES,
+        reconciliation,
+    })
 }
 
 fn freeze_ranked_predictions(
@@ -1431,6 +2235,8 @@ pub(crate) struct LiveDerivedFractions {
     pub(crate) late_after_demand_fraction: Option<f64>,
     pub(crate) useful_installation_fraction: Option<f64>,
     pub(crate) unused_installation_fraction: Option<f64>,
+    pub(crate) direct_payoff_installation_fraction: Option<f64>,
+    pub(crate) candidate_evicted_unused_installation_fraction: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1455,6 +2261,8 @@ pub(crate) struct LiveArmEvidence {
     pub(crate) measured_aggregate: crate::gpu_native_real_benchmark::Aggregate,
     pub(crate) measured_live_totals: LiveLifecycleCounters,
     pub(crate) measured_live_fractions: LiveDerivedFractions,
+    pub(crate) measured_destructive_admission_calibration:
+        DestructiveAdmissionCalibrationEvidence,
     pub(crate) measured_source_attribution: DemandSourceEvidence,
     pub(crate) runtime_shutdown: crate::greedy_parity::BackgroundShutdownEvidence,
 }
@@ -1516,6 +2324,25 @@ pub(crate) struct DemandSourceComparisonEvidence {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct DestructiveAdmissionEconomicsEvidence {
+    pub(crate) speculative_install_denominator: u64,
+    pub(crate) destructive_replacement_denominator: u64,
+    pub(crate) direct_payoff_count: u64,
+    pub(crate) direct_payoff_per_speculative_install_fraction: Option<f64>,
+    pub(crate) candidate_evicted_unused_count: u64,
+    pub(crate) candidate_evicted_unused_fraction: Option<f64>,
+    pub(crate) victim_harm_count: u64,
+    pub(crate) victim_harm_fraction: Option<f64>,
+    pub(crate) foreground_demand_nvme_operations_avoided: i128,
+    pub(crate) speculative_nvme_operations_added: i128,
+    pub(crate) net_total_nvme_operation_delta: i128,
+    pub(crate) foreground_demand_h2d_installs_avoided: i128,
+    pub(crate) speculative_h2d_installs_added: i128,
+    pub(crate) net_total_h2d_install_delta: i128,
+    pub(crate) reconciliation_pass: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct PerformanceEvidence {
     pub(crate) pass: bool,
     pub(crate) eligible_for_interpretation: bool,
@@ -1570,6 +2397,7 @@ pub(crate) struct BoundedLivePrefetchReport {
     pub(crate) pr1cb_commit: &'static str,
     pub(crate) pr1cb_report_sha256: &'static str,
     pub(crate) pr1cc_commit: &'static str,
+    pub(crate) pr1cd2_commit: &'static str,
     pub(crate) pr1cc_authoritative_report_sha256: Option<String>,
     pub(crate) external_pr1cc_policy_selection_pending: bool,
     pub(crate) policy_selection_source: &'static str,
@@ -1609,6 +2437,8 @@ pub(crate) struct BoundedLivePrefetchReport {
     pub(crate) live_path_exercised: Option<LivePathExercisedEvidence>,
     pub(crate) residency_effectiveness: Option<ResidencyEffectivenessEvidence>,
     pub(crate) demand_source_comparison: Option<DemandSourceComparisonEvidence>,
+    pub(crate) destructive_admission_economics:
+        Option<DestructiveAdmissionEconomicsEvidence>,
     pub(crate) performance: Option<PerformanceEvidence>,
 }
 
@@ -1660,6 +2490,11 @@ fn checked_add_counters(
     add!(misses_introduced_by_speculative_eviction);
     add!(miss_boundaries_introduced_by_speculative_eviction);
     add!(speculative_expert_evicted_unused);
+    add!(speculative_install_directly_reused_by_demand);
+    add!(speculative_install_evicted_before_direct_reuse);
+    add!(speculative_install_never_directly_reused);
+    add!(speculative_install_used_only_after_later_reinstallation_or_non_speculative_restoration);
+    add!(victim_demanded_before_candidate_direct_payoff);
     add!(prediction_protected_victim_skips);
     add!(forced_prediction_protected_evictions);
     add!(demand_independently_won_install_race);
@@ -1688,6 +2523,23 @@ fn aggregate_live_runs(
         checked_add_counters(&mut total, &run.live.counters)?;
     }
     Ok(total)
+}
+
+fn aggregate_destructive_admission_calibration(
+    runs: &[LiveQualifiedRunEvidence],
+) -> Result<DestructiveAdmissionCalibrationEvidence, crate::gpu_native_real_benchmark::BenchmarkFailure>
+{
+    let events = runs
+        .iter()
+        .flat_map(|run| run.live.calibration_events.iter().cloned())
+        .collect::<Vec<_>>();
+    build_destructive_admission_calibration(&events).map_err(|error| {
+        crate::gpu_native_real_benchmark::BenchmarkFailure::new(
+            "postcondition",
+            "destructive-admission-calibration-invalid",
+            error.to_string(),
+        )
+    })
 }
 
 fn checked_sum<I>(
@@ -1930,6 +2782,14 @@ fn live_derived_fractions(counters: &LiveLifecycleCounters) -> LiveDerivedFracti
         ),
         unused_installation_fraction: ratio(
             counters.prediction_unused,
+            counters.physical_installation_completed,
+        ),
+        direct_payoff_installation_fraction: ratio(
+            counters.speculative_install_directly_reused_by_demand,
+            counters.physical_installation_completed,
+        ),
+        candidate_evicted_unused_installation_fraction: ratio(
+            counters.speculative_install_evicted_before_direct_reuse,
             counters.physical_installation_completed,
         ),
     }
@@ -2212,6 +3072,21 @@ async fn run_arm(
     let measured_aggregate = crate::gpu_native_real_benchmark::aggregate(&measured_production)?;
     let measured_live_totals = aggregate_live_runs(&measured_run_evidence)?;
     let measured_live_fractions = live_derived_fractions(&measured_live_totals);
+    let measured_destructive_admission_calibration =
+        aggregate_destructive_admission_calibration(&measured_run_evidence)?;
+    if measured_destructive_admission_calibration.replacement_count
+        != measured_live_totals.speculative_replacements
+    {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "destructive-admission-calibration-counter-mismatch",
+            format!(
+                "calibration replacements={} live replacements={}",
+                measured_destructive_admission_calibration.replacement_count,
+                measured_live_totals.speculative_replacements
+            ),
+        ));
+    }
     let measured_source_attribution =
         demand_source_evidence(&measured_run_evidence, &measured_live_totals)?;
     if arm == LiveArm::Off
@@ -2219,7 +3094,8 @@ async fn run_arm(
             || measured_live_totals.source_acquisition_started != 0
             || measured_live_totals.physical_installation_started != 0
             || measured_live_totals.speculative_nvme_bytes != 0
-            || measured_live_totals.speculative_h2d_bytes != 0)
+            || measured_live_totals.speculative_h2d_bytes != 0
+            || measured_destructive_admission_calibration.replacement_count != 0)
     {
         return Err(BenchmarkFailure::new(
             "postcondition",
@@ -2240,6 +3116,7 @@ async fn run_arm(
         measured_aggregate,
         measured_live_totals,
         measured_live_fractions,
+        measured_destructive_admission_calibration,
         measured_source_attribution,
         runtime_shutdown,
     })
@@ -2414,6 +3291,82 @@ fn compare_demand_sources(
         demand_nvme_bytes: counter_delta(off.demand_nvme_bytes, on.demand_nvme_bytes),
         demand_h2d_installs: counter_delta(off.demand_h2d_installs, on.demand_h2d_installs),
         demand_h2d_bytes: counter_delta(off.demand_h2d_bytes, on.demand_h2d_bytes),
+    }
+}
+
+fn destructive_admission_economics(
+    control: &LiveArmEvidence,
+    treatment: &LiveArmEvidence,
+) -> DestructiveAdmissionEconomicsEvidence {
+    let off = &control.measured_source_attribution;
+    let on = &treatment.measured_source_attribution;
+    let counters = &treatment.measured_live_totals;
+    let calibration = &treatment.measured_destructive_admission_calibration;
+    let calibration_totals = calibration
+        .candidate_rank_outcomes
+        .iter()
+        .fold(ReplacementOutcomeCounts::default(), |mut total, rank| {
+            total.replacement_count = total
+                .replacement_count
+                .saturating_add(rank.outcomes.replacement_count);
+            total.candidate_direct_payoffs = total
+                .candidate_direct_payoffs
+                .saturating_add(rank.outcomes.candidate_direct_payoffs);
+            total.candidate_evicted_unused = total
+                .candidate_evicted_unused
+                .saturating_add(rank.outcomes.candidate_evicted_unused);
+            total.victim_demanded_before_payoff = total
+                .victim_demanded_before_payoff
+                .saturating_add(rank.outcomes.victim_demanded_before_payoff);
+            total
+        });
+    let direct_payoff_count = counters.speculative_install_directly_reused_by_demand;
+    let candidate_evicted_unused_count = counters
+        .speculative_install_evicted_before_direct_reuse;
+    let victim_harm_count = counters.victim_demanded_before_candidate_direct_payoff;
+    let speculative_install_denominator = counters.physical_installation_completed;
+    let destructive_replacement_denominator = counters.speculative_replacements;
+    let foreground_demand_nvme_operations_avoided =
+        off.demand_nvme_operations as i128 - on.demand_nvme_operations as i128;
+    let speculative_nvme_operations_added = on.speculative_nvme_operations as i128
+        - off.speculative_nvme_operations as i128;
+    let net_total_nvme_operation_delta = (on.demand_nvme_operations as i128
+        + on.speculative_nvme_operations as i128)
+        - (off.demand_nvme_operations as i128 + off.speculative_nvme_operations as i128);
+    let foreground_demand_h2d_installs_avoided =
+        off.demand_h2d_installs as i128 - on.demand_h2d_installs as i128;
+    let speculative_h2d_installs_added =
+        on.speculative_h2d_installs as i128 - off.speculative_h2d_installs as i128;
+    let net_total_h2d_install_delta = (on.demand_h2d_installs as i128
+        + on.speculative_h2d_installs as i128)
+        - (off.demand_h2d_installs as i128 + off.speculative_h2d_installs as i128);
+    let reconciliation_pass = calibration.reconciliation.pass
+        && calibration_totals.replacement_count == destructive_replacement_denominator
+        && calibration_totals.candidate_direct_payoffs <= direct_payoff_count
+        && calibration_totals.candidate_evicted_unused <= candidate_evicted_unused_count
+        && calibration_totals.victim_demanded_before_payoff == victim_harm_count;
+    DestructiveAdmissionEconomicsEvidence {
+        speculative_install_denominator,
+        destructive_replacement_denominator,
+        direct_payoff_count,
+        direct_payoff_per_speculative_install_fraction: ratio(
+            direct_payoff_count,
+            speculative_install_denominator,
+        ),
+        candidate_evicted_unused_count,
+        candidate_evicted_unused_fraction: ratio(
+            candidate_evicted_unused_count,
+            speculative_install_denominator,
+        ),
+        victim_harm_count,
+        victim_harm_fraction: ratio(victim_harm_count, destructive_replacement_denominator),
+        foreground_demand_nvme_operations_avoided,
+        speculative_nvme_operations_added,
+        net_total_nvme_operation_delta,
+        foreground_demand_h2d_installs_avoided,
+        speculative_h2d_installs_added,
+        net_total_h2d_install_delta,
+        reconciliation_pass,
     }
 }
 
@@ -2697,6 +3650,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         pr1cb_commit: PR1CB_COMMIT,
         pr1cb_report_sha256: PR1CB_REPORT_SHA256,
         pr1cc_commit: PR1CC_COMMIT,
+        pr1cd2_commit: PR1CD2_COMMIT,
         pr1cc_authoritative_report_sha256: None,
         external_pr1cc_policy_selection_pending: true,
         policy_selection_source: "required-explicit-cli-selection-no-authoritative-pr1cc-winner-artifact-available",
@@ -2759,6 +3713,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         live_path_exercised: None,
         residency_effectiveness: None,
         demand_source_comparison: None,
+        destructive_admission_economics: None,
         performance: None,
     };
 
@@ -2843,6 +3798,21 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     let live_path = live_path_exercised(&treatment.measured_live_totals);
     let residency = compare_residency(&control, &treatment);
     let demand_source_comparison = compare_demand_sources(&control, &treatment);
+    let destructive_admission_economics =
+        destructive_admission_economics(&control, &treatment);
+    if !destructive_admission_economics.reconciliation_pass {
+        let failure = BenchmarkFailure::new(
+            "postcondition",
+            "destructive-admission-economics-counter-mismatch",
+            format!(
+                "destructive admission economics did not reconcile: {destructive_admission_economics:?}"
+            ),
+        );
+        report.failure = Some(failure.clone());
+        report.destructive_admission_economics = Some(destructive_admission_economics);
+        emit_report(&report, args.report_out.as_deref())?;
+        return Err(failure.into());
+    }
     let performance = compare_performance(&control, &treatment, behavioral.pass, live_path.pass);
     report.behavioral_equivalence_pass = behavioral.pass;
     report.live_path_exercised_pass = live_path.pass;
@@ -2860,6 +3830,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     report.live_path_exercised = Some(live_path);
     report.residency_effectiveness = Some(residency);
     report.demand_source_comparison = Some(demand_source_comparison);
+    report.destructive_admission_economics = Some(destructive_admission_economics);
     report.performance = Some(performance);
     emit_report(&report, args.report_out.as_deref())
 }
@@ -2900,6 +3871,56 @@ mod tests {
         }
     }
 
+    fn physical_identity(slot_epoch: u32) -> PhysicalInstallIdentity {
+        PhysicalInstallIdentity {
+            layer_index: 1,
+            local_expert_id: 0,
+            logical_generation: 7,
+            bank: 0,
+            slot: 0,
+            slot_epoch,
+        }
+    }
+
+    fn victim_decision(age: Option<usize>) -> GpuNativeLiveVictimDecision {
+        GpuNativeLiveVictimDecision {
+            global_id: 5,
+            physical_lru_rank: 4,
+            prediction_protected: false,
+            last_actual_route_token_position: age.map(|age| 10usize.saturating_sub(age)),
+            age_in_completed_tokens: age,
+            never_observed: age.is_none(),
+        }
+    }
+
+    fn replacement_event(
+        ticket_id: u64,
+        candidate_rank: usize,
+        candidate_score: f64,
+        age: Option<usize>,
+        direct: bool,
+        evicted_unused: bool,
+        victim_harm: bool,
+    ) -> DestructiveReplacementEvent {
+        DestructiveReplacementEvent {
+            ticket_id,
+            run_index: 0,
+            candidate_rank,
+            candidate_score,
+            victim_global_id: 128 + ticket_id as u32,
+            victim_physical_lru_rank: 8,
+            victim_prediction_protected: false,
+            victim_last_actual_route_token_position: age.map(|age| 40usize - age),
+            victim_age_in_completed_tokens: age,
+            victim_never_observed: age.is_none(),
+            candidate_direct_payoff: direct,
+            candidate_evicted_unused: evicted_unused,
+            victim_demanded_before_payoff: victim_harm,
+            miss_introduced: victim_harm,
+            miss_boundary_introduced: victim_harm,
+        }
+    }
+
     fn accept(
         controller: &GpuNativeBoundedLivePrefetchController,
         pending: &PendingTarget,
@@ -2908,6 +3929,7 @@ mod tests {
             .accept_candidate(
                 pending,
                 &pending.candidates[0],
+                1,
                 Arc::new(HashSet::from([pending.candidates[0].global_id])),
             )
             .unwrap()
@@ -2923,7 +3945,15 @@ mod tests {
     ) {
         let mut inner = controller.inner.lock();
         let run = inner.run.as_mut().unwrap();
-        classify_candidate_demand(run, pending, &selected, demand_at, |_| Ok(current)).unwrap();
+        let installed_identity = run
+            .candidates
+            .values()
+            .find_map(|record| record.installed_identity)
+            .unwrap_or_else(|| physical_identity(1));
+        classify_candidate_demand(run, pending, &selected, demand_at, |_| {
+            Ok(current.then_some(installed_identity))
+        })
+        .unwrap();
     }
 
     fn counters(controller: &GpuNativeBoundedLivePrefetchController) -> LiveLifecycleCounters {
@@ -2959,8 +3989,18 @@ mod tests {
         controller.record_demand_joined_source(4);
         classify(&controller, &pending, HashSet::from([4]), 100, false);
         assert!(controller.reserve_install(ticket.ticket_id, false));
-        controller.record_installed(ticket.ticket_id, 4096, None, 0, false);
-        controller.record_demand_service_completed(&[4]);
+        controller.record_installed_with_identity(
+            ticket.ticket_id,
+            4096,
+            physical_identity(1),
+            None,
+            0,
+            false,
+        );
+        controller.record_demand_service_completed_with_identities(&HashMap::from([(
+            4,
+            physical_identity(1),
+        )]));
         let counters = counters(&controller);
         assert_eq!(counters.source_acquisition_deduplicated_joined, 1);
         assert_eq!(counters.demand_joined_speculative_acquisition, 1);
@@ -2968,6 +4008,7 @@ mod tests {
         assert_eq!(counters.demand_arrived_while_speculative_in_flight, 1);
         assert_eq!(counters.demand_reused_speculative_result, 1);
         assert_eq!(counters.prediction_useful, 1);
+        assert_eq!(counters.speculative_install_directly_reused_by_demand, 1);
         assert_eq!(counters.late_after_demand, 0);
     }
 
@@ -2978,7 +4019,14 @@ mod tests {
         let pending = pending(4);
         let ticket = accept(&controller, &pending);
         controller.record_source_started(ticket.ticket_id, false, false);
-        controller.record_installed(ticket.ticket_id, 4096, None, 0, false);
+        controller.record_installed_with_identity(
+            ticket.ticket_id,
+            4096,
+            physical_identity(1),
+            None,
+            0,
+            false,
+        );
         classify(
             &controller,
             &pending,
@@ -2990,6 +4038,7 @@ mod tests {
         assert_eq!(counters.prediction_useful, 1);
         assert_eq!(counters.completed_before_first_demand, 1);
         assert_eq!(counters.demand_reused_speculative_result, 1);
+        assert_eq!(counters.speculative_install_directly_reused_by_demand, 1);
     }
 
     #[test]
@@ -3055,6 +4104,7 @@ mod tests {
             .accept_candidate(
                 &pending,
                 &pending.candidates[0],
+                1,
                 Arc::new(HashSet::from([4])),
             )
             .unwrap();
@@ -3105,6 +4155,7 @@ mod tests {
             .accept_candidate(
                 &pending,
                 &pending.candidates[0],
+                1,
                 Arc::new(HashSet::from([4])),
             )
             .unwrap();
@@ -3115,6 +4166,164 @@ mod tests {
         assert_eq!(counters.source_acquisition_started, 0);
         assert_eq!(counters.speculative_joined_existing_acquisition, 0);
         assert_eq!(counters.physical_installation_started, 0);
+        let calibration = build_destructive_admission_calibration(&[]).unwrap();
+        assert_eq!(calibration.replacement_count, 0);
+        assert!(calibration.reconciliation.pass);
+        assert!(!calibration.unbounded_replacement_event_log_emitted);
+    }
+
+    #[test]
+    fn direct_reuse_is_not_conflated_with_use_after_later_restoration() {
+        let controller = controller();
+        controller.begin_run(ShadowPhase::Measured, 0).unwrap();
+        let pending = pending(4);
+        let ticket = accept(&controller, &pending);
+        assert!(controller.reserve_install(ticket.ticket_id, true));
+        controller.record_installed_with_identity(
+            ticket.ticket_id,
+            4096,
+            physical_identity(1),
+            Some(victim_decision(Some(6))),
+            0,
+            false,
+        );
+        let later = PendingTarget {
+            boundary: 1,
+            ..pending.clone()
+        };
+        {
+            let mut inner = controller.inner.lock();
+            let run = inner.run.as_mut().unwrap();
+            classify_candidate_demand(
+                run,
+                &later,
+                &HashSet::from([4]),
+                200,
+                |_| Ok(Some(physical_identity(2))),
+            )
+            .unwrap();
+            finalize_direct_reuse_accounting(run).unwrap();
+        }
+        let counters = counters(&controller);
+        assert_eq!(counters.prediction_useful, 1);
+        assert_eq!(counters.prediction_useful_later, 1);
+        assert_eq!(counters.speculative_install_directly_reused_by_demand, 0);
+        assert_eq!(counters.speculative_install_evicted_before_direct_reuse, 1);
+        assert_eq!(counters.speculative_install_never_directly_reused, 1);
+        assert_eq!(
+            counters
+                .speculative_install_used_only_after_later_reinstallation_or_non_speculative_restoration,
+            1
+        );
+    }
+
+    #[test]
+    fn destructive_replacement_preserves_predictor_rank_score_and_victim_decision() {
+        let controller = controller();
+        controller.begin_run(ShadowPhase::Measured, 0).unwrap();
+        let mut pending = pending(4);
+        pending.candidates[0].score = 0.375;
+        let ticket = controller
+            .accept_candidate(
+                &pending,
+                &pending.candidates[0],
+                3,
+                Arc::new(HashSet::from([4])),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(ticket.score, 0.375);
+        assert!(controller.reserve_install(ticket.ticket_id, true));
+        controller.record_installed_with_identity(
+            ticket.ticket_id,
+            4096,
+            physical_identity(1),
+            Some(victim_decision(Some(6))),
+            0,
+            false,
+        );
+        let inner = controller.inner.lock();
+        let events = destructive_replacement_events(inner.run.as_ref().unwrap());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].candidate_rank, 3);
+        assert_eq!(events[0].candidate_score, 0.375);
+        assert_eq!(events[0].victim_global_id, 5);
+        assert_eq!(events[0].victim_physical_lru_rank, 4);
+        assert_eq!(events[0].victim_last_actual_route_token_position, Some(4));
+        assert_eq!(events[0].victim_age_in_completed_tokens, Some(6));
+    }
+
+    #[test]
+    fn bounded_calibration_histograms_outcomes_and_thresholds_reconcile() {
+        let events = vec![
+            replacement_event(0, 1, 0.10, None, true, false, false),
+            replacement_event(1, 2, 0.20, Some(0), false, true, false),
+            replacement_event(2, 3, 0.30, Some(2), false, true, true),
+            replacement_event(3, 4, 0.40, Some(8), true, false, true),
+            replacement_event(4, 5, 0.50, Some(33), false, false, false),
+        ];
+        let calibration = build_destructive_admission_calibration(&events).unwrap();
+        assert_eq!(calibration.replacement_count, 5);
+        assert_eq!(calibration.candidate_scores.all_replacements.count, 5);
+        assert_eq!(calibration.candidate_scores.all_replacements.min, Some(0.10));
+        assert_eq!(calibration.candidate_scores.all_replacements.p50, Some(0.30));
+        assert_eq!(calibration.candidate_scores.all_replacements.max, Some(0.50));
+        assert_eq!(calibration.candidate_rank_outcomes.len(), 8);
+        assert_eq!(calibration.victim_age_outcomes.len(), 9);
+        assert_eq!(calibration.candidate_rank_x_victim_age_outcomes.len(), 72);
+        assert_eq!(calibration.diagnostic_event_filter_threshold_table.len(), 35);
+        assert_eq!(calibration.bounded_replacement_samples.len(), 5);
+        assert_eq!(
+            calibration
+                .mutually_exclusive_outcomes
+                .candidate_direct_payoff_only,
+            1
+        );
+        assert_eq!(
+            calibration
+                .mutually_exclusive_outcomes
+                .both_candidate_direct_payoff_and_victim_harm,
+            1
+        );
+        assert!(calibration.reconciliation.pass);
+        for row in &calibration.diagnostic_event_filter_threshold_table {
+            assert_eq!(
+                row.admitted_historical_events.outcomes.replacement_count
+                    + row.rejected_historical_events.outcomes.replacement_count,
+                5
+            );
+        }
+        let many = (0..100)
+            .map(|ticket_id| {
+                replacement_event(ticket_id, 1, 0.25, Some(9), false, true, false)
+            })
+            .collect::<Vec<_>>();
+        let bounded = build_destructive_admission_calibration(&many).unwrap();
+        assert_eq!(bounded.replacement_count, 100);
+        assert_eq!(bounded.bounded_replacement_samples.len(), 64);
+        assert_eq!(bounded.bounded_replacement_sample_limit, 64);
+    }
+
+    #[test]
+    fn pr1cd2_resource_and_predictor_contracts_remain_frozen() {
+        assert_eq!(SCHEMA, "mer.gpu-native-bounded-live-prefetch.v2");
+        assert_eq!(
+            PR1CD2_COMMIT,
+            "8cb3cbe2ffd561e37add6815a3e8c646d24c772d"
+        );
+        assert_eq!(FROZEN_PREDICTOR, "predictive-loader-second-order");
+        assert_eq!(FROZEN_FANOUT, 8);
+        assert_eq!(
+            LiveResourceBounds::default(),
+            LiveResourceBounds {
+                max_candidates_accepted_per_boundary: 2,
+                max_installations_per_boundary: 1,
+                max_replacements_per_boundary: 1,
+                max_in_flight_source_acquisitions: 1,
+                max_target_boundaries_survived: 1,
+                max_lifecycle_samples: 64,
+            }
+        );
     }
 
     #[test]
@@ -3270,6 +4479,10 @@ mod tests {
             let fields = canonical.as_object().unwrap();
             assert!(!fields.contains_key("total_ram_to_vram_install_bytes"));
             assert!(!fields.contains_key("speculative_ram_to_vram_install_bytes"));
+            assert!(!fields.contains_key("destructive_admission_calibration"));
+            assert!(!fields.contains_key("candidate_rank_outcomes"));
+            assert!(!fields.contains_key("victim_age_outcomes"));
+            assert!(!fields.contains_key("speculative_install_directly_reused_by_demand"));
         }
     }
 
