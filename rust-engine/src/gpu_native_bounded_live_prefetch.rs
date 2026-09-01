@@ -1697,7 +1697,12 @@ fn classify_direct_or_restored_reuse(
         return;
     }
     mark_original_install_evicted_if_needed(counters, record, current_identity);
-    if current_identity.is_some() && !record.used_only_after_later_restoration {
+    if !record.directly_reused_by_demand
+        && record.evicted_before_direct_reuse
+        && current_identity.is_some()
+        && current_identity != Some(installed_identity)
+        && !record.used_only_after_later_restoration
+    {
         record.used_only_after_later_restoration = true;
         counters
             .speculative_install_used_only_after_later_reinstallation_or_non_speculative_restoration = counters
@@ -4173,7 +4178,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_reuse_is_not_conflated_with_use_after_later_restoration() {
+    fn direct_reuse_survives_later_different_physical_identity() {
         let controller = controller();
         controller.begin_run(ShadowPhase::Measured, 0).unwrap();
         let pending = pending(4);
@@ -4194,13 +4199,110 @@ mod tests {
         {
             let mut inner = controller.inner.lock();
             let run = inner.run.as_mut().unwrap();
-            classify_candidate_demand(
-                run,
-                &later,
-                &HashSet::from([4]),
-                200,
-                |_| Ok(Some(physical_identity(2))),
-            )
+            classify_candidate_demand(run, &pending, &HashSet::from([4]), 100, |_| {
+                Ok(Some(physical_identity(1)))
+            })
+            .unwrap();
+            classify_candidate_demand(run, &later, &HashSet::from([4]), 200, |_| {
+                Ok(Some(physical_identity(2)))
+            })
+            .unwrap();
+            finalize_direct_reuse_accounting(run).unwrap();
+        }
+        let counters = counters(&controller);
+        assert_eq!(counters.speculative_install_directly_reused_by_demand, 1);
+        assert_eq!(counters.speculative_install_evicted_before_direct_reuse, 0);
+        assert_eq!(
+            counters
+                .speculative_install_used_only_after_later_reinstallation_or_non_speculative_restoration,
+            0
+        );
+        assert_eq!(counters.speculative_install_never_directly_reused, 0);
+    }
+
+    #[test]
+    fn direct_payoff_classification_is_terminal_across_residency_churn() {
+        let controller = controller();
+        controller.begin_run(ShadowPhase::Measured, 0).unwrap();
+        let pending = pending(4);
+        let ticket = accept(&controller, &pending);
+        assert!(controller.reserve_install(ticket.ticket_id, false));
+        controller.record_installed_with_identity(
+            ticket.ticket_id,
+            4096,
+            physical_identity(1),
+            None,
+            0,
+            false,
+        );
+        {
+            let mut inner = controller.inner.lock();
+            let run = inner.run.as_mut().unwrap();
+            let record = run.candidates.get_mut(&ticket.ticket_id).unwrap();
+            classify_direct_or_restored_reuse(
+                &mut run.counters,
+                record,
+                Some(physical_identity(1)),
+            );
+            mark_original_install_evicted_if_needed(&mut run.counters, record, None);
+            classify_direct_or_restored_reuse(
+                &mut run.counters,
+                record,
+                Some(physical_identity(2)),
+            );
+            mark_original_install_evicted_if_needed(&mut run.counters, record, None);
+            classify_direct_or_restored_reuse(
+                &mut run.counters,
+                record,
+                Some(physical_identity(3)),
+            );
+            assert!(record.directly_reused_by_demand);
+            assert!(!record.evicted_before_direct_reuse);
+            assert!(!record.used_only_after_later_restoration);
+            finalize_direct_reuse_accounting(run).unwrap();
+        }
+        let counters = counters(&controller);
+        assert_eq!(counters.speculative_install_directly_reused_by_demand, 1);
+        assert_eq!(counters.speculative_install_evicted_before_direct_reuse, 0);
+        assert_eq!(
+            counters
+                .speculative_install_used_only_after_later_reinstallation_or_non_speculative_restoration,
+            0
+        );
+        assert_eq!(counters.speculative_install_never_directly_reused, 0);
+    }
+
+    #[test]
+    fn direct_reuse_is_not_conflated_with_use_after_later_restoration() {
+        let controller = controller();
+        controller.begin_run(ShadowPhase::Measured, 0).unwrap();
+        let pending = pending(4);
+        let ticket = accept(&controller, &pending);
+        assert!(controller.reserve_install(ticket.ticket_id, true));
+        controller.record_installed_with_identity(
+            ticket.ticket_id,
+            4096,
+            physical_identity(1),
+            Some(victim_decision(Some(6))),
+            0,
+            false,
+        );
+        let eviction_boundary = PendingTarget {
+            boundary: 1,
+            ..pending.clone()
+        };
+        let later = PendingTarget {
+            boundary: 2,
+            ..pending.clone()
+        };
+        {
+            let mut inner = controller.inner.lock();
+            let run = inner.run.as_mut().unwrap();
+            classify_candidate_demand(run, &eviction_boundary, &HashSet::new(), 150, |_| Ok(None))
+                .unwrap();
+            classify_candidate_demand(run, &later, &HashSet::from([4]), 200, |_| {
+                Ok(Some(physical_identity(2)))
+            })
             .unwrap();
             finalize_direct_reuse_accounting(run).unwrap();
         }
@@ -4214,6 +4316,52 @@ mod tests {
             counters
                 .speculative_install_used_only_after_later_reinstallation_or_non_speculative_restoration,
             1
+        );
+        assert!(
+            counters
+                .speculative_install_used_only_after_later_reinstallation_or_non_speculative_restoration
+                <= counters.speculative_install_evicted_before_direct_reuse
+        );
+        assert!(
+            counters.speculative_install_evicted_before_direct_reuse
+                <= counters.speculative_install_never_directly_reused
+        );
+    }
+
+    #[test]
+    fn exact_direct_payoff_and_legacy_demand_reuse_counters_may_differ() {
+        let controller = controller();
+        controller.begin_run(ShadowPhase::Measured, 0).unwrap();
+        let pending = pending(4);
+        let ticket = accept(&controller, &pending);
+        assert!(controller.reserve_install(ticket.ticket_id, false));
+        controller.record_installed_with_identity(
+            ticket.ticket_id,
+            4096,
+            physical_identity(1),
+            None,
+            0,
+            false,
+        );
+        let later = PendingTarget {
+            boundary: 1,
+            ..pending.clone()
+        };
+        {
+            let mut inner = controller.inner.lock();
+            let run = inner.run.as_mut().unwrap();
+            classify_candidate_demand(run, &later, &HashSet::from([4]), 200, |_| {
+                Ok(Some(physical_identity(1)))
+            })
+            .unwrap();
+            finalize_direct_reuse_accounting(run).unwrap();
+        }
+        let counters = counters(&controller);
+        assert_eq!(counters.speculative_install_directly_reused_by_demand, 1);
+        assert_eq!(counters.demand_reused_speculative_result, 0);
+        assert_ne!(
+            counters.speculative_install_directly_reused_by_demand,
+            counters.demand_reused_speculative_result
         );
     }
 
