@@ -228,6 +228,8 @@ const BOUNDED_LIVE_PREFETCH_COMMAND: &str =
     "qualify-gpu-native-bounded-live-prefetch";
 const BOUNDED_LIVE_PREFETCH_SCORE_CEILING_COMMAND: &str =
     "qualify-gpu-native-bounded-live-prefetch-score-ceiling";
+const BOUNDED_LIVE_PREFETCH_RAM_STAGE_COMMAND: &str =
+    "qualify-gpu-native-bounded-live-prefetch-ram-stage";
 
 fn normalize_stateful_replacement_shadow_command(
     raw_args: &[OsString],
@@ -251,6 +253,7 @@ fn normalize_bounded_live_prefetch_command(
         bool,
         Option<crate::gpu_native_residency::GpuNativeLiveReplacementPolicy>,
         bool,
+        bool,
     ),
     String,
 > {
@@ -259,12 +262,14 @@ fn normalize_bounded_live_prefetch_command(
         .position(|arg| {
             arg == BOUNDED_LIVE_PREFETCH_COMMAND
                 || arg == BOUNDED_LIVE_PREFETCH_SCORE_CEILING_COMMAND
+                || arg == BOUNDED_LIVE_PREFETCH_RAM_STAGE_COMMAND
         })
     else {
-        return Ok((raw_args.to_vec(), false, None, false));
+        return Ok((raw_args.to_vec(), false, None, false, false));
     };
-    let score_ceiling_requested =
-        raw_args[command_index] == BOUNDED_LIVE_PREFETCH_SCORE_CEILING_COMMAND;
+    let ram_stage_requested = raw_args[command_index] == BOUNDED_LIVE_PREFETCH_RAM_STAGE_COMMAND;
+    let score_ceiling_requested = ram_stage_requested
+        || raw_args[command_index] == BOUNDED_LIVE_PREFETCH_SCORE_CEILING_COMMAND;
     let mut normalized = Vec::with_capacity(raw_args.len());
     let mut policy = None;
     let mut index = 0usize;
@@ -304,7 +309,13 @@ fn normalize_bounded_live_prefetch_command(
         }
         index += 1;
     }
-    Ok((normalized, true, policy, score_ceiling_requested))
+    Ok((
+        normalized,
+        true,
+        policy,
+        score_ceiling_requested,
+        ram_stage_requested,
+    ))
 }
 
 /// MoE execution engine that streams experts from NVMe via O_DIRECT pread(2).
@@ -2049,6 +2060,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bounded_live_prefetch_requested,
         bounded_live_replacement_policy,
         bounded_live_score_ceiling_requested,
+        bounded_live_ram_stage_requested,
     ) = normalize_bounded_live_prefetch_command(&stateful_normalized_args)?;
     let cli = Cli::parse_from(normalized_args);
     let worker_protocol_stdout = matches!(
@@ -2517,6 +2529,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         expected_adapter_name,
                         replacement_policy,
                         score_ceiling_gate: bounded_live_score_ceiling_requested,
+                        ram_stage_enabled: bounded_live_ram_stage_requested,
                         report_out,
                         progress_watchdog,
                     },

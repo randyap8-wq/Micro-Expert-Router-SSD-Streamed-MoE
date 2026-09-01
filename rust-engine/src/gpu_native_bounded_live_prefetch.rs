@@ -15,16 +15,19 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 pub(crate) const SCHEMA: &str = "mer.gpu-native-bounded-live-prefetch.v2";
 pub(crate) const SCORE_CEILING_SCHEMA: &str = "mer.gpu-native-bounded-live-prefetch.v3";
+pub(crate) const RAM_STAGE_SCHEMA: &str = "mer.gpu-native-bounded-live-prefetch.v4";
 pub(crate) const MODE: &str = "gpu-native-bounded-live-prefetch";
 pub(crate) const SCORE_CEILING_MODE: &str = "gpu-native-bounded-live-prefetch-score-ceiling";
+pub(crate) const RAM_STAGE_MODE: &str = "gpu-native-bounded-live-prefetch-ram-stage";
 pub(crate) const COMMAND: &str = "qualify-gpu-native-bounded-live-prefetch";
 pub(crate) const SCORE_CEILING_COMMAND: &str =
     "qualify-gpu-native-bounded-live-prefetch-score-ceiling";
+pub(crate) const RAM_STAGE_COMMAND: &str = "qualify-gpu-native-bounded-live-prefetch-ram-stage";
 pub(crate) const SOURCE_MAIN_COMMIT: &str = "e8b542110693e74aa8f1013bb16d1bed0bdd8ba7";
 pub(crate) const TESTED_PR1BB_COMMIT: &str = "c7006c5c6fbcee74c91526f89a8c2b5b06d8a9c5";
 pub(crate) const TESTED_PR1BB_REPORT_SHA256: &str =
@@ -42,6 +45,11 @@ pub(crate) const PR1CE1_REPORT_SHA256: &str =
     "76bd74c00754032da22ceb49973a5f5a13864b4065db7ccf123c15146f7bc066";
 pub(crate) const PR1CE1_LOG_SHA256: &str =
     "3dd56a71f9dca30c5619a2cfbd754cebb3e9bd60358d1f903411de49511eebc9";
+pub(crate) const PR1CF_COMMIT: &str = "b03b9bd97ffb96e555c13600f8f7dcfe18aa972d";
+pub(crate) const PR1CF_REPORT_SHA256: &str =
+    "0ceb5964d6539927a5c49517f50e9f3809e6757d41f56efd0746ad983e9684b2";
+pub(crate) const PR1CF_LOG_SHA256: &str =
+    "3425b3cfaf34c2df3fe12dc29dd3daeaac86f90e7e832169dc7e34660e703ed6";
 pub(crate) const FROZEN_CANDIDATE_SCORE_CEILING: f64 = 0.002777777777777778;
 pub(crate) const SCORE_CEILING_COMPARISON: &str = "candidate.score < threshold";
 
@@ -65,6 +73,7 @@ pub(crate) struct CommandArgs {
     pub(crate) expected_adapter_name: String,
     pub(crate) replacement_policy: GpuNativeLiveReplacementPolicy,
     pub(crate) score_ceiling_gate: bool,
+    pub(crate) ram_stage_enabled: bool,
     pub(crate) report_out: Option<PathBuf>,
     pub(crate) progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
 }
@@ -119,6 +128,7 @@ pub(crate) struct LiveControllerConfig {
     pub(crate) markov_min_prob: f64,
     pub(crate) bounds: LiveResourceBounds,
     pub(crate) candidate_score_ceiling: Option<f64>,
+    pub(crate) ram_stage_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -214,7 +224,24 @@ struct CandidateRecord {
     victim_decision: Option<GpuNativeLiveVictimDecision>,
     miss_introduced_by_victim_eviction: bool,
     miss_boundary_introduced_by_victim_eviction: bool,
+    ram_stage: Option<RamStageResidentIdentity>,
+    ram_stage_first_demand_observed: bool,
+    ram_stage_demand_reuse_counted: bool,
+    ram_stage_evicted_before_first_demand: bool,
     abort_handle: Option<tokio::task::AbortHandle>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RamStageSourceKind {
+    AlreadyRamResident,
+    JoinedExistingAcquisition,
+    NvmeInserted,
+}
+
+#[derive(Clone, Debug)]
+struct RamStageResidentIdentity {
+    source: RamStageSourceKind,
+    resident: Weak<crate::expert_cache::ExpertResident>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,6 +348,79 @@ struct ScoreGateCounters {
     rejected: u64,
     admitted_score_min: Option<f64>,
     admitted_score_max: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RamStageCounters {
+    requests: u64,
+    already_ram_resident_stage_hits: u64,
+    joined_existing_acquisition_completions: u64,
+    nvme_stage_reads: u64,
+    nvme_stage_bytes: u64,
+    successful_ram_cache_inserts: u64,
+    stage_completions: u64,
+    demand_reused_staged_ram_expert: u64,
+    demand_reused_preexisting_ram_expert: u64,
+    ram_cache_evictions_caused_by_staging: u64,
+    staged_expert_evicted_before_first_demand: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct RamStageRunEvidence {
+    pub(crate) requests: u64,
+    pub(crate) already_ram_resident_stage_hits: u64,
+    pub(crate) joined_existing_acquisition_completions: u64,
+    pub(crate) nvme_stage_reads: u64,
+    pub(crate) nvme_stage_bytes: u64,
+    pub(crate) successful_ram_cache_inserts: u64,
+    pub(crate) stage_completions: u64,
+    pub(crate) terminal_without_stage_completion: u64,
+    pub(crate) demand_reused_staged_ram_expert: u64,
+    pub(crate) demand_reused_preexisting_ram_expert: u64,
+    pub(crate) demand_arrived_while_ram_staging_in_flight: u64,
+    pub(crate) ram_cache_evictions_caused_by_staging: u64,
+    pub(crate) staged_expert_evicted_before_first_demand: u64,
+    pub(crate) speculative_h2d_installs: u64,
+    pub(crate) speculative_h2d_bytes: u64,
+    pub(crate) speculative_replacements: u64,
+    pub(crate) speculative_evictions: u64,
+    pub(crate) speculative_victim_decisions: u64,
+    pub(crate) requests_reconcile: bool,
+    pub(crate) completion_sources_reconcile: bool,
+    pub(crate) nvme_counters_reconcile: bool,
+    pub(crate) zero_speculative_gpu_work: bool,
+    pub(crate) reconciliation_pass: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct RamStageGpuIsolationEvidence {
+    pub(crate) speculative_physical_probe_requests: u64,
+    pub(crate) speculative_physical_probe_hits: u64,
+    pub(crate) speculative_h2d_installs: u64,
+    pub(crate) speculative_h2d_bytes: u64,
+    pub(crate) speculative_replacements: u64,
+    pub(crate) speculative_evictions: u64,
+    pub(crate) speculative_gpu_admission_enabled: bool,
+    pub(crate) zero_speculative_gpu_work: bool,
+    pub(crate) reconciliation_pass: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct RamStageContractEvidence {
+    pub(crate) qualification_only: bool,
+    pub(crate) speculative_gpu_admission_enabled: bool,
+    pub(crate) speculative_ram_stage_enabled: bool,
+    pub(crate) pr1cf_commit: &'static str,
+    pub(crate) pr1cf_report_sha256: &'static str,
+    pub(crate) pr1cf_log_sha256: &'static str,
+    pub(crate) frozen_score_threshold: f64,
+    pub(crate) strict_score_comparison: &'static str,
+    pub(crate) completion_boundary: &'static str,
+    pub(crate) demand_reuse_semantics: &'static str,
+    pub(crate) exact_provenance_semantics: &'static str,
+    pub(crate) ordinary_ram_cache_semantics_preserved: bool,
+    pub(crate) ram_capacity_increased: bool,
+    pub(crate) counterfactual_performance_claim: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -585,6 +685,8 @@ pub(crate) struct LiveRunEvidence {
     pub(crate) lifecycle_samples: Vec<LiveLifecycleSample>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) score_gate: Option<ScoreGateRunEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ram_stage: Option<RamStageRunEvidence>,
     pub(crate) destructive_admission_calibration: DestructiveAdmissionCalibrationEvidence,
     #[serde(skip_serializing)]
     calibration_events: Vec<DestructiveReplacementEvent>,
@@ -631,6 +733,7 @@ struct ActiveRun {
     timing: TimingValues,
     samples: Vec<LiveLifecycleSample>,
     score_gate: ScoreGateCounters,
+    ram_stage: RamStageCounters,
     failure: Option<String>,
 }
 
@@ -670,6 +773,8 @@ impl GpuNativeBoundedLivePrefetchController {
             || config
                 .candidate_score_ceiling
                 .is_some_and(|threshold| !threshold.is_finite() || threshold <= 0.0)
+            || (config.ram_stage_enabled
+                && config.candidate_score_ceiling != Some(FROZEN_CANDIDATE_SCORE_CEILING))
         {
             return Err(ShadowObserverError::new(format!(
                 "invalid bounded live-prefetch config: {config:?}"
@@ -707,6 +812,10 @@ impl GpuNativeBoundedLivePrefetchController {
 
     pub(crate) fn score_gate_enabled(&self) -> bool {
         self.config.candidate_score_ceiling.is_some()
+    }
+
+    pub(crate) fn ram_stage_enabled(&self) -> bool {
+        self.config.ram_stage_enabled
     }
 
     /// PR1C-F's qualification-only admission decision. The engine calls this
@@ -756,6 +865,12 @@ impl GpuNativeBoundedLivePrefetchController {
                         .admitted_score_max
                         .map_or(record.score, |value| value.max(record.score)),
                 );
+                if self.config.ram_stage_enabled {
+                    run.ram_stage.requests =
+                        run.ram_stage.requests.checked_add(1).ok_or_else(|| {
+                            ShadowObserverError::new("RAM-stage request counter overflow")
+                        })?;
+                }
                 true
             } else {
                 record.score_gate_decision = ScoreGateDecision::Rejected;
@@ -800,6 +915,7 @@ impl GpuNativeBoundedLivePrefetchController {
             timing: TimingValues::default(),
             samples: Vec::new(),
             score_gate: ScoreGateCounters::default(),
+            ram_stage: RamStageCounters::default(),
             failure: None,
         });
         Ok(())
@@ -1057,6 +1173,10 @@ impl GpuNativeBoundedLivePrefetchController {
                 victim_decision: None,
                 miss_introduced_by_victim_eviction: false,
                 miss_boundary_introduced_by_victim_eviction: false,
+                ram_stage: None,
+                ram_stage_first_demand_observed: false,
+                ram_stage_demand_reuse_counted: false,
+                ram_stage_evicted_before_first_demand: false,
                 abort_handle: None,
             },
         );
@@ -1171,6 +1291,71 @@ impl GpuNativeBoundedLivePrefetchController {
             .saturating_add(1);
     }
 
+    /// Attribute an ordinary foreground RAM source lookup to an exact
+    /// PR1C-G resident identity. This observes the existing demand path; it
+    /// does not select a source or create a qualification-only fast path.
+    pub(crate) fn record_demand_ram_source(
+        &self,
+        global_id: u32,
+        resident: &Arc<crate::expert_cache::ExpertResident>,
+    ) {
+        if !self.config.ram_stage_enabled {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        let Some(run) = inner.run.as_mut() else {
+            return;
+        };
+        let mut reused_staged = false;
+        let mut reused_preexisting = false;
+        let mut evicted_before_demand = 0u64;
+        for record in run
+            .candidates
+            .values_mut()
+            .filter(|record| record.global_id == global_id)
+        {
+            let Some(identity) = record.ram_stage.as_ref() else {
+                continue;
+            };
+            if record.ram_stage_first_demand_observed {
+                continue;
+            }
+            record.ram_stage_first_demand_observed = true;
+            if ram_stage_resident_matches(identity, resident) {
+                record.ram_stage_demand_reuse_counted = true;
+                match identity.source {
+                    RamStageSourceKind::NvmeInserted if !reused_staged => {
+                        reused_staged = true;
+                    }
+                    RamStageSourceKind::AlreadyRamResident
+                    | RamStageSourceKind::JoinedExistingAcquisition
+                        if !reused_staged && !reused_preexisting =>
+                    {
+                        reused_preexisting = true;
+                    }
+                    _ => {}
+                }
+            } else if identity.source == RamStageSourceKind::NvmeInserted
+                && !record.ram_stage_evicted_before_first_demand
+            {
+                record.ram_stage_evicted_before_first_demand = true;
+                evicted_before_demand = evicted_before_demand.saturating_add(1);
+            }
+        }
+        run.ram_stage.demand_reused_staged_ram_expert = run
+            .ram_stage
+            .demand_reused_staged_ram_expert
+            .saturating_add(u64::from(reused_staged));
+        run.ram_stage.demand_reused_preexisting_ram_expert = run
+            .ram_stage
+            .demand_reused_preexisting_ram_expert
+            .saturating_add(u64::from(!reused_staged && reused_preexisting));
+        run.ram_stage.staged_expert_evicted_before_first_demand = run
+            .ram_stage
+            .staged_expert_evicted_before_first_demand
+            .saturating_add(evicted_before_demand);
+    }
+
     /// Called only after the foreground demand transaction has returned the
     /// complete selected set. This closes the race where a speculative install
     /// finishes after the target probe but early enough for that same demand
@@ -1247,6 +1432,86 @@ impl GpuNativeBoundedLivePrefetchController {
             run.counters.speculative_nvme_operations.saturating_add(1);
         run.counters.speculative_nvme_bytes =
             run.counters.speculative_nvme_bytes.saturating_add(bytes);
+        if self.config.ram_stage_enabled {
+            run.ram_stage.nvme_stage_reads = run.ram_stage.nvme_stage_reads.saturating_add(1);
+            run.ram_stage.nvme_stage_bytes = run.ram_stage.nvme_stage_bytes.saturating_add(bytes);
+        }
+    }
+
+    pub(crate) fn record_ram_stage_completed(
+        &self,
+        ticket_id: u64,
+        resident: &Arc<crate::expert_cache::ExpertResident>,
+        source: RamStageSourceKind,
+    ) {
+        let resident = Arc::downgrade(resident);
+        self.finish_ticket(ticket_id, "ram-stage-completed", |run, record, _| {
+            if record.source_started_at_us.is_none() || record.ram_stage.is_some() {
+                run.failure.get_or_insert_with(|| {
+                    format!(
+                        "RAM-stage completion for ticket {ticket_id} lacked one source start or was duplicated"
+                    )
+                });
+                return;
+            }
+            record.ram_stage = Some(RamStageResidentIdentity { source, resident });
+            run.ram_stage.stage_completions = run.ram_stage.stage_completions.saturating_add(1);
+            match source {
+                RamStageSourceKind::AlreadyRamResident => {
+                    run.ram_stage.already_ram_resident_stage_hits = run
+                        .ram_stage
+                        .already_ram_resident_stage_hits
+                        .saturating_add(1);
+                }
+                RamStageSourceKind::JoinedExistingAcquisition => {
+                    run.ram_stage.joined_existing_acquisition_completions = run
+                        .ram_stage
+                        .joined_existing_acquisition_completions
+                        .saturating_add(1);
+                }
+                RamStageSourceKind::NvmeInserted => {
+                    run.ram_stage.successful_ram_cache_inserts = run
+                        .ram_stage
+                        .successful_ram_cache_inserts
+                        .saturating_add(1);
+                }
+            }
+        });
+    }
+
+    pub(crate) fn record_ram_cache_eviction_caused_by_staging(
+        &self,
+        evicted: &Arc<crate::expert_cache::ExpertResident>,
+    ) {
+        if !self.config.ram_stage_enabled {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        let Some(run) = inner.run.as_mut() else {
+            return;
+        };
+        run.ram_stage.ram_cache_evictions_caused_by_staging = run
+            .ram_stage
+            .ram_cache_evictions_caused_by_staging
+            .saturating_add(1);
+        let mut newly_attributed = 0u64;
+        for record in run.candidates.values_mut() {
+            let Some(identity) = record.ram_stage.as_ref() else {
+                continue;
+            };
+            if identity.source == RamStageSourceKind::NvmeInserted
+                && !record.ram_stage_first_demand_observed
+                && !record.ram_stage_evicted_before_first_demand
+                && ram_stage_resident_matches(identity, evicted)
+            {
+                record.ram_stage_evicted_before_first_demand = true;
+                newly_attributed = newly_attributed.saturating_add(1);
+            }
+        }
+        run.ram_stage.staged_expert_evicted_before_first_demand = run
+            .ram_stage
+            .staged_expert_evicted_before_first_demand
+            .saturating_add(newly_attributed);
     }
 
     pub(crate) fn reserve_install(&self, ticket_id: u64, replacement_needed: bool) -> bool {
@@ -1521,6 +1786,9 @@ impl GpuNativeBoundedLivePrefetchController {
                 "live-prefetch finalization found {orphan_in_flight_source_entries} orphan singleflight source entries"
             )));
         }
+        if self.config.ram_stage_enabled {
+            self.reconcile_ram_stage_final_cache_state(engine);
+        }
         let postconditions = residency.validate_live_postconditions()?;
         let mut inner = self.inner.lock();
         let mut run = inner.run.take().ok_or_else(|| {
@@ -1581,6 +1849,11 @@ impl GpuNativeBoundedLivePrefetchController {
             .candidate_score_ceiling
             .map(|threshold| build_score_gate_run_evidence(&run, threshold))
             .transpose()?;
+        let ram_stage = self
+            .config
+            .ram_stage_enabled
+            .then(|| build_ram_stage_run_evidence(&run))
+            .transpose()?;
         run.counters.prediction_unused = run
             .candidates
             .values()
@@ -1620,6 +1893,7 @@ impl GpuNativeBoundedLivePrefetchController {
             timing,
             lifecycle_samples: run.samples,
             score_gate,
+            ram_stage,
             destructive_admission_calibration,
             calibration_events,
             postconditions,
@@ -1630,6 +1904,187 @@ impl GpuNativeBoundedLivePrefetchController {
             no_leaked_install_reservations: true,
         })
     }
+
+    fn reconcile_ram_stage_final_cache_state(&self, engine: &crate::engine::Engine) {
+        let pending = {
+            let inner = self.inner.lock();
+            let Some(run) = inner.run.as_ref() else {
+                return;
+            };
+            run.candidates
+                .iter()
+                .filter_map(|(&ticket_id, record)| {
+                    let identity = record.ram_stage.as_ref()?;
+                    (identity.source == RamStageSourceKind::NvmeInserted
+                        && !record.ram_stage_first_demand_observed
+                        && !record.ram_stage_evicted_before_first_demand)
+                        .then_some((ticket_id, record.global_id, identity.resident.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        let evicted = pending
+            .into_iter()
+            .filter_map(|(ticket_id, global_id, expected)| {
+                let current = engine.bounded_live_ram_cache_peek(global_id);
+                let matches = expected.upgrade().is_some_and(|expected| {
+                    current
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(&expected, current))
+                });
+                (!matches).then_some(ticket_id)
+            })
+            .collect::<Vec<_>>();
+        if evicted.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        let Some(run) = inner.run.as_mut() else {
+            return;
+        };
+        let mut newly_attributed = 0u64;
+        for ticket_id in evicted {
+            let Some(record) = run.candidates.get_mut(&ticket_id) else {
+                continue;
+            };
+            if !record.ram_stage_first_demand_observed
+                && !record.ram_stage_evicted_before_first_demand
+            {
+                record.ram_stage_evicted_before_first_demand = true;
+                newly_attributed = newly_attributed.saturating_add(1);
+            }
+        }
+        run.ram_stage.staged_expert_evicted_before_first_demand = run
+            .ram_stage
+            .staged_expert_evicted_before_first_demand
+            .saturating_add(newly_attributed);
+    }
+}
+
+fn ram_stage_resident_matches(
+    identity: &RamStageResidentIdentity,
+    resident: &Arc<crate::expert_cache::ExpertResident>,
+) -> bool {
+    identity
+        .resident
+        .upgrade()
+        .is_some_and(|expected| Arc::ptr_eq(&expected, resident))
+}
+
+fn build_ram_stage_run_evidence(
+    run: &ActiveRun,
+) -> Result<RamStageRunEvidence, ShadowObserverError> {
+    let stage_records = run
+        .candidates
+        .values()
+        .filter(|record| record.ram_stage.is_some())
+        .count() as u64;
+    let terminal_without_stage_completion = run
+        .candidates
+        .values()
+        .filter(|record| {
+            record.score_gate_decision == ScoreGateDecision::Admitted && record.ram_stage.is_none()
+        })
+        .count() as u64;
+    let already_records =
+        run.candidates
+            .values()
+            .filter(|record| {
+                record.ram_stage.as_ref().is_some_and(|identity| {
+                    identity.source == RamStageSourceKind::AlreadyRamResident
+                })
+            })
+            .count() as u64;
+    let joined_records = run
+        .candidates
+        .values()
+        .filter(|record| {
+            record.ram_stage.as_ref().is_some_and(|identity| {
+                identity.source == RamStageSourceKind::JoinedExistingAcquisition
+            })
+        })
+        .count() as u64;
+    let inserted_records = run
+        .candidates
+        .values()
+        .filter(|record| {
+            record
+                .ram_stage
+                .as_ref()
+                .is_some_and(|identity| identity.source == RamStageSourceKind::NvmeInserted)
+        })
+        .count() as u64;
+    let speculative_victim_decisions = run
+        .candidates
+        .values()
+        .filter(|record| record.victim_decision.is_some())
+        .count() as u64;
+    let requests_reconcile = run.ram_stage.requests == run.score_gate.admitted
+        && run
+            .ram_stage
+            .requests
+            .checked_sub(run.ram_stage.stage_completions)
+            == Some(terminal_without_stage_completion);
+    let completion_sources_reconcile = run
+        .ram_stage
+        .already_ram_resident_stage_hits
+        .checked_add(run.ram_stage.joined_existing_acquisition_completions)
+        .and_then(|value| value.checked_add(run.ram_stage.successful_ram_cache_inserts))
+        == Some(run.ram_stage.stage_completions)
+        && stage_records == run.ram_stage.stage_completions
+        && already_records == run.ram_stage.already_ram_resident_stage_hits
+        && joined_records == run.ram_stage.joined_existing_acquisition_completions
+        && inserted_records == run.ram_stage.successful_ram_cache_inserts;
+    let nvme_counters_reconcile = run.ram_stage.nvme_stage_reads
+        == run.counters.speculative_nvme_operations
+        && run.ram_stage.nvme_stage_bytes == run.counters.speculative_nvme_bytes;
+    let zero_speculative_gpu_work = run.counters.physical_installation_started == 0
+        && run.counters.physical_installation_completed == 0
+        && run.counters.speculative_h2d_installs == 0
+        && run.counters.speculative_h2d_bytes == 0
+        && run.counters.speculative_replacements == 0
+        && run.counters.speculative_evictions == 0
+        && speculative_victim_decisions == 0;
+    let reconciliation_pass = requests_reconcile
+        && completion_sources_reconcile
+        && nvme_counters_reconcile
+        && zero_speculative_gpu_work;
+    let evidence = RamStageRunEvidence {
+        requests: run.ram_stage.requests,
+        already_ram_resident_stage_hits: run.ram_stage.already_ram_resident_stage_hits,
+        joined_existing_acquisition_completions: run
+            .ram_stage
+            .joined_existing_acquisition_completions,
+        nvme_stage_reads: run.ram_stage.nvme_stage_reads,
+        nvme_stage_bytes: run.ram_stage.nvme_stage_bytes,
+        successful_ram_cache_inserts: run.ram_stage.successful_ram_cache_inserts,
+        stage_completions: run.ram_stage.stage_completions,
+        terminal_without_stage_completion,
+        demand_reused_staged_ram_expert: run.ram_stage.demand_reused_staged_ram_expert,
+        demand_reused_preexisting_ram_expert: run.ram_stage.demand_reused_preexisting_ram_expert,
+        demand_arrived_while_ram_staging_in_flight: run
+            .counters
+            .demand_joined_speculative_acquisition,
+        ram_cache_evictions_caused_by_staging: run.ram_stage.ram_cache_evictions_caused_by_staging,
+        staged_expert_evicted_before_first_demand: run
+            .ram_stage
+            .staged_expert_evicted_before_first_demand,
+        speculative_h2d_installs: run.counters.speculative_h2d_installs,
+        speculative_h2d_bytes: run.counters.speculative_h2d_bytes,
+        speculative_replacements: run.counters.speculative_replacements,
+        speculative_evictions: run.counters.speculative_evictions,
+        speculative_victim_decisions,
+        requests_reconcile,
+        completion_sources_reconcile,
+        nvme_counters_reconcile,
+        zero_speculative_gpu_work,
+        reconciliation_pass,
+    };
+    if !evidence.reconciliation_pass {
+        return Err(ShadowObserverError::new(format!(
+            "RAM-stage accounting did not reconcile: {evidence:?}"
+        )));
+    }
+    Ok(evidence)
 }
 
 fn build_score_gate_run_evidence(
@@ -1660,6 +2115,7 @@ fn build_score_gate_run_evidence(
                 && !candidate.installed
                 && candidate.installed_identity.is_none()
                 && candidate.victim_decision.is_none()
+                && candidate.ram_stage.is_none()
         });
     let admitted_score_bounds_reconcile = if run.score_gate.admitted == 0 {
         run.score_gate.admitted_score_min.is_none() && run.score_gate.admitted_score_max.is_none()
@@ -2401,6 +2857,8 @@ pub(crate) struct LiveQualifiedRunEvidence {
     pub(crate) production: crate::gpu_native_real_benchmark::PerRunResult,
     pub(crate) live: LiveRunEvidence,
     pub(crate) gpu_native_h2d_install_bytes: QualificationInstallByteEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ram_stage_gpu_isolation: Option<RamStageGpuIsolationEvidence>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -2475,8 +2933,11 @@ pub(crate) struct LiveArmEvidence {
     pub(crate) measured_live_fractions: LiveDerivedFractions,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) measured_score_gate: Option<ScoreGateRunEvidence>,
-    pub(crate) measured_destructive_admission_calibration:
-        DestructiveAdmissionCalibrationEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) measured_ram_stage: Option<RamStageRunEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) measured_ram_stage_gpu_isolation: Option<RamStageGpuIsolationEvidence>,
+    pub(crate) measured_destructive_admission_calibration: DestructiveAdmissionCalibrationEvidence,
     pub(crate) measured_source_attribution: DemandSourceEvidence,
     pub(crate) runtime_shutdown: crate::greedy_parity::BackgroundShutdownEvidence,
 }
@@ -2557,6 +3018,14 @@ pub(crate) struct DestructiveAdmissionEconomicsEvidence {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct RamStageEconomicsEvidence {
+    pub(crate) foreground_demand_nvme_operations_avoided: i128,
+    pub(crate) speculative_ram_stage_nvme_operations_added: i128,
+    pub(crate) net_total_nvme_operation_delta: i128,
+    pub(crate) reconciliation_pass: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct PerformanceEvidence {
     pub(crate) pass: bool,
     pub(crate) eligible_for_interpretation: bool,
@@ -2580,6 +3049,10 @@ pub(crate) struct LivePathExercisedEvidence {
     pub(crate) source_acquisition_started: u64,
     pub(crate) speculative_source_joins: u64,
     pub(crate) physical_installation_started: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ram_stage_requests: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ram_stage_completions: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2644,6 +3117,10 @@ pub(crate) struct BoundedLivePrefetchReport {
     pub(crate) score_gate_contract: Option<ScoreGateContractEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) score_gate_reconciliation_pass: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ram_stage_contract: Option<RamStageContractEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ram_stage_reconciliation_pass: Option<bool>,
     pub(crate) normal_production_default_remains_disabled: bool,
     pub(crate) production_semantics: LiveProductionSemantics,
     pub(crate) cache_reset: crate::BenchRealCacheReset,
@@ -2655,8 +3132,9 @@ pub(crate) struct BoundedLivePrefetchReport {
     pub(crate) live_path_exercised: Option<LivePathExercisedEvidence>,
     pub(crate) residency_effectiveness: Option<ResidencyEffectivenessEvidence>,
     pub(crate) demand_source_comparison: Option<DemandSourceComparisonEvidence>,
-    pub(crate) destructive_admission_economics:
-        Option<DestructiveAdmissionEconomicsEvidence>,
+    pub(crate) destructive_admission_economics: Option<DestructiveAdmissionEconomicsEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ram_stage_economics: Option<RamStageEconomicsEvidence>,
     pub(crate) performance: Option<PerformanceEvidence>,
 }
 
@@ -2840,6 +3318,226 @@ fn aggregate_score_gate(
     }))
 }
 
+fn aggregate_ram_stage(
+    runs: &[LiveQualifiedRunEvidence],
+    live: &LiveLifecycleCounters,
+) -> Result<Option<RamStageRunEvidence>, crate::gpu_native_real_benchmark::BenchmarkFailure> {
+    use crate::gpu_native_real_benchmark::BenchmarkFailure;
+    let enabled = runs.iter().any(|run| run.live.ram_stage.is_some());
+    if !enabled {
+        return Ok(None);
+    }
+    if runs.iter().any(|run| run.live.ram_stage.is_none()) {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "ram-stage-run-evidence-missing",
+            "RAM-stage arm mixed enabled and disabled run evidence",
+        ));
+    }
+    let evidence = runs
+        .iter()
+        .map(|run| {
+            run.live
+                .ram_stage
+                .as_ref()
+                .expect("RAM-stage evidence checked")
+        })
+        .collect::<Vec<_>>();
+    let sum = |field: fn(&RamStageRunEvidence) -> u64, name: &str| {
+        checked_sum(evidence.iter().map(|value| field(value)), name)
+    };
+    let requests = sum(|value| value.requests, "ram-stage-requests")?;
+    let already_ram_resident_stage_hits = sum(
+        |value| value.already_ram_resident_stage_hits,
+        "already-ram-resident-stage-hits",
+    )?;
+    let joined_existing_acquisition_completions = sum(
+        |value| value.joined_existing_acquisition_completions,
+        "joined-existing-acquisition-completions",
+    )?;
+    let nvme_stage_reads = sum(|value| value.nvme_stage_reads, "nvme-stage-reads")?;
+    let nvme_stage_bytes = sum(|value| value.nvme_stage_bytes, "nvme-stage-bytes")?;
+    let successful_ram_cache_inserts = sum(
+        |value| value.successful_ram_cache_inserts,
+        "successful-ram-cache-inserts",
+    )?;
+    let stage_completions = sum(|value| value.stage_completions, "ram-stage-completions")?;
+    let terminal_without_stage_completion = sum(
+        |value| value.terminal_without_stage_completion,
+        "ram-stage-terminal-without-completion",
+    )?;
+    let demand_reused_staged_ram_expert = sum(
+        |value| value.demand_reused_staged_ram_expert,
+        "demand-reused-staged-ram-expert",
+    )?;
+    let demand_reused_preexisting_ram_expert = sum(
+        |value| value.demand_reused_preexisting_ram_expert,
+        "demand-reused-preexisting-ram-expert",
+    )?;
+    let demand_arrived_while_ram_staging_in_flight = sum(
+        |value| value.demand_arrived_while_ram_staging_in_flight,
+        "demand-arrived-while-ram-staging-in-flight",
+    )?;
+    let ram_cache_evictions_caused_by_staging = sum(
+        |value| value.ram_cache_evictions_caused_by_staging,
+        "ram-cache-evictions-caused-by-staging",
+    )?;
+    let staged_expert_evicted_before_first_demand = sum(
+        |value| value.staged_expert_evicted_before_first_demand,
+        "staged-expert-evicted-before-first-demand",
+    )?;
+    let speculative_h2d_installs = sum(
+        |value| value.speculative_h2d_installs,
+        "speculative-h2d-installs",
+    )?;
+    let speculative_h2d_bytes = sum(|value| value.speculative_h2d_bytes, "speculative-h2d-bytes")?;
+    let speculative_replacements = sum(
+        |value| value.speculative_replacements,
+        "speculative-replacements",
+    )?;
+    let speculative_evictions = sum(|value| value.speculative_evictions, "speculative-evictions")?;
+    let speculative_victim_decisions = sum(
+        |value| value.speculative_victim_decisions,
+        "speculative-victim-decisions",
+    )?;
+    let requests_reconcile =
+        requests.checked_sub(stage_completions) == Some(terminal_without_stage_completion);
+    let completion_sources_reconcile = already_ram_resident_stage_hits
+        .checked_add(joined_existing_acquisition_completions)
+        .and_then(|value| value.checked_add(successful_ram_cache_inserts))
+        == Some(stage_completions);
+    let nvme_counters_reconcile = nvme_stage_reads == live.speculative_nvme_operations
+        && nvme_stage_bytes == live.speculative_nvme_bytes;
+    let zero_speculative_gpu_work = speculative_h2d_installs == 0
+        && speculative_h2d_bytes == 0
+        && speculative_replacements == 0
+        && speculative_evictions == 0
+        && speculative_victim_decisions == 0
+        && live.physical_installation_started == 0
+        && live.physical_installation_completed == 0;
+    let reconciliation_pass = requests_reconcile
+        && completion_sources_reconcile
+        && nvme_counters_reconcile
+        && zero_speculative_gpu_work
+        && evidence.iter().all(|value| value.reconciliation_pass);
+    let aggregate = RamStageRunEvidence {
+        requests,
+        already_ram_resident_stage_hits,
+        joined_existing_acquisition_completions,
+        nvme_stage_reads,
+        nvme_stage_bytes,
+        successful_ram_cache_inserts,
+        stage_completions,
+        terminal_without_stage_completion,
+        demand_reused_staged_ram_expert,
+        demand_reused_preexisting_ram_expert,
+        demand_arrived_while_ram_staging_in_flight,
+        ram_cache_evictions_caused_by_staging,
+        staged_expert_evicted_before_first_demand,
+        speculative_h2d_installs,
+        speculative_h2d_bytes,
+        speculative_replacements,
+        speculative_evictions,
+        speculative_victim_decisions,
+        requests_reconcile,
+        completion_sources_reconcile,
+        nvme_counters_reconcile,
+        zero_speculative_gpu_work,
+        reconciliation_pass,
+    };
+    if !aggregate.reconciliation_pass {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "ram-stage-aggregate-reconciliation-failed",
+            format!("RAM-stage aggregate did not reconcile: {aggregate:?}"),
+        ));
+    }
+    Ok(Some(aggregate))
+}
+
+fn aggregate_ram_stage_gpu_isolation(
+    runs: &[LiveQualifiedRunEvidence],
+) -> Result<Option<RamStageGpuIsolationEvidence>, crate::gpu_native_real_benchmark::BenchmarkFailure>
+{
+    use crate::gpu_native_real_benchmark::BenchmarkFailure;
+    let enabled = runs.iter().any(|run| run.ram_stage_gpu_isolation.is_some());
+    if !enabled {
+        return Ok(None);
+    }
+    if runs.iter().any(|run| run.ram_stage_gpu_isolation.is_none()) {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "ram-stage-gpu-isolation-evidence-missing",
+            "RAM-stage arm mixed enabled and disabled GPU-isolation evidence",
+        ));
+    }
+    let evidence = runs
+        .iter()
+        .map(|run| {
+            run.ram_stage_gpu_isolation
+                .as_ref()
+                .expect("GPU-isolation evidence checked")
+        })
+        .collect::<Vec<_>>();
+    let speculative_physical_probe_requests = checked_sum(
+        evidence
+            .iter()
+            .map(|value| value.speculative_physical_probe_requests),
+        "speculative-physical-probe-requests",
+    )?;
+    let speculative_physical_probe_hits = checked_sum(
+        evidence
+            .iter()
+            .map(|value| value.speculative_physical_probe_hits),
+        "speculative-physical-probe-hits",
+    )?;
+    let speculative_h2d_installs = checked_sum(
+        evidence.iter().map(|value| value.speculative_h2d_installs),
+        "ram-stage-gpu-isolation-h2d-installs",
+    )?;
+    let speculative_h2d_bytes = checked_sum(
+        evidence.iter().map(|value| value.speculative_h2d_bytes),
+        "ram-stage-gpu-isolation-h2d-bytes",
+    )?;
+    let speculative_replacements = checked_sum(
+        evidence.iter().map(|value| value.speculative_replacements),
+        "ram-stage-gpu-isolation-replacements",
+    )?;
+    let speculative_evictions = checked_sum(
+        evidence.iter().map(|value| value.speculative_evictions),
+        "ram-stage-gpu-isolation-evictions",
+    )?;
+    let speculative_gpu_admission_enabled = evidence
+        .iter()
+        .any(|value| value.speculative_gpu_admission_enabled);
+    let zero_speculative_gpu_work = speculative_h2d_installs == 0
+        && speculative_h2d_bytes == 0
+        && speculative_replacements == 0
+        && speculative_evictions == 0
+        && !speculative_gpu_admission_enabled;
+    let reconciliation_pass =
+        zero_speculative_gpu_work && evidence.iter().all(|value| value.reconciliation_pass);
+    let aggregate = RamStageGpuIsolationEvidence {
+        speculative_physical_probe_requests,
+        speculative_physical_probe_hits,
+        speculative_h2d_installs,
+        speculative_h2d_bytes,
+        speculative_replacements,
+        speculative_evictions,
+        speculative_gpu_admission_enabled,
+        zero_speculative_gpu_work,
+        reconciliation_pass,
+    };
+    if !aggregate.reconciliation_pass {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "ram-stage-gpu-isolation-failed",
+            format!("RAM-stage GPU isolation did not reconcile: {aggregate:?}"),
+        ));
+    }
+    Ok(Some(aggregate))
+}
+
 fn aggregate_destructive_admission_calibration(
     runs: &[LiveQualifiedRunEvidence],
 ) -> Result<DestructiveAdmissionCalibrationEvidence, crate::gpu_native_real_benchmark::BenchmarkFailure>
@@ -2905,6 +3603,49 @@ fn qualification_install_byte_evidence(
             )?,
         },
     })
+}
+
+fn ram_stage_gpu_isolation_evidence(
+    production: &crate::gpu_native_real_benchmark::PerRunResult,
+    install_bytes: &QualificationInstallByteEvidence,
+    live: &LiveRunEvidence,
+) -> Result<RamStageGpuIsolationEvidence, crate::gpu_native_real_benchmark::BenchmarkFailure> {
+    use crate::gpu_native_real_benchmark::BenchmarkFailure;
+    let residency = &production.counters.gpu_native_residency_delta;
+    let speculative_h2d_installs = residency.speculative_ram_to_vram_installs;
+    let speculative_h2d_bytes = install_bytes.delta.speculative_ram_to_vram_install_bytes;
+    let speculative_replacements = live.counters.speculative_replacements;
+    let speculative_evictions = live.counters.speculative_evictions;
+    let zero_speculative_gpu_work = speculative_h2d_installs == 0
+        && speculative_h2d_bytes == 0
+        && speculative_replacements == 0
+        && speculative_evictions == 0;
+    let reconciliation_pass = live.ram_stage.as_ref().is_some_and(|value| {
+        value.reconciliation_pass
+            && value.speculative_h2d_installs == speculative_h2d_installs
+            && value.speculative_h2d_bytes == speculative_h2d_bytes
+            && value.speculative_replacements == speculative_replacements
+            && value.speculative_evictions == speculative_evictions
+    }) && zero_speculative_gpu_work;
+    let evidence = RamStageGpuIsolationEvidence {
+        speculative_physical_probe_requests: residency.speculative_requests,
+        speculative_physical_probe_hits: residency.speculative_vram_hits,
+        speculative_h2d_installs,
+        speculative_h2d_bytes,
+        speculative_replacements,
+        speculative_evictions,
+        speculative_gpu_admission_enabled: false,
+        zero_speculative_gpu_work,
+        reconciliation_pass,
+    };
+    if !evidence.reconciliation_pass {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "ram-stage-speculative-gpu-work-observed",
+            format!("PR1C-G observed speculative GPU work: {evidence:?}"),
+        ));
+    }
+    Ok(evidence)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3165,14 +3906,28 @@ async fn execute_live_run(
             )
         });
     match (execution, finalized) {
-        (Ok(production), Ok(live)) => Ok(LiveQualifiedRunEvidence {
-            production,
-            live,
-            gpu_native_h2d_install_bytes: qualification_install_byte_evidence(
+        (Ok(production), Ok(live)) => {
+            let gpu_native_h2d_install_bytes = qualification_install_byte_evidence(
                 gpu_native_h2d_install_bytes_before,
                 gpu_native_h2d_install_bytes_after,
-            )?,
-        }),
+            )?;
+            let ram_stage_gpu_isolation = controller
+                .ram_stage_enabled()
+                .then(|| {
+                    ram_stage_gpu_isolation_evidence(
+                        &production,
+                        &gpu_native_h2d_install_bytes,
+                        &live,
+                    )
+                })
+                .transpose()?;
+            Ok(LiveQualifiedRunEvidence {
+                production,
+                live,
+                gpu_native_h2d_install_bytes,
+                ram_stage_gpu_isolation,
+            })
+        }
         (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
         (Err(execution), Err(finalization)) => Err(BenchmarkFailure::new(
             "postcondition",
@@ -3192,6 +3947,7 @@ async fn run_arm(
     bounds: LiveResourceBounds,
     markov_min_prob: f64,
     score_ceiling_gate: bool,
+    ram_stage_enabled: bool,
     prompt_ids: &[u32],
     output_tokens: usize,
     warmup_runs: usize,
@@ -3279,6 +4035,7 @@ async fn run_arm(
         markov_min_prob,
         bounds,
         candidate_score_ceiling: score_ceiling_gate.then_some(FROZEN_CANDIDATE_SCORE_CEILING),
+        ram_stage_enabled,
     });
     let controller = match controller {
         Ok(controller) => controller,
@@ -3390,6 +4147,9 @@ async fn run_arm(
     let measured_live_totals = aggregate_live_runs(&measured_run_evidence)?;
     let measured_live_fractions = live_derived_fractions(&measured_live_totals);
     let measured_score_gate = aggregate_score_gate(&measured_run_evidence)?;
+    let measured_ram_stage = aggregate_ram_stage(&measured_run_evidence, &measured_live_totals)?;
+    let measured_ram_stage_gpu_isolation =
+        aggregate_ram_stage_gpu_isolation(&measured_run_evidence)?;
     let measured_destructive_admission_calibration =
         aggregate_destructive_admission_calibration(&measured_run_evidence)?;
     if measured_destructive_admission_calibration.replacement_count
@@ -3435,6 +4195,8 @@ async fn run_arm(
         measured_live_totals,
         measured_live_fractions,
         measured_score_gate,
+        measured_ram_stage,
+        measured_ram_stage_gpu_isolation,
         measured_destructive_admission_calibration,
         measured_source_attribution,
         runtime_shutdown,
@@ -3689,6 +4451,34 @@ fn destructive_admission_economics(
     }
 }
 
+fn ram_stage_economics(
+    control: &LiveArmEvidence,
+    treatment: &LiveArmEvidence,
+) -> Option<RamStageEconomicsEvidence> {
+    let treatment_stage = treatment.measured_ram_stage.as_ref()?;
+    let control_stage_reads = control
+        .measured_ram_stage
+        .as_ref()
+        .map_or(0, |stage| stage.nvme_stage_reads);
+    let off = &control.measured_source_attribution;
+    let on = &treatment.measured_source_attribution;
+    let foreground_demand_nvme_operations_avoided =
+        off.demand_nvme_operations as i128 - on.demand_nvme_operations as i128;
+    let speculative_ram_stage_nvme_operations_added =
+        treatment_stage.nvme_stage_reads as i128 - control_stage_reads as i128;
+    let net_total_nvme_operation_delta = (on.demand_nvme_operations as i128
+        + treatment_stage.nvme_stage_reads as i128)
+        - (off.demand_nvme_operations as i128 + control_stage_reads as i128);
+    Some(RamStageEconomicsEvidence {
+        foreground_demand_nvme_operations_avoided,
+        speculative_ram_stage_nvme_operations_added,
+        net_total_nvme_operation_delta,
+        reconciliation_pass: net_total_nvme_operation_delta
+            == speculative_ram_stage_nvme_operations_added
+                - foreground_demand_nvme_operations_avoided,
+    })
+}
+
 fn mean_wall_seconds(arm: &LiveArmEvidence) -> f64 {
     arm.measured_run_evidence
         .iter()
@@ -3697,20 +4487,30 @@ fn mean_wall_seconds(arm: &LiveArmEvidence) -> f64 {
         / arm.measured_run_evidence.len() as f64
 }
 
-fn live_path_exercised(counters: &LiveLifecycleCounters) -> LivePathExercisedEvidence {
+fn live_path_exercised(
+    counters: &LiveLifecycleCounters,
+    ram_stage: Option<&RamStageRunEvidence>,
+) -> LivePathExercisedEvidence {
     let nonresident_accepted_candidates = counters
         .accepted_candidates
         .saturating_sub(counters.already_physically_resident);
     let speculative_source_joins = counters.speculative_joined_existing_acquisition;
-    let progressed = counters.source_acquisition_started > 0
-        || speculative_source_joins > 0
-        || counters.physical_installation_started > 0;
+    let progressed = ram_stage.map_or_else(
+        || {
+            counters.source_acquisition_started > 0
+                || speculative_source_joins > 0
+                || counters.physical_installation_started > 0
+        },
+        |stage| stage.requests > 0 && stage.stage_completions > 0,
+    );
     LivePathExercisedEvidence {
         pass: nonresident_accepted_candidates > 0 && progressed,
         nonresident_accepted_candidates,
         source_acquisition_started: counters.source_acquisition_started,
         speculative_source_joins,
         physical_installation_started: counters.physical_installation_started,
+        ram_stage_requests: ram_stage.map(|stage| stage.requests),
+        ram_stage_completions: ram_stage.map(|stage| stage.stage_completions),
     }
 }
 
@@ -3811,11 +4611,24 @@ fn emit_report(
 
 pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::error::Error>> {
     use crate::gpu_native_real_benchmark::{BenchmarkFailure, BenchmarkProvenance};
-    let command = if args.score_ceiling_gate {
+    let command = if args.ram_stage_enabled {
+        RAM_STAGE_COMMAND
+    } else if args.score_ceiling_gate {
         SCORE_CEILING_COMMAND
     } else {
         COMMAND
     };
+
+    if args.ram_stage_enabled && !args.score_ceiling_gate {
+        return Err(BenchmarkFailure::new(
+            "preflight",
+            "ram-stage-requires-frozen-score-gate",
+            format!(
+                "{RAM_STAGE_COMMAND} requires the frozen PR1C-F score ceiling {SCORE_CEILING_COMPARISON} {FROZEN_CANDIDATE_SCORE_CEILING}"
+            ),
+        )
+        .into());
+    }
 
     if !args.greedy {
         return Err(BenchmarkFailure::new(
@@ -3963,12 +4776,16 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         max_in_flight_source_acquisitions: bounds.max_in_flight_source_acquisitions,
     };
     let mut report = BoundedLivePrefetchReport {
-        schema: if args.score_ceiling_gate {
+        schema: if args.ram_stage_enabled {
+            RAM_STAGE_SCHEMA
+        } else if args.score_ceiling_gate {
             SCORE_CEILING_SCHEMA
         } else {
             SCHEMA
         },
-        mode: if args.score_ceiling_gate {
+        mode: if args.ram_stage_enabled {
+            RAM_STAGE_MODE
+        } else if args.score_ceiling_gate {
             SCORE_CEILING_MODE
         } else {
             MODE
@@ -4041,6 +4858,23 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
             historical_complement_introduced_miss_boundaries: 1_004,
         }),
         score_gate_reconciliation_pass: args.score_ceiling_gate.then_some(false),
+        ram_stage_contract: args.ram_stage_enabled.then_some(RamStageContractEvidence {
+            qualification_only: true,
+            speculative_gpu_admission_enabled: false,
+            speculative_ram_stage_enabled: true,
+            pr1cf_commit: PR1CF_COMMIT,
+            pr1cf_report_sha256: PR1CF_REPORT_SHA256,
+            pr1cf_log_sha256: PR1CF_LOG_SHA256,
+            frozen_score_threshold: FROZEN_CANDIDATE_SCORE_CEILING,
+            strict_score_comparison: SCORE_CEILING_COMPARISON,
+            completion_boundary: "after the admitted candidate is available as an exact resident in MER's existing RAM expert cache; before logical GPU admission, victim selection, H2D, physical install, replacement, or eviction",
+            demand_reuse_semantics: "foreground demand remains the ordinary physical-miss -> existing RAM cache -> fetch_with_retry -> logical demand admission -> demand H2D path; no PR1C-G demand fast path exists",
+            exact_provenance_semantics: "demand reuse caused by PR1C-G requires Arc::ptr_eq with the exact weakly-held resident inserted by the RAM-stage transaction; global cache-hit deltas are not used",
+            ordinary_ram_cache_semantics_preserved: true,
+            ram_capacity_increased: false,
+            counterfactual_performance_claim: false,
+        }),
+        ram_stage_reconciliation_pass: args.ram_stage_enabled.then_some(false),
         normal_production_default_remains_disabled: true,
         production_semantics: LiveProductionSemantics {
             normal_runtime_default_enabled: false,
@@ -4066,6 +4900,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         residency_effectiveness: None,
         demand_source_comparison: None,
         destructive_admission_economics: None,
+        ram_stage_economics: None,
         performance: None,
     };
 
@@ -4078,6 +4913,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         bounds,
         markov_min_prob,
         args.score_ceiling_gate,
+        args.ram_stage_enabled,
         &prompt_ids,
         request_input.output_tokens,
         args.warmup_runs,
@@ -4105,6 +4941,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         bounds,
         markov_min_prob,
         args.score_ceiling_gate,
+        args.ram_stage_enabled,
         &prompt_ids,
         request_input.output_tokens,
         args.warmup_runs,
@@ -4149,11 +4986,14 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     report.qualification_resources = control.qualification_resources;
     report.off_on_resource_layout_identical = true;
     let behavioral = compare_behavior(&control, &treatment);
-    let live_path = live_path_exercised(&treatment.measured_live_totals);
+    let live_path = live_path_exercised(
+        &treatment.measured_live_totals,
+        treatment.measured_ram_stage.as_ref(),
+    );
     let residency = compare_residency(&control, &treatment);
     let demand_source_comparison = compare_demand_sources(&control, &treatment);
-    let destructive_admission_economics =
-        destructive_admission_economics(&control, &treatment);
+    let destructive_admission_economics = destructive_admission_economics(&control, &treatment);
+    let ram_stage_economics = ram_stage_economics(&control, &treatment);
     if !destructive_admission_economics.reconciliation_pass {
         let failure = BenchmarkFailure::new(
             "postcondition",
@@ -4164,6 +5004,20 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         );
         report.failure = Some(failure.clone());
         report.destructive_admission_economics = Some(destructive_admission_economics);
+        emit_report(&report, args.report_out.as_deref())?;
+        return Err(failure.into());
+    }
+    if ram_stage_economics
+        .as_ref()
+        .is_some_and(|evidence| !evidence.reconciliation_pass)
+    {
+        let failure = BenchmarkFailure::new(
+            "postcondition",
+            "ram-stage-economics-counter-mismatch",
+            format!("RAM-stage NVMe economics did not reconcile: {ram_stage_economics:?}"),
+        );
+        report.failure = Some(failure.clone());
+        report.ram_stage_economics = ram_stage_economics;
         emit_report(&report, args.report_out.as_deref())?;
         return Err(failure.into());
     }
@@ -4178,12 +5032,21 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         .as_ref()
         .map(|evidence| evidence.reconciliation_pass);
     report.score_gate_reconciliation_pass = score_gate_reconciliation_pass;
+    let ram_stage_reconciliation_pass = treatment.measured_ram_stage.as_ref().map(|stage| {
+        stage.reconciliation_pass
+            && treatment
+                .measured_ram_stage_gpu_isolation
+                .as_ref()
+                .is_some_and(|isolation| isolation.reconciliation_pass)
+    });
+    report.ram_stage_reconciliation_pass = ram_stage_reconciliation_pass;
     report.qualification_complete = true;
     report.qualification_pass = control.complete
         && treatment.complete
         && behavioral.pass
         && live_path.pass
         && score_gate_reconciliation_pass.unwrap_or(true)
+        && ram_stage_reconciliation_pass.unwrap_or(true)
         && control.runtime_shutdown.all_runtime_resources_released
         && treatment.runtime_shutdown.all_runtime_resources_released;
     report.behavioral_equivalence = Some(behavioral);
@@ -4191,6 +5054,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     report.residency_effectiveness = Some(residency);
     report.demand_source_comparison = Some(demand_source_comparison);
     report.destructive_admission_economics = Some(destructive_admission_economics);
+    report.ram_stage_economics = ram_stage_economics;
     report.performance = Some(performance);
     emit_report(&report, args.report_out.as_deref())
 }
@@ -4212,6 +5076,14 @@ mod tests {
         arm: LiveArm,
         score_ceiling_gate: bool,
     ) -> Arc<GpuNativeBoundedLivePrefetchController> {
+        controller_for_mode(arm, score_ceiling_gate, false)
+    }
+
+    fn controller_for_mode(
+        arm: LiveArm,
+        score_ceiling_gate: bool,
+        ram_stage_enabled: bool,
+    ) -> Arc<GpuNativeBoundedLivePrefetchController> {
         GpuNativeBoundedLivePrefetchController::new(LiveControllerConfig {
             arm,
             policy: GpuNativeLiveReplacementPolicy::PhysicalLru,
@@ -4221,8 +5093,22 @@ mod tests {
             markov_min_prob: 0.0,
             bounds: LiveResourceBounds::default(),
             candidate_score_ceiling: score_ceiling_gate.then_some(FROZEN_CANDIDATE_SCORE_CEILING),
+            ram_stage_enabled,
         })
         .unwrap()
+    }
+
+    fn ram_stage_controller() -> Arc<GpuNativeBoundedLivePrefetchController> {
+        controller_for_mode(LiveArm::On, true, true)
+    }
+
+    fn ram_resident(global_id: u32) -> Arc<crate::expert_cache::ExpertResident> {
+        let pool = crate::buffer_pool::BufferPool::new(1, 4096, 4096);
+        Arc::new(crate::expert_cache::ExpertResident::new_with_block_align(
+            global_id,
+            pool.try_acquire().expect("test RAM resident buffer"),
+            4096,
+        ))
     }
 
     fn pending(global_id: u32) -> PendingTarget {
@@ -4469,6 +5355,143 @@ mod tests {
             run.candidates[&ticket.ticket_id].score_gate_decision,
             ScoreGateDecision::NotEvaluated
         );
+    }
+
+    #[test]
+    fn pr1cg_score_below_threshold_nvme_stages_and_exact_demand_reuse_reconciles() {
+        let controller = ram_stage_controller();
+        let ticket = accepted_score_ticket(&controller, FROZEN_CANDIDATE_SCORE_CEILING / 2.0);
+        assert!(controller
+            .admit_score_gated_nonresident_candidate(ticket.ticket_id)
+            .unwrap());
+        controller.record_source_started(ticket.ticket_id, false, false);
+        controller.record_nvme_complete(ticket.ticket_id, 4096);
+        let resident = ram_resident(ticket.global_id);
+        controller.record_ram_stage_completed(
+            ticket.ticket_id,
+            &resident,
+            RamStageSourceKind::NvmeInserted,
+        );
+        controller.record_demand_ram_source(ticket.global_id, &resident);
+
+        let inner = controller.inner.lock();
+        let evidence = build_ram_stage_run_evidence(inner.run.as_ref().unwrap()).unwrap();
+        assert_eq!(evidence.requests, 1);
+        assert_eq!(evidence.nvme_stage_reads, 1);
+        assert_eq!(evidence.nvme_stage_bytes, 4096);
+        assert_eq!(evidence.successful_ram_cache_inserts, 1);
+        assert_eq!(evidence.stage_completions, 1);
+        assert_eq!(evidence.demand_reused_staged_ram_expert, 1);
+        assert_eq!(evidence.demand_reused_preexisting_ram_expert, 0);
+        assert_eq!(evidence.speculative_h2d_installs, 0);
+        assert_eq!(evidence.speculative_h2d_bytes, 0);
+        assert_eq!(evidence.speculative_replacements, 0);
+        assert_eq!(evidence.speculative_evictions, 0);
+        assert_eq!(evidence.speculative_victim_decisions, 0);
+        assert!(evidence.zero_speculative_gpu_work);
+        assert!(evidence.reconciliation_pass);
+    }
+
+    #[test]
+    fn pr1cg_already_ram_resident_completes_without_nvme_or_gpu_work() {
+        let controller = ram_stage_controller();
+        let ticket = accepted_score_ticket(&controller, FROZEN_CANDIDATE_SCORE_CEILING / 2.0);
+        assert!(controller
+            .admit_score_gated_nonresident_candidate(ticket.ticket_id)
+            .unwrap());
+        let resident = ram_resident(ticket.global_id);
+        controller.record_source_started(ticket.ticket_id, true, false);
+        controller.record_ram_stage_completed(
+            ticket.ticket_id,
+            &resident,
+            RamStageSourceKind::AlreadyRamResident,
+        );
+        controller.record_demand_ram_source(ticket.global_id, &resident);
+
+        let inner = controller.inner.lock();
+        let evidence = build_ram_stage_run_evidence(inner.run.as_ref().unwrap()).unwrap();
+        assert_eq!(evidence.requests, 1);
+        assert_eq!(evidence.already_ram_resident_stage_hits, 1);
+        assert_eq!(evidence.nvme_stage_reads, 0);
+        assert_eq!(evidence.nvme_stage_bytes, 0);
+        assert_eq!(evidence.successful_ram_cache_inserts, 0);
+        assert_eq!(evidence.stage_completions, 1);
+        assert_eq!(evidence.demand_reused_preexisting_ram_expert, 1);
+        assert!(evidence.zero_speculative_gpu_work);
+        assert!(evidence.reconciliation_pass);
+    }
+
+    #[test]
+    fn pr1cg_equal_and_above_threshold_reject_before_ram_source_or_gpu_work() {
+        for score in [
+            FROZEN_CANDIDATE_SCORE_CEILING,
+            FROZEN_CANDIDATE_SCORE_CEILING * 2.0,
+        ] {
+            let controller = ram_stage_controller();
+            let ticket = accepted_score_ticket(&controller, score);
+            assert!(!controller
+                .admit_score_gated_nonresident_candidate(ticket.ticket_id)
+                .unwrap());
+            let counters = counters(&controller);
+            assert_eq!(counters.source_acquisition_started, 0);
+            assert_eq!(counters.speculative_nvme_operations, 0);
+            assert_eq!(counters.physical_installation_started, 0);
+            assert_eq!(counters.speculative_h2d_installs, 0);
+            assert_eq!(counters.speculative_replacements, 0);
+            assert_eq!(counters.speculative_evictions, 0);
+            let inner = controller.inner.lock();
+            let evidence = build_ram_stage_run_evidence(inner.run.as_ref().unwrap()).unwrap();
+            assert_eq!(evidence.requests, 0);
+            assert_eq!(evidence.stage_completions, 0);
+            assert!(evidence.zero_speculative_gpu_work);
+            assert!(evidence.reconciliation_pass);
+        }
+    }
+
+    #[test]
+    fn pr1cg_staged_eviction_before_first_demand_is_exactly_observed() {
+        let controller = ram_stage_controller();
+        let ticket = accepted_score_ticket(&controller, FROZEN_CANDIDATE_SCORE_CEILING / 2.0);
+        assert!(controller
+            .admit_score_gated_nonresident_candidate(ticket.ticket_id)
+            .unwrap());
+        controller.record_source_started(ticket.ticket_id, false, false);
+        controller.record_nvme_complete(ticket.ticket_id, 4096);
+        let resident = ram_resident(ticket.global_id);
+        controller.record_ram_stage_completed(
+            ticket.ticket_id,
+            &resident,
+            RamStageSourceKind::NvmeInserted,
+        );
+        controller.record_ram_cache_eviction_caused_by_staging(&resident);
+
+        let inner = controller.inner.lock();
+        let evidence = build_ram_stage_run_evidence(inner.run.as_ref().unwrap()).unwrap();
+        assert_eq!(evidence.ram_cache_evictions_caused_by_staging, 1);
+        assert_eq!(evidence.staged_expert_evicted_before_first_demand, 1);
+        assert!(evidence.reconciliation_pass);
+    }
+
+    #[test]
+    fn pr1cg_accounting_fails_closed_on_ram_stage_counter_drift() {
+        let controller = ram_stage_controller();
+        let ticket = accepted_score_ticket(&controller, FROZEN_CANDIDATE_SCORE_CEILING / 2.0);
+        assert!(controller
+            .admit_score_gated_nonresident_candidate(ticket.ticket_id)
+            .unwrap());
+        controller.record_source_started(ticket.ticket_id, true, false);
+        let resident = ram_resident(ticket.global_id);
+        controller.record_ram_stage_completed(
+            ticket.ticket_id,
+            &resident,
+            RamStageSourceKind::AlreadyRamResident,
+        );
+        let mut inner = controller.inner.lock();
+        let run = inner.run.as_mut().unwrap();
+        assert!(build_ram_stage_run_evidence(run).is_ok());
+        run.ram_stage.requests += 1;
+        let error = build_ram_stage_run_evidence(run).unwrap_err();
+        assert!(error.to_string().contains("RAM-stage accounting did not reconcile"));
     }
 
     #[test]
@@ -4958,8 +5981,18 @@ mod tests {
             SCORE_CEILING_SCHEMA,
             "mer.gpu-native-bounded-live-prefetch.v3"
         );
+        assert_eq!(RAM_STAGE_SCHEMA, "mer.gpu-native-bounded-live-prefetch.v4");
         assert_eq!(FROZEN_CANDIDATE_SCORE_CEILING, 0.002777777777777778);
         assert_eq!(SCORE_CEILING_COMPARISON, "candidate.score < threshold");
+        assert_eq!(PR1CF_COMMIT, "b03b9bd97ffb96e555c13600f8f7dcfe18aa972d");
+        assert_eq!(
+            PR1CF_REPORT_SHA256,
+            "0ceb5964d6539927a5c49517f50e9f3809e6757d41f56efd0746ad983e9684b2"
+        );
+        assert_eq!(
+            PR1CF_LOG_SHA256,
+            "3425b3cfaf34c2df3fe12dc29dd3daeaac86f90e7e832169dc7e34660e703ed6"
+        );
         assert_eq!(
             PR1CD2_COMMIT,
             "8cb3cbe2ffd561e37add6815a3e8c646d24c772d"
@@ -5013,7 +6046,7 @@ mod tests {
             accepted_candidates: 1,
             ..LiveLifecycleCounters::default()
         };
-        let evidence = live_path_exercised(&counters);
+        let evidence = live_path_exercised(&counters, None);
         assert_eq!(evidence.nonresident_accepted_candidates, 1);
         assert!(!evidence.pass);
         assert!(!performance_eligible(true, evidence.pass));
@@ -5023,10 +6056,10 @@ mod tests {
             source_acquisition_started: 1,
             ..LiveLifecycleCounters::default()
         };
-        assert!(live_path_exercised(&progressed).pass);
+        assert!(live_path_exercised(&progressed, None).pass);
         assert!(performance_eligible(
             true,
-            live_path_exercised(&progressed).pass
+            live_path_exercised(&progressed, None).pass
         ));
     }
 
@@ -5206,10 +6239,16 @@ mod tests {
         .into_iter()
         .map(std::ffi::OsString::from)
         .collect::<Vec<_>>();
-        let (normalized, requested, replacement_policy, score_ceiling_requested) =
-            crate::normalize_bounded_live_prefetch_command(&raw).unwrap();
+        let (
+            normalized,
+            requested,
+            replacement_policy,
+            score_ceiling_requested,
+            ram_stage_requested,
+        ) = crate::normalize_bounded_live_prefetch_command(&raw).unwrap();
         assert!(requested);
         assert!(!score_ceiling_requested);
+        assert!(!ram_stage_requested);
         let parsed = crate::Cli::try_parse_from(normalized).unwrap();
         assert!(matches!(
             parsed.cmd,
@@ -5239,10 +6278,16 @@ mod tests {
         .into_iter()
         .map(std::ffi::OsString::from)
         .collect::<Vec<_>>();
-        let (normalized, requested, replacement_policy, score_ceiling_requested) =
-            crate::normalize_bounded_live_prefetch_command(&raw).unwrap();
+        let (
+            normalized,
+            requested,
+            replacement_policy,
+            score_ceiling_requested,
+            ram_stage_requested,
+        ) = crate::normalize_bounded_live_prefetch_command(&raw).unwrap();
         assert!(requested);
         assert!(!score_ceiling_requested);
+        assert!(!ram_stage_requested);
         let parsed = crate::Cli::try_parse_from(normalized).unwrap();
         assert!(matches!(
             parsed.cmd,
@@ -5274,10 +6319,57 @@ mod tests {
         .into_iter()
         .map(std::ffi::OsString::from)
         .collect::<Vec<_>>();
-        let (normalized, requested, replacement_policy, score_ceiling_requested) =
-            crate::normalize_bounded_live_prefetch_command(&raw).unwrap();
+        let (
+            normalized,
+            requested,
+            replacement_policy,
+            score_ceiling_requested,
+            ram_stage_requested,
+        ) = crate::normalize_bounded_live_prefetch_command(&raw).unwrap();
         assert!(requested);
         assert!(score_ceiling_requested);
+        assert!(!ram_stage_requested);
+        let parsed = crate::Cli::try_parse_from(normalized).unwrap();
+        assert!(matches!(
+            parsed.cmd,
+            crate::Cmd::QualifyGpuNativePrefetchMultipredictorShadow { .. }
+        ));
+        assert_eq!(
+            require_explicit_replacement_policy(replacement_policy).unwrap(),
+            GpuNativeLiveReplacementPolicy::PhysicalLruPredictionProtected
+        );
+    }
+
+    #[test]
+    fn cli_parses_dedicated_pr1cg_ram_stage_command() {
+        let raw = [
+            "micro-expert-router",
+            RAM_STAGE_COMMAND,
+            "--config",
+            "config.toml",
+            "--prompt",
+            "hello",
+            "--output-tokens",
+            "2",
+            "--greedy",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--replacement-policy",
+            "physical-lru-prediction-protected",
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+        let (
+            normalized,
+            requested,
+            replacement_policy,
+            score_ceiling_requested,
+            ram_stage_requested,
+        ) = crate::normalize_bounded_live_prefetch_command(&raw).unwrap();
+        assert!(requested);
+        assert!(score_ceiling_requested);
+        assert!(ram_stage_requested);
         let parsed = crate::Cli::try_parse_from(normalized).unwrap();
         assert!(matches!(
             parsed.cmd,

@@ -332,6 +332,13 @@ impl ExpertCache {
         resident
     }
 
+    /// Clone a resident without changing LRU recency or cost-aware heat.
+    /// Qualification evidence uses this to compare exact `Arc` identity
+    /// without turning an observation into an ordinary RAM-cache hit.
+    pub fn peek(&self, id: u32) -> Option<Arc<ExpertResident>> {
+        self.inner.lock().peek(&id).cloned()
+    }
+
     /// Peek without changing recency. Useful for the predictive loader to
     /// check residency without polluting the LRU order.
     pub fn contains(&self, id: u32) -> bool {

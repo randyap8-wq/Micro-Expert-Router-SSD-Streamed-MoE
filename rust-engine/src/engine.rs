@@ -21,7 +21,7 @@ use crate::expert_cache::{
     GpuHotPromotionOutcome, GpuResident,
 };
 use crate::gating::Router;
-use crate::gpu_native_bounded_live_prefetch::LiveCancellationReason;
+use crate::gpu_native_bounded_live_prefetch::{LiveCancellationReason, RamStageSourceKind};
 use crate::gpu_native_residency::{
     global_to_layer_local as gpu_native_global_to_layer_local, GpuNativeDemandExpert,
     GpuNativeResidencyPriority, GpuNativeSpeculativeInstall, GpuNativeSpeculativeProbe,
@@ -4142,6 +4142,11 @@ impl Engine {
                 self.fetch_with_retry(global_id).await?
             }
         };
+        if let Some(controller) =
+            live_controller.filter(|controller| controller.ram_stage_enabled())
+        {
+            controller.record_demand_ram_source(global_id, &resident);
+        }
         residents.insert(global_id, resident.clone());
         Ok(resident)
     }
@@ -4545,6 +4550,15 @@ impl Engine {
                 ticket_id,
                 completed: false,
             };
+            if task_controller.ram_stage_enabled() {
+                if me
+                    .execute_bounded_live_ram_stage(&task_controller, ticket_id, ticket.global_id)
+                    .await
+                {
+                    task_guard.complete();
+                }
+                return;
+            }
             let resident = if let Some(resident) = me.core.cache.get(ticket.global_id) {
                 task_controller.record_source_started(ticket_id, true, false);
                 resident
@@ -4725,8 +4739,151 @@ impl Engine {
         controller.register_abort_handle(ticket_id, handle);
     }
 
+    /// Execute the PR1C-G transaction through the existing RAM/source
+    /// hierarchy and stop as soon as the exact resident is available in the
+    /// ordinary RAM cache. Deliberately absent from this signature are the
+    /// GPU-native residency manager, a logical GPU admission, a victim policy,
+    /// and any physical install capability.
+    async fn execute_bounded_live_ram_stage(
+        self: &Arc<Self>,
+        controller: &Arc<
+            crate::gpu_native_bounded_live_prefetch::GpuNativeBoundedLivePrefetchController,
+        >,
+        ticket_id: u64,
+        global_id: u32,
+    ) -> bool {
+        if let Some(resident) = self.core.cache.get(global_id) {
+            controller.record_source_started(ticket_id, true, false);
+            controller.record_ram_stage_completed(
+                ticket_id,
+                &resident,
+                RamStageSourceKind::AlreadyRamResident,
+            );
+            return true;
+        }
+
+        let (is_leader, notify) = match self.core.in_flight.entry(global_id) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => (false, occupied.get().clone()),
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let notify = Arc::new(Notify::new());
+                vacant.insert(notify.clone());
+                (true, notify)
+            }
+        };
+        if !is_leader {
+            controller.record_source_started(ticket_id, false, true);
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let resident = if self.core.cache.contains(global_id) {
+                self.core
+                    .cache
+                    .get(global_id)
+                    .expect("joined RAM stage became resident under cache recheck")
+            } else {
+                if self.core.in_flight.contains_key(&global_id) {
+                    notified.await;
+                }
+                let Some(resident) = self.core.cache.get(global_id) else {
+                    return false;
+                };
+                resident
+            };
+            controller.record_ram_stage_completed(
+                ticket_id,
+                &resident,
+                RamStageSourceKind::JoinedExistingAcquisition,
+            );
+            return true;
+        }
+
+        // Keep leadership until the controller has registered the exact
+        // staged `Arc`, so a foreground singleflight follower cannot wake and
+        // outrun provenance registration.
+        let _singleflight = SingleflightLeaderGuard {
+            map: self.core.in_flight.clone(),
+            id: global_id,
+            notify,
+            armed: true,
+        };
+        let mut buf = match self.core.pool.try_acquire_shadow() {
+            Some(buf) => buf,
+            None if self.core.pool.shadow_capacity() == 0 => {
+                let Some(buf) = self.core.pool.try_acquire() else {
+                    self.note_prefetch_dropped_pool_starved(global_id);
+                    return false;
+                };
+                buf
+            }
+            None => {
+                let recycled = self
+                    .core
+                    .cache
+                    .evict_lru_shadow_backed()
+                    .and_then(|victim| {
+                        controller.record_ram_cache_eviction_caused_by_staging(&victim);
+                        drop(victim);
+                        self.core.pool.try_acquire_shadow()
+                    });
+                let Some(buf) = recycled else {
+                    self.note_prefetch_dropped_pool_starved(global_id);
+                    return false;
+                };
+                buf
+            }
+        };
+        controller.record_source_started(ticket_id, false, false);
+        if let Err(error) = self.core.storage.read_expert(global_id, &mut buf).await {
+            controller.record_fatal(
+                ticket_id,
+                format!("speculative RAM-stage source read failed for expert {global_id}: {error}"),
+            );
+            return true;
+        }
+        let bytes = buf.len() as u64;
+        controller.record_nvme_complete(ticket_id, bytes);
+        self.metrics
+            .counters
+            .prefetch_completed
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .counters
+            .bytes_read
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.core.governor.record_completed();
+        let resident = Arc::new(ExpertResident::new_with_block_align(
+            global_id,
+            buf,
+            self.core.storage.config().block_align,
+        ));
+        match self.core.cache.insert(resident.clone()) {
+            Ok(Some(evicted)) => {
+                controller.record_ram_cache_eviction_caused_by_staging(&evicted);
+                drop(evicted);
+            }
+            Ok(None) => {}
+            Err(rejected) => {
+                drop(rejected);
+                return false;
+            }
+        }
+        controller.record_ram_stage_completed(
+            ticket_id,
+            &resident,
+            RamStageSourceKind::NvmeInserted,
+        );
+        true
+    }
+
     pub(crate) fn bounded_live_source_in_flight_count(&self) -> usize {
         self.core.in_flight.len()
+    }
+
+    pub(crate) fn bounded_live_ram_cache_peek(
+        &self,
+        global_id: u32,
+    ) -> Option<Arc<ExpertResident>> {
+        self.core.cache.peek(global_id)
     }
 
     pub(crate) fn bounded_live_speculative_resource_layout(&self) -> (usize, usize) {
@@ -7447,6 +7604,26 @@ mod tests {
         ))
     }
 
+    fn ram_stage_test_controller(
+    ) -> Arc<crate::gpu_native_bounded_live_prefetch::GpuNativeBoundedLivePrefetchController> {
+        crate::gpu_native_bounded_live_prefetch::GpuNativeBoundedLivePrefetchController::new(
+            crate::gpu_native_bounded_live_prefetch::LiveControllerConfig {
+                arm: crate::gpu_native_bounded_live_prefetch::LiveArm::On,
+                policy: crate::gpu_native_residency::GpuNativeLiveReplacementPolicy::PhysicalLru,
+                num_layers: 2,
+                experts_per_layer: 4,
+                top_k: 1,
+                markov_min_prob: 0.0,
+                bounds: crate::gpu_native_bounded_live_prefetch::LiveResourceBounds::default(),
+                candidate_score_ceiling: Some(
+                    crate::gpu_native_bounded_live_prefetch::FROZEN_CANDIDATE_SCORE_CEILING,
+                ),
+                ram_stage_enabled: true,
+            },
+        )
+        .unwrap()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gpu_native_demand_source_reuses_ram_without_duplicate_nvme_read() {
         let dir = TempDir::new("gpu-native-demand-source");
@@ -7475,6 +7652,57 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&ram_hit, &same_request));
         assert_eq!(engine.report().bytes_read, after_nvme);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr1cg_ram_miss_stages_in_ordinary_cache_then_demand_reuses_exact_arc() {
+        let dir = TempDir::new("pr1cg-ram-miss-stage");
+        let engine = build_engine(&dir.path, 4, 8, 8, 2, 1, 1, 17);
+        let controller = ram_stage_test_controller();
+        let gpu = engine.execution_context().gpu_expert_cache();
+        assert_eq!(engine.report().bytes_read, 0);
+        assert_eq!(gpu.used_bytes(), 0);
+        assert!(engine.core.gpu_native_residency.is_none());
+
+        assert!(engine
+            .execute_bounded_live_ram_stage(&controller, 0, 0)
+            .await);
+        let staged = engine
+            .bounded_live_ram_cache_peek(0)
+            .expect("RAM-stage insert must be visible in the ordinary cache");
+        let after_stage = engine.report().bytes_read;
+        assert_eq!(after_stage, engine.core.storage.config().expert_size as u64);
+        assert_eq!(gpu.used_bytes(), 0, "RAM staging must stop before GPU admission");
+
+        let mut request = HashMap::new();
+        let demanded = engine
+            .gpu_native_demand_source(0, &mut request, Some(&controller))
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&staged, &demanded));
+        assert_eq!(engine.report().bytes_read, after_stage);
+        assert_eq!(gpu.used_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr1cg_ram_hit_completes_without_nvme_or_gpu_work() {
+        let dir = TempDir::new("pr1cg-ram-hit-stage");
+        let engine = build_engine(&dir.path, 4, 8, 8, 2, 1, 1, 17);
+        let controller = ram_stage_test_controller();
+        let preexisting = engine.fetch_with_retry(0).await.unwrap();
+        let before_stage = engine.report().bytes_read;
+        let gpu = engine.execution_context().gpu_expert_cache();
+        assert_eq!(gpu.used_bytes(), 0);
+
+        assert!(engine
+            .execute_bounded_live_ram_stage(&controller, 0, 0)
+            .await);
+        let staged = engine
+            .bounded_live_ram_cache_peek(0)
+            .expect("preexisting resident remains in ordinary RAM cache");
+        assert!(Arc::ptr_eq(&preexisting, &staged));
+        assert_eq!(engine.report().bytes_read, before_stage);
+        assert_eq!(gpu.used_bytes(), 0);
     }
 
     #[test]

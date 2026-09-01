@@ -154,6 +154,11 @@ impl MultiLayerExpertCache {
         self.caches[self.try_layer_idx(id)?].get(id)
     }
 
+    /// Clone a resident without changing per-layer LRU recency or heat.
+    pub fn peek(&self, id: u32) -> Option<Arc<ExpertResident>> {
+        self.caches[self.try_layer_idx(id)?].peek(id)
+    }
+
     pub fn contains(&self, id: u32) -> bool {
         self.try_layer_idx(id)
             .is_some_and(|idx| self.caches[idx].contains(id))
