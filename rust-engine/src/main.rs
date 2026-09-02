@@ -908,24 +908,6 @@ enum Cmd {
         report_out: Option<PathBuf>,
     },
 
-    /// Qualification-only control/treatment replay of exact foreground
-    /// GPU-native physical-miss source acquisition. The workload is frozen in
-    /// the command: Qwen3-Coder-30B-A3B-Instruct Q4_0, the literal PR2-A
-    /// prompt, 128 output tokens, one warmup, three measured requests, keep
-    /// cache, and greedy sampling.
-    #[command(name = "qualify-gpu-native-demand-source-concurrency")]
-    QualifyGpuNativeDemandSourceConcurrency {
-        /// Path to the frozen strict production GPU-native TOML config.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact authoritative adapter name required for both isolated arms.
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Required destination for the typed v1 qualification report.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
-
     /// Production-path PR2-A.2 control/treatment qualification. Control
     /// forces the legacy exact sequential source helper; treatment exercises
     /// the same ordinary production batching seam used by normal serving.
@@ -1892,7 +1874,6 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         Cmd::Serve { config }
         | Cmd::BenchReal { config, .. }
         | Cmd::BenchGpuNativeReal { config, .. }
-        | Cmd::QualifyGpuNativeDemandSourceConcurrency { config, .. }
         | Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
@@ -2319,25 +2300,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     progress_watchdog,
                 },
             ))
-        }
-        Cmd::QualifyGpuNativeDemandSourceConcurrency {
-            config,
-            expected_adapter_name,
-            report_out,
-        } => {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(
-                crate::gpu_native_demand_source_concurrency::run_command(
-                    crate::gpu_native_demand_source_concurrency::CommandArgs {
-                        config,
-                        expected_adapter_name,
-                        report_out,
-                        progress_watchdog,
-                    },
-                ),
-            )
         }
         Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction {
             config,
@@ -16282,52 +16244,6 @@ mod tests {
             super::startup_config_path(&cli.cmd),
             Some(Path::new("config.toml"))
         );
-    }
-
-    #[test]
-    fn gpu_native_demand_source_concurrency_cli_parses_frozen_command() {
-        let cli = <Cli as clap::Parser>::try_parse_from([
-            "micro-expert-router",
-            "qualify-gpu-native-demand-source-concurrency",
-            "--config",
-            "config.toml",
-            "--expected-adapter-name",
-            "NVIDIA L4",
-            "--report-out",
-            "pr2a-report.json",
-        ])
-        .unwrap();
-
-        match &cli.cmd {
-            Cmd::QualifyGpuNativeDemandSourceConcurrency {
-                config,
-                expected_adapter_name,
-                report_out,
-            } => {
-                assert_eq!(config, &PathBuf::from("config.toml"));
-                assert_eq!(expected_adapter_name, "NVIDIA L4");
-                assert_eq!(report_out, &PathBuf::from("pr2a-report.json"));
-            }
-            _ => panic!("unexpected command variant"),
-        }
-        assert_eq!(
-            super::startup_config_path(&cli.cmd),
-            Some(Path::new("config.toml"))
-        );
-
-        let mutable_workload = <Cli as clap::Parser>::try_parse_from([
-            "micro-expert-router",
-            "qualify-gpu-native-demand-source-concurrency",
-            "--config",
-            "config.toml",
-            "--expected-adapter-name",
-            "NVIDIA L4",
-            "--report-out",
-            "pr2a-report.json",
-            "--output-tokens",
-            "1",
-        ]);
-        assert!(mutable_workload.is_err());
     }
 
     #[test]

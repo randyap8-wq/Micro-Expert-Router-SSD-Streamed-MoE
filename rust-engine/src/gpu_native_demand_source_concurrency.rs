@@ -1,8 +1,7 @@
-//! PR2-A qualification orchestration for exact-demand concurrent source
-//! acquisition. The v1 command remains qualification-only and serialized
-//! exactly as before. The v2 command compares an explicit sequential control
-//! with the same ordinary production source path used by normal serving,
-//! constructing a fresh isolated runtime for each arm.
+//! PR2-A production qualification for exact-demand concurrent source
+//! acquisition. The command compares an explicit sequential control with the
+//! ordinary production source path used by normal serving, constructing a
+//! fresh isolated runtime for each arm.
 
 use crate::backend::{GpuExpertIoSnapshot, GpuExpertMemorySnapshot};
 use crate::engine::{
@@ -21,8 +20,6 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub(crate) const SCHEMA: &str = "mer.gpu-native-demand-source-concurrency.v1";
-pub(crate) const MODE: &str = "qualify-gpu-native-demand-source-concurrency";
 pub(crate) const PRODUCTION_SCHEMA: &str = "mer.gpu-native-demand-source-concurrency.v2";
 pub(crate) const PRODUCTION_MODE: &str = "qualify-gpu-native-demand-source-concurrency-production";
 pub(crate) const FROZEN_PROMPT: &str =
@@ -52,20 +49,6 @@ pub(crate) struct FrozenWorkload {
     expected_adapter_name: String,
     backend: &'static str,
     datadog: &'static str,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct IsolationEvidence {
-    control_then_treatment: bool,
-    fresh_runtime_per_arm: bool,
-    one_qualification_request_stream: bool,
-    speculative_prefetch_disabled: bool,
-    competing_foreground_requests: u64,
-    production_fetch_with_retry_changed: bool,
-    production_singleflight_changed: bool,
-    production_multi_request_singleflight_solved: bool,
-    primary_pool_capacity_unchanged: bool,
-    shadow_pool_used_by_treatment: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -180,73 +163,10 @@ pub(crate) struct WorkEquivalenceGate {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub(crate) struct MechanismGate {
-    treatment_batch_eligible_all_ram_miss_source_sets_gt_zero: bool,
-    treatment_batch_path_exercised: bool,
-    control_batch_path_not_exercised: bool,
-    concurrent_source_reads_gt_zero: bool,
-    treatment_actual_batch_nvme_width_max_gt_one: bool,
-    treatment_mixed_ram_state_batch_attempts_zero: bool,
-    deterministic_cache_commit_reconciliation: bool,
-    no_pool_capacity_failure: bool,
-    no_batch_read_failure: bool,
-    passed: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct Gates {
-    behavioral: BehavioralGate,
-    work_equivalence: WorkEquivalenceGate,
-    mechanism: MechanismGate,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct ArmPerformance {
-    decode_tps: f64,
-    end_to_end_generated_tps: f64,
-    mean_request_wall_seconds: f64,
-    source_acquisition_wall_us: u64,
-    total_residency_service_us: u64,
-    boundary_wait_us: u64,
-}
-
-#[derive(Clone, Debug, Serialize)]
 pub(crate) struct MetricComparison {
     control: f64,
     treatment: f64,
     delta_percent: f64,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct PerformanceComparison {
-    control: ArmPerformance,
-    treatment: ArmPerformance,
-    decode_tps: MetricComparison,
-    end_to_end_generated_tps: MetricComparison,
-    mean_request_wall_seconds: MetricComparison,
-    source_acquisition_wall_us: MetricComparison,
-    total_residency_service_us: MetricComparison,
-    performance_result: &'static str,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct QualificationReport {
-    schema: &'static str,
-    mode: &'static str,
-    qualification_only: bool,
-    production_demand_source_changed: bool,
-    benchmark_complete: bool,
-    qualification_pass: bool,
-    performance_result: &'static str,
-    failure: Option<BenchmarkFailure>,
-    frozen_workload: FrozenWorkload,
-    provenance: BenchmarkProvenance,
-    isolation: Option<IsolationEvidence>,
-    control: Option<ArmReport>,
-    treatment: Option<ArmReport>,
-    reconciliation: Option<Reconciliation>,
-    gates: Option<Gates>,
-    performance: Option<PerformanceComparison>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -631,8 +551,6 @@ async fn run_arm(
     prepared: &Prepared,
     args: &CommandArgs,
     arm: GpuNativeDemandSourceQualificationArm,
-    production_v2: bool,
-    mode: &'static str,
 ) -> Result<ArmReport, BenchmarkFailure> {
     let arm_name = match arm {
         GpuNativeDemandSourceQualificationArm::Control => "control",
@@ -647,15 +565,9 @@ async fn run_arm(
         &mut benchmark,
     )
     .await?;
-    let enable_result = if production_v2 {
-        runtime
-            .engine
-            .enable_gpu_native_demand_source_production_qualification(arm)
-    } else {
-        runtime
-            .engine
-            .enable_gpu_native_demand_source_qualification(arm)
-    };
+    let enable_result = runtime
+        .engine
+        .enable_gpu_native_demand_source_production_qualification(arm);
     if let Err(error) = enable_result {
         let failure = BenchmarkFailure::new("startup", "qualification-arm-enable-failed", error);
         let _ = crate::gpu_native_real_benchmark::shutdown_runtime(
@@ -702,7 +614,7 @@ async fn run_arm(
     if execution_failure.is_none() {
         for index in 0..FROZEN_WARMUP_RUNS {
             let result = crate::with_progress_timeout(
-                format!("{mode} {arm_name} warmup {index}"),
+                format!("{PRODUCTION_MODE} {arm_name} warmup {index}"),
                 args.progress_watchdog,
                 crate::gpu_native_real_benchmark::execute_request(
                     &runtime,
@@ -750,7 +662,7 @@ async fn run_arm(
             ));
         }
     }
-    if execution_failure.is_none() && production_v2 {
+    if execution_failure.is_none() {
         warmup_production = Some(runtime.engine.production_demand_source_snapshot());
     }
     if execution_failure.is_none() {
@@ -798,7 +710,7 @@ async fn run_arm(
     if execution_failure.is_none() {
         for index in 0..FROZEN_MEASURED_RUNS {
             let result = crate::with_progress_timeout(
-                format!("{mode} {arm_name} measured {index}"),
+                format!("{PRODUCTION_MODE} {arm_name} measured {index}"),
                 args.progress_watchdog,
                 crate::gpu_native_real_benchmark::execute_request(
                     &runtime,
@@ -825,7 +737,7 @@ async fn run_arm(
     let source = runtime
         .engine
         .gpu_native_demand_source_qualification_snapshot();
-    let production = production_v2.then(|| runtime.engine.production_demand_source_snapshot());
+    let production = Some(runtime.engine.production_demand_source_snapshot());
     let work = if execution_failure.is_none() {
         match start.expect("measurement start captured").finish(&runtime) {
             Ok(work) => Some(work),
@@ -1083,12 +995,7 @@ fn reconcile(control: &ArmReport, treatment: &ArmReport) -> Reconciliation {
     result
 }
 
-fn gates(reconciliation: &Reconciliation, control: &ArmReport, treatment: &ArmReport) -> Gates {
-    let cs = control.source.as_ref().expect("complete control source");
-    let ts = treatment
-        .source
-        .as_ref()
-        .expect("complete treatment source");
+fn common_gates(reconciliation: &Reconciliation) -> (BehavioralGate, WorkEquivalenceGate) {
     let behavioral_pass = reconciliation.generated_tokens_exact
         && reconciliation.generated_token_hashes_exact
         && reconciliation.selected_route_sequence_exact
@@ -1106,17 +1013,8 @@ fn gates(reconciliation: &Reconciliation, control: &ArmReport, treatment: &ArmRe
         && reconciliation.recovery_semantics_exact
         && reconciliation.ordered_ram_insert_ids_exact
         && reconciliation.ordered_ram_eviction_ids_exact;
-    let mechanism_pass = ts.batch_eligible_all_ram_miss_source_sets > 0
-        && ts.batch_path_exercises > 0
-        && cs.batch_path_exercises == 0
-        && ts.concurrent_source_reads > 0
-        && ts.actual_batch_nvme_width_max > 1
-        && ts.mixed_ram_state_batch_attempts == 0
-        && ts.deterministic_cache_commit_reconciliation
-        && ts.pool_capacity_failures == 0
-        && ts.batch_read_failures == 0;
-    Gates {
-        behavioral: BehavioralGate {
+    (
+        BehavioralGate {
             generated_token_parity_exact: reconciliation.generated_tokens_exact
                 && reconciliation.generated_token_hashes_exact,
             route_parity_exact: reconciliation.selected_route_sequence_exact
@@ -1128,7 +1026,7 @@ fn gates(reconciliation: &Reconciliation, control: &ArmReport, treatment: &ArmRe
             speculation_zero: reconciliation.all_speculative_work_zero,
             passed: behavioral_pass,
         },
-        work_equivalence: WorkEquivalenceGate {
+        WorkEquivalenceGate {
             demand_nvme_bytes_exact: reconciliation.demand_nvme_bytes_exact,
             demand_h2d_installs_exact: reconciliation.ram_to_vram_installs_exact,
             demand_h2d_bytes_exact: reconciliation.ram_to_vram_bytes_exact,
@@ -1139,47 +1037,7 @@ fn gates(reconciliation: &Reconciliation, control: &ArmReport, treatment: &ArmRe
                 && reconciliation.ordered_ram_eviction_ids_exact,
             passed: work_pass,
         },
-        mechanism: MechanismGate {
-            treatment_batch_eligible_all_ram_miss_source_sets_gt_zero: ts
-                .batch_eligible_all_ram_miss_source_sets
-                > 0,
-            treatment_batch_path_exercised: ts.batch_path_exercises > 0,
-            control_batch_path_not_exercised: cs.batch_path_exercises == 0,
-            concurrent_source_reads_gt_zero: ts.concurrent_source_reads > 0,
-            treatment_actual_batch_nvme_width_max_gt_one: ts.actual_batch_nvme_width_max > 1,
-            treatment_mixed_ram_state_batch_attempts_zero: ts.mixed_ram_state_batch_attempts == 0,
-            deterministic_cache_commit_reconciliation: ts.deterministic_cache_commit_reconciliation,
-            no_pool_capacity_failure: ts.pool_capacity_failures == 0,
-            no_batch_read_failure: ts.batch_read_failures == 0,
-            passed: mechanism_pass,
-        },
-    }
-}
-
-fn arm_performance(arm: &ArmReport) -> Result<ArmPerformance, BenchmarkFailure> {
-    let aggregate = arm.benchmark.aggregate.as_ref().ok_or_else(|| {
-        BenchmarkFailure::new(
-            "postcondition",
-            "missing-arm-aggregate",
-            "complete PR2-A arm did not produce a benchmark aggregate",
-        )
-    })?;
-    let runs = generated_results(arm);
-    let mean_request_wall_seconds = runs
-        .iter()
-        .map(|run| run.timing.end_to_end_seconds)
-        .sum::<f64>()
-        / runs.len() as f64;
-    let source = arm.source.as_ref().expect("complete arm source");
-    let work = arm.work.as_ref().expect("complete arm work");
-    Ok(ArmPerformance {
-        decode_tps: aggregate.decode_tps.mean,
-        end_to_end_generated_tps: aggregate.end_to_end_generated_tps.mean,
-        mean_request_wall_seconds,
-        source_acquisition_wall_us: source.source_acquisition_wall_us,
-        total_residency_service_us: source.total_residency_service_us,
-        boundary_wait_us: work.recovery.boundary_wait_us,
-    })
+    )
 }
 
 fn comparison(control: f64, treatment: f64) -> MetricComparison {
@@ -1192,48 +1050,6 @@ fn comparison(control: f64, treatment: f64) -> MetricComparison {
             (treatment - control) / control * 100.0
         },
     }
-}
-
-fn performance(
-    control: &ArmReport,
-    treatment: &ArmReport,
-) -> Result<PerformanceComparison, BenchmarkFailure> {
-    let control = arm_performance(control)?;
-    let treatment = arm_performance(treatment)?;
-    let performance_result = if treatment.decode_tps > control.decode_tps
-        && treatment.source_acquisition_wall_us < control.source_acquisition_wall_us
-        && treatment.total_residency_service_us < control.total_residency_service_us
-    {
-        "improved"
-    } else if treatment.decode_tps < control.decode_tps
-        && treatment.source_acquisition_wall_us > control.source_acquisition_wall_us
-    {
-        "regressed"
-    } else {
-        "mixed_or_no_improvement"
-    };
-    Ok(PerformanceComparison {
-        decode_tps: comparison(control.decode_tps, treatment.decode_tps),
-        end_to_end_generated_tps: comparison(
-            control.end_to_end_generated_tps,
-            treatment.end_to_end_generated_tps,
-        ),
-        mean_request_wall_seconds: comparison(
-            control.mean_request_wall_seconds,
-            treatment.mean_request_wall_seconds,
-        ),
-        source_acquisition_wall_us: comparison(
-            control.source_acquisition_wall_us as f64,
-            treatment.source_acquisition_wall_us as f64,
-        ),
-        total_residency_service_us: comparison(
-            control.total_residency_service_us as f64,
-            treatment.total_residency_service_us as f64,
-        ),
-        control,
-        treatment,
-        performance_result,
-    })
 }
 
 fn production_safety_zero(snapshot: &ProductionDemandSourceSnapshot) -> bool {
@@ -1299,7 +1115,7 @@ fn production_gates(
     control: &ArmReport,
     treatment: &ArmReport,
 ) -> ProductionGates {
-    let common_gates = gates(&reconciliation.common, control, treatment);
+    let (behavioral, work_equivalence) = common_gates(&reconciliation.common);
     let cp = control
         .production
         .as_ref()
@@ -1329,8 +1145,8 @@ fn production_gates(
         && production_safety_zero(cp)
         && production_safety_zero(tp);
     ProductionGates {
-        behavioral: common_gates.behavioral,
-        work_equivalence: common_gates.work_equivalence,
+        behavioral,
+        work_equivalence,
         mechanism: ProductionMechanismGate {
             control_production_batch_successes_zero,
             treatment_production_batch_successes_gt_zero,
@@ -1438,124 +1254,6 @@ fn emit_report<T: Serialize>(
     Ok(())
 }
 
-pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let prepared = prepare(&args)?;
-    let mut report = QualificationReport {
-        schema: SCHEMA,
-        mode: MODE,
-        qualification_only: true,
-        production_demand_source_changed: false,
-        benchmark_complete: false,
-        qualification_pass: false,
-        performance_result: "not_measured",
-        failure: None,
-        frozen_workload: frozen_workload(args.expected_adapter_name.clone()),
-        provenance: prepared.provenance.clone(),
-        isolation: None,
-        control: None,
-        treatment: None,
-        reconciliation: None,
-        gates: None,
-        performance: None,
-    };
-
-    let control = match run_arm(
-        &prepared,
-        &args,
-        GpuNativeDemandSourceQualificationArm::Control,
-        false,
-        MODE,
-    )
-    .await
-    {
-        Ok(control) => control,
-        Err(failure) => {
-            report.failure = Some(failure.clone());
-            emit_report(&report, &args.report_out)?;
-            return Err(failure.to_string().into());
-        }
-    };
-    let control_failure = control.failure.clone();
-    report.control = Some(control);
-    if let Some(failure) = control_failure {
-        report.failure = Some(failure.clone());
-        emit_report(&report, &args.report_out)?;
-        return Err(failure.to_string().into());
-    }
-
-    let treatment = match run_arm(
-        &prepared,
-        &args,
-        GpuNativeDemandSourceQualificationArm::Treatment,
-        false,
-        MODE,
-    )
-    .await
-    {
-        Ok(treatment) => treatment,
-        Err(failure) => {
-            report.failure = Some(failure.clone());
-            emit_report(&report, &args.report_out)?;
-            return Err(failure.to_string().into());
-        }
-    };
-    let treatment_failure = treatment.failure.clone();
-    report.treatment = Some(treatment);
-    if let Some(failure) = treatment_failure {
-        report.failure = Some(failure.clone());
-        emit_report(&report, &args.report_out)?;
-        return Err(failure.to_string().into());
-    }
-
-    let control = report.control.as_ref().expect("control stored");
-    let treatment = report.treatment.as_ref().expect("treatment stored");
-    let reconciliation = reconcile(control, treatment);
-    let gates = gates(&reconciliation, control, treatment);
-    let performance = match performance(control, treatment) {
-        Ok(performance) => performance,
-        Err(failure) => {
-            report.failure = Some(failure.clone());
-            emit_report(&report, &args.report_out)?;
-            return Err(failure.to_string().into());
-        }
-    };
-    let qualification_pass = reconciliation.all_invariants_pass
-        && gates.behavioral.passed
-        && gates.work_equivalence.passed
-        && gates.mechanism.passed;
-    let cs = control.source.as_ref().expect("complete control source");
-    let ts = treatment
-        .source
-        .as_ref()
-        .expect("complete treatment source");
-    report.isolation = Some(IsolationEvidence {
-        control_then_treatment: true,
-        fresh_runtime_per_arm: true,
-        one_qualification_request_stream: cs.single_request_stream && ts.single_request_stream,
-        speculative_prefetch_disabled: reconciliation.all_speculative_work_zero,
-        competing_foreground_requests: cs
-            .overlapping_demand_sets
-            .saturating_add(ts.overlapping_demand_sets),
-        production_fetch_with_retry_changed: false,
-        production_singleflight_changed: false,
-        production_multi_request_singleflight_solved: false,
-        primary_pool_capacity_unchanged: cs.primary_pool_capacity == ts.primary_pool_capacity,
-        shadow_pool_used_by_treatment: false,
-    });
-    report.benchmark_complete = true;
-    report.qualification_pass = qualification_pass;
-    report.performance_result = performance.performance_result;
-    report.reconciliation = Some(reconciliation);
-    report.gates = Some(gates);
-    report.performance = Some(performance);
-    emit_report(&report, &args.report_out)?;
-    if qualification_pass {
-        Ok(())
-    } else {
-        Err("PR2-A qualification gates did not all pass; see emitted report".into())
-    }
-}
-
 pub(crate) async fn run_production_command(
     args: CommandArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1583,8 +1281,6 @@ pub(crate) async fn run_production_command(
         &prepared,
         &args,
         GpuNativeDemandSourceQualificationArm::Control,
-        true,
-        PRODUCTION_MODE,
     )
     .await
     {
@@ -1607,8 +1303,6 @@ pub(crate) async fn run_production_command(
         &prepared,
         &args,
         GpuNativeDemandSourceQualificationArm::Treatment,
-        true,
-        PRODUCTION_MODE,
     )
     .await
     {
@@ -1706,8 +1400,6 @@ mod tests {
 
     #[test]
     fn frozen_workload_contract_is_literal() {
-        assert_eq!(SCHEMA, "mer.gpu-native-demand-source-concurrency.v1");
-        assert_eq!(MODE, "qualify-gpu-native-demand-source-concurrency");
         assert_eq!(
             PRODUCTION_SCHEMA,
             "mer.gpu-native-demand-source-concurrency.v2"
