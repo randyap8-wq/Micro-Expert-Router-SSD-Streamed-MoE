@@ -926,6 +926,22 @@ enum Cmd {
         report_out: PathBuf,
     },
 
+    /// Production-path PR2-A.2 control/treatment qualification. Control
+    /// forces the legacy exact sequential source helper; treatment exercises
+    /// the same ordinary production batching seam used by normal serving.
+    #[command(name = "qualify-gpu-native-demand-source-concurrency-production")]
+    QualifyGpuNativeDemandSourceConcurrencyProduction {
+        /// Path to the frozen strict production GPU-native TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Exact authoritative adapter name required for both isolated arms.
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Required destination for the typed v2 qualification report.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
     /// Qualify strict real-checkpoint inference with CPU dense/attention/KV/
     /// router/head planes and native-Q4_0 routed experts on a hardware GPU.
     QualifyHybridQ4 {
@@ -1877,6 +1893,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::BenchReal { config, .. }
         | Cmd::BenchGpuNativeReal { config, .. }
         | Cmd::QualifyGpuNativeDemandSourceConcurrency { config, .. }
+        | Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
@@ -2313,6 +2330,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build()?;
             rt.block_on(
                 crate::gpu_native_demand_source_concurrency::run_command(
+                    crate::gpu_native_demand_source_concurrency::CommandArgs {
+                        config,
+                        expected_adapter_name,
+                        report_out,
+                        progress_watchdog,
+                    },
+                ),
+            )
+        }
+        Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(
+                crate::gpu_native_demand_source_concurrency::run_production_command(
                     crate::gpu_native_demand_source_concurrency::CommandArgs {
                         config,
                         expected_adapter_name,
@@ -16294,6 +16330,40 @@ mod tests {
         assert!(mutable_workload.is_err());
     }
 
+    #[test]
+    fn gpu_native_demand_source_concurrency_cli_parses_production_command() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "qualify-gpu-native-demand-source-concurrency-production",
+            "--config",
+            "config.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--report-out",
+            "pr2a2-production-report.json",
+        ])
+        .unwrap();
+
+        match &cli.cmd {
+            Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction {
+                config,
+                expected_adapter_name,
+                report_out,
+            } => {
+                assert_eq!(config, &PathBuf::from("config.toml"));
+                assert_eq!(expected_adapter_name, "NVIDIA L4");
+                assert_eq!(
+                    report_out,
+                    &PathBuf::from("pr2a2-production-report.json")
+                );
+            }
+            _ => panic!("unexpected command variant"),
+        }
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new("config.toml"))
+        );
+    }
 
     #[test]
     fn isolated_execution_context_contract_selects_expected_planes() {

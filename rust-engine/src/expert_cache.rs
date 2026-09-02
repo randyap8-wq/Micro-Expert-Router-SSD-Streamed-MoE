@@ -282,6 +282,83 @@ pub struct ExpertCache {
     /// Logical cache-pressure clock: incremented once per insertion.
     /// Drives the exponential decay of resident heat scores.
     epoch: AtomicU64,
+    /// Cache positions owned by in-flight exact-demand production batches.
+    /// Reserved positions count against `capacity` immediately, so ordinary
+    /// inserts cannot consume them while the owning batch performs NVMe I/O.
+    /// Every mutation is serialized with `inner`; the atomic representation
+    /// also permits a cheap process-wide leak snapshot.
+    reserved_slots: std::sync::atomic::AtomicUsize,
+}
+
+/// Why a production exact-demand cache reservation could not be created.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExpertCacheReservationError {
+    Capacity,
+    VictimUnavailable,
+    CostAwarePolicy,
+}
+
+/// RAII ownership of exact positions in one per-layer [`ExpertCache`].
+///
+/// The reservation evicts all required strict-LRU victims atomically at
+/// creation time, but holds no mutex while device reads run. Successful
+/// ordered commits consume one position each. Dropping the guard releases
+/// every unused position, including cancellation and panic unwind.
+pub(crate) struct ExpertCacheSlotReservation {
+    cache: Arc<ExpertCache>,
+    remaining: usize,
+}
+
+impl ExpertCacheSlotReservation {
+    pub(crate) fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    /// Consume one reserved position without invoking the ordinary eviction
+    /// path. An existing id or inconsistent occupancy is an invariant
+    /// violation and leaves the reservation intact for RAII cleanup.
+    pub(crate) fn commit(
+        &mut self,
+        resident: Arc<ExpertResident>,
+    ) -> Result<(), Arc<ExpertResident>> {
+        if self.remaining == 0 {
+            return Err(resident);
+        }
+        let id = resident.id;
+        let mut guard = self.cache.inner.lock();
+        let reserved = self.cache.reserved_slots.load(Ordering::Relaxed);
+        if reserved == 0
+            || guard.peek(&id).is_some()
+            || guard.len().saturating_add(reserved) > self.cache.capacity
+        {
+            return Err(resident);
+        }
+        self.cache.reserved_slots.fetch_sub(1, Ordering::Relaxed);
+        self.remaining -= 1;
+        let evicted = guard.push(id, resident);
+        debug_assert!(
+            evicted.is_none(),
+            "reserved cache commit must not evict or replace a resident"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for ExpertCacheSlotReservation {
+    fn drop(&mut self) {
+        if self.remaining == 0 {
+            return;
+        }
+        // Serialize release with ordinary insertion so no insert can observe
+        // a partially released reservation or steal a still-owned position.
+        let _guard = self.cache.inner.lock();
+        let previous = self
+            .cache
+            .reserved_slots
+            .fetch_sub(self.remaining, Ordering::Relaxed);
+        debug_assert!(previous >= self.remaining, "cache reservation underflow");
+        self.remaining = 0;
+    }
 }
 
 /// Per-insertion decay factor applied to resident heat scores in
@@ -299,6 +376,7 @@ impl ExpertCache {
             capacity,
             cost_aware: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
+            reserved_slots: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -370,7 +448,9 @@ impl ExpertCache {
             0
         };
         let mut pre_evicted = None;
-        if guard.len() >= self.capacity && guard.peek(&id).is_none() {
+        let effective_len = guard.len()
+            .saturating_add(self.reserved_slots.load(Ordering::Relaxed));
+        if effective_len >= self.capacity && guard.peek(&id).is_none() {
             // Pick the victim under the active policy: strict LRU by
             // default, or the lowest decaying-heat resident in
             // cost-aware mode.
@@ -397,6 +477,85 @@ impl ExpertCache {
         // value — which is fine to surface as "evicted" too.
         let push_evicted = guard.push(id, resident).map(|(_, v)| v);
         Ok(push_evicted.or(pre_evicted))
+    }
+
+    /// Atomically reserve `count` strict-LRU positions for one exact-demand
+    /// batch. The returned victims are already removed but remain alive until
+    /// the caller records their identities and drops them outside the lock.
+    ///
+    /// Cost-aware eviction intentionally declines batching: pre-reserving
+    /// several positions cannot reproduce its insertion-epoch/heat sequence
+    /// without changing the active policy, so production falls back to the
+    /// ordinary sequential source path.
+    pub(crate) fn try_reserve_slots(
+        self: &Arc<Self>,
+        count: usize,
+    ) -> Result<(ExpertCacheSlotReservation, Vec<Arc<ExpertResident>>), ExpertCacheReservationError>
+    {
+        if count == 0 {
+            return Ok((
+                ExpertCacheSlotReservation {
+                    cache: self.clone(),
+                    remaining: 0,
+                },
+                Vec::new(),
+            ));
+        }
+        if count > self.capacity {
+            return Err(ExpertCacheReservationError::Capacity);
+        }
+        if self.is_cost_aware() {
+            return Err(ExpertCacheReservationError::CostAwarePolicy);
+        }
+
+        // Lock order matches `insert` / `evict_lru`: pinned before inner.
+        let pinned = self.pinned.lock();
+        let mut guard = self.inner.lock();
+        let already_reserved = self.reserved_slots.load(Ordering::Relaxed);
+        let free = self
+            .capacity
+            .saturating_sub(guard.len().saturating_add(already_reserved));
+        let victims_needed = count.saturating_sub(free);
+        let victim_ids = guard
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| !pinned.contains(id))
+            .rev()
+            .take(victims_needed)
+            .collect::<Vec<_>>();
+        if victim_ids.len() != victims_needed {
+            return Err(ExpertCacheReservationError::VictimUnavailable);
+        }
+
+        let mut victims = Vec::with_capacity(victims_needed);
+        for id in victim_ids {
+            victims.push(
+                guard
+                    .pop(&id)
+                    .expect("reservation victim selected from authoritative cache"),
+            );
+        }
+        self.reserved_slots.fetch_add(count, Ordering::Relaxed);
+        debug_assert!(
+            guard
+                .len()
+                .saturating_add(self.reserved_slots.load(Ordering::Relaxed))
+                <= self.capacity,
+            "cache reservations must never increase effective capacity"
+        );
+        drop(guard);
+        drop(pinned);
+        Ok((
+            ExpertCacheSlotReservation {
+                cache: self.clone(),
+                remaining: count,
+            },
+            victims,
+        ))
+    }
+
+    pub(crate) fn reserved_slots(&self) -> usize {
+        self.reserved_slots.load(Ordering::Relaxed)
     }
 
     /// Choose the id to evict from `guard` under the active policy.
@@ -1743,6 +1902,70 @@ mod tests {
     fn make(id: u32, pool: &BufferPool) -> Arc<ExpertResident> {
         let buffer = pool.try_acquire().unwrap();
         Arc::new(ExpertResident::new(id, buffer))
+    }
+
+    #[test]
+    fn exact_demand_reservation_counts_against_capacity_and_skips_pins() {
+        let pool = BufferPool::new(6, 4096, 4096);
+        let cache = Arc::new(ExpertCache::new(3));
+        for id in [0, 1, 2] {
+            assert!(cache.insert(make(id, &pool)).is_ok());
+        }
+        cache.pin(0);
+
+        let (mut reservation, victims) = cache.try_reserve_slots(2).unwrap();
+        assert_eq!(
+            victims
+                .iter()
+                .map(|resident| resident.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        drop(victims);
+        assert_eq!(cache.reserved_slots(), 2);
+        assert_eq!(cache.len() + cache.reserved_slots(), cache.capacity());
+        assert!(
+            cache.contains(0),
+            "pinned resident must survive reservation"
+        );
+
+        let rejected = match cache.insert(make(3, &pool)) {
+            Err(rejected) => rejected,
+            Ok(_) => panic!("ordinary insert stole a reserved cache position"),
+        };
+        assert_eq!(rejected.id, 3, "ordinary insert cannot steal a reservation");
+        assert!(reservation.commit(make(4, &pool)).is_ok());
+        assert!(reservation.commit(make(5, &pool)).is_ok());
+        drop(reservation);
+        assert_eq!(cache.reserved_slots(), 0);
+        assert_eq!(cache.len(), cache.capacity());
+        assert!(cache.contains(0));
+        assert!(cache.contains(4));
+        assert!(cache.contains(5));
+    }
+
+    #[test]
+    fn dropping_exact_demand_reservation_releases_every_unused_slot() {
+        let pool = BufferPool::new(3, 4096, 4096);
+        let cache = Arc::new(ExpertCache::new(2));
+        let (reservation, victims) = cache.try_reserve_slots(2).unwrap();
+        assert!(victims.is_empty());
+        assert_eq!(cache.reserved_slots(), 2);
+        assert!(cache.insert(make(0, &pool)).is_err());
+        drop(reservation);
+        assert_eq!(cache.reserved_slots(), 0);
+        assert!(cache.insert(make(1, &pool)).is_ok());
+    }
+
+    #[test]
+    fn cost_aware_cache_declines_precomputed_reservation() {
+        let cache = Arc::new(ExpertCache::new(2));
+        cache.set_cost_aware(true);
+        assert!(matches!(
+            cache.try_reserve_slots(1),
+            Err(ExpertCacheReservationError::CostAwarePolicy)
+        ));
+        assert_eq!(cache.reserved_slots(), 0);
     }
 
     #[test]

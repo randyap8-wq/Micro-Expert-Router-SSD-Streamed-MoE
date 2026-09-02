@@ -203,6 +203,11 @@ impl BufferPool {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn primary_available(&self) -> usize {
+        self.inner.free.lock().len()
+    }
+
     /// Try to pop a free **shadow** buffer immediately. Returns `None`
     /// if the shadow pool is disabled (`shadow_capacity() == 0`) **or**
     /// fully in flight. Speculative prefetches should always use this

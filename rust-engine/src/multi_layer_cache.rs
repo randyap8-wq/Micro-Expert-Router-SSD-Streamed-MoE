@@ -20,7 +20,9 @@
 //! multi-layer models (single-layer models continue to use
 //! `expert_<id>.bin`, written by the existing extractor).
 
-use crate::expert_cache::{ExpertCache, ExpertResident};
+use crate::expert_cache::{
+    ExpertCache, ExpertCacheReservationError, ExpertCacheSlotReservation, ExpertResident,
+};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -268,6 +270,30 @@ impl MultiLayerExpertCache {
         layer: usize,
     ) -> Option<Arc<ExpertResident>> {
         self.caches.get(layer)?.evict_lru()
+    }
+
+    /// Reserve exact cache positions in one authoritative per-layer LRU.
+    /// The operation is atomic within that layer and never holds a cache
+    /// mutex after it returns, so device I/O remains outside the critical
+    /// section. Ordinary inserts count the reservation against capacity.
+    pub(crate) fn try_reserve_layer_slots(
+        &self,
+        layer: usize,
+        count: usize,
+    ) -> Result<
+        (ExpertCacheSlotReservation, Vec<Arc<ExpertResident>>),
+        ExpertCacheReservationError,
+    > {
+        self.caches
+            .get(layer)
+            .ok_or(ExpertCacheReservationError::Capacity)?
+            .try_reserve_slots(count)
+    }
+
+    /// Process-wide snapshot used by production telemetry and qualification
+    /// postconditions. A nonzero value after demand service is a leak.
+    pub(crate) fn reserved_slots(&self) -> usize {
+        self.caches.iter().map(|cache| cache.reserved_slots()).sum()
     }
 
     /// **Tier 4 — cost-aware eviction.** Enable or disable the
