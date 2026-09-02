@@ -17,7 +17,6 @@ use crate::aligned_buffer::AlignedBuffer;
 use crate::backend::Backend as _;
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{
-    ExpertCacheSlotReservation,
     ExpertResident, GpuAdmission, GpuDemandAdmissionError, GpuDemandSetAdmission, GpuExpertCache,
     GpuHotPromotionOutcome, GpuResident,
 };
@@ -38,7 +37,7 @@ use crate::inference::{
 };
 use crate::io_provider::NvmeStorage;
 use crate::metrics::Metrics;
-use crate::multi_layer_cache::MultiLayerExpertCache;
+use crate::multi_layer_cache::{MultiLayerCacheReservation, MultiLayerExpertCache};
 use crate::router::{
     DecayWorkerHandle, LayeredExpertAffinity, LocalityMonitor, NeuralSpeculator, PredictiveLoader,
 };
@@ -410,12 +409,16 @@ pub(crate) enum GpuNativeDemandResidencyError {
     QualificationCacheCommitRejected {
         global_id: u32,
     },
-    QualificationUnexpectedCommitEviction {
-        inserted_global_id: u32,
-        evicted_global_id: u32,
-    },
     ProductionBatchCommitViolation {
         global_id: u32,
+    },
+    ProductionBatchPoolUnavailableAfterReservation {
+        requested: usize,
+        acquired: usize,
+    },
+    ProductionBatchReadFailedAfterReservation {
+        global_ids: Vec<u32>,
+        source: String,
     },
     ExpertRead(ExpertReadError),
     LogicalAdmission(crate::backend::GpuExpertDispatchError),
@@ -484,16 +487,20 @@ impl std::fmt::Display for GpuNativeDemandResidencyError {
                 f,
                 "qualification-only ordered RAM-cache commit rejected expert {global_id}"
             ),
-            Self::QualificationUnexpectedCommitEviction {
-                inserted_global_id,
-                evicted_global_id,
-            } => write!(
-                f,
-                "qualification-only ordered RAM-cache commit of expert {inserted_global_id} unexpectedly evicted expert {evicted_global_id} after deterministic reservation"
-            ),
             Self::ProductionBatchCommitViolation { global_id } => write!(
                 f,
                 "production exact-demand reserved cache commit invariant failed for expert {global_id}"
+            ),
+            Self::ProductionBatchPoolUnavailableAfterReservation {
+                requested,
+                acquired,
+            } => write!(
+                f,
+                "production exact-demand batch acquired only {acquired} of {requested} primary buffers after committing its cache victim schedule; sequential fallback is unsafe"
+            ),
+            Self::ProductionBatchReadFailedAfterReservation { global_ids, source } => write!(
+                f,
+                "production exact-demand batch read for experts {global_ids:?} failed after committing its cache victim schedule; sequential fallback is unsafe: {source}"
             ),
             Self::ExpertRead(error) => write!(f, "tiered residency fetch failed: {error}"),
             Self::LogicalAdmission(error) => {
@@ -1263,17 +1270,19 @@ impl Drop for MultiIdSingleflightLeadership {
 /// guard owns the actual positions; this wrapper only accounts consumption
 /// and unused release without changing its safety protocol.
 struct ProductionCacheReservation {
-    inner: ExpertCacheSlotReservation,
+    inner: MultiLayerCacheReservation,
     telemetry: Arc<ProductionDemandSourceTelemetry>,
 }
 
 impl ProductionCacheReservation {
-    fn commit(&mut self, resident: Arc<ExpertResident>) -> Result<(), Arc<ExpertResident>> {
-        self.inner.commit(resident)?;
-        self.telemetry
-            .cache_reservations_consumed
-            .fetch_add(1, Ordering::Relaxed);
-        Ok(())
+    fn commit(&mut self, resident: Arc<ExpertResident>) -> Result<bool, Arc<ExpertResident>> {
+        let cached = self.inner.commit(resident)?;
+        if cached {
+            self.telemetry
+                .cache_reservations_consumed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(cached)
     }
 }
 
@@ -5080,11 +5089,13 @@ impl Engine {
         Ok(())
     }
 
-    /// Ordinary production source for an exact physical-missing set. The
-    /// optimization is opportunistic: every setup/contention/read failure
-    /// releases batch ownership first and then executes the complete legacy
-    /// sequential helper. Only an invariant failure during a reserved commit
-    /// is surfaced instead of being hidden by another eviction.
+    /// Ordinary production source for an exact physical-missing set. Setup or
+    /// contention failures before cache reservation remain opportunistic and
+    /// use the complete legacy sequential helper. Once the atomic victim
+    /// schedule has removed residents, pool/read/commit failures are surfaced
+    /// fail-closed: replaying sequentially could stop on an early expert after
+    /// later experts' victims were already removed, so it would falsely claim
+    /// exact failure-state semantics.
     async fn gpu_native_production_source_physical_missing_set(
         self: &Arc<Self>,
         global_ids: &[u32],
@@ -5190,21 +5201,8 @@ impl Engine {
                 .await;
         }
 
-        let layer = self.core.cache.layer_of(unresolved[0]);
-        if unresolved
-            .iter()
-            .any(|global_id| self.core.cache.layer_of(*global_id) != layer)
-        {
-            telemetry
-                .fallback_reservation
-                .fetch_add(1, Ordering::Relaxed);
-            drop(leadership);
-            return self
-                .gpu_native_sequential_source_physical_missing_set(global_ids, residents)
-                .await;
-        }
-        let (cache_reservation, victims) =
-            match self.core.cache.try_reserve_layer_slots(layer, unresolved.len()) {
+        let reservation_outcome =
+            match self.core.cache.try_reserve_exact_demand(&unresolved) {
                 Ok(reservation) => reservation,
                 Err(_) => {
                     telemetry
@@ -5216,32 +5214,36 @@ impl Engine {
                         .await;
                 }
             };
+        let reserved_slots = reservation_outcome.reservation.remaining();
         telemetry
             .cache_slots_reserved
-            .fetch_add(unresolved.len() as u64, Ordering::Relaxed);
+            .fetch_add(reserved_slots as u64, Ordering::Relaxed);
         let mut cache_reservation = ProductionCacheReservation {
-            inner: cache_reservation,
+            inner: reservation_outcome.reservation,
             telemetry: telemetry.clone(),
         };
         if let Some(qualification) = self.gpu_native_demand_source_qualification() {
-            for victim in &victims {
-                qualification.record_cache_eviction(victim.id);
+            for &victim_id in &reservation_outcome.eviction_ids {
+                qualification.record_cache_eviction(victim_id);
             }
         }
-        drop(victims);
+        drop(reservation_outcome.victims);
 
         let mut buffers = Vec::with_capacity(unresolved.len());
         for _ in 0..unresolved.len() {
             match self.core.pool.try_acquire() {
                 Some(buffer) => buffers.push(buffer),
                 None => {
-                    telemetry.fallback_pool.fetch_add(1, Ordering::Relaxed);
+                    let acquired = buffers.len();
                     drop(buffers);
                     drop(cache_reservation);
                     drop(leadership);
-                    return self
-                        .gpu_native_sequential_source_physical_missing_set(global_ids, residents)
-                        .await;
+                    return Err(
+                        GpuNativeDemandResidencyError::ProductionBatchPoolUnavailableAfterReservation {
+                            requested: unresolved.len(),
+                            acquired,
+                        },
+                    );
                 }
             }
         }
@@ -5273,16 +5275,22 @@ impl Engine {
         let expected_bytes = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
         let read_bytes = match read_result {
             Ok(read_bytes) if read_bytes == expected_bytes => read_bytes,
-            Ok(_) | Err(_) => {
-                telemetry
-                    .fallback_batch_read_error
-                    .fetch_add(1, Ordering::Relaxed);
+            result => {
+                let source = match result {
+                    Ok(read_bytes) => {
+                        format!("batch returned {read_bytes} bytes, expected {expected_bytes}")
+                    }
+                    Err(error) => error.to_string(),
+                };
                 drop(buffers);
                 drop(cache_reservation);
                 drop(leadership);
-                return self
-                    .gpu_native_sequential_source_physical_missing_set(global_ids, residents)
-                    .await;
+                return Err(
+                    GpuNativeDemandResidencyError::ProductionBatchReadFailedAfterReservation {
+                        global_ids: unresolved,
+                        source,
+                    },
+                );
             }
         };
 
@@ -5344,8 +5352,8 @@ impl Engine {
 
     /// PR2-A treatment seam for a source set already proven to be entirely
     /// absent from RAM by a non-recency-mutating eligibility scan. It reserves
-    /// only primary-pool buffers by simulating the existing sequential cache
-    /// victim schedule, dispatches the unavoidable misses through the existing
+    /// exact cache positions through the same pure sequential victim planner
+    /// as production, dispatches the unavoidable misses through the existing
     /// NVMe batch primitive, and commits successful residents in request order.
     async fn gpu_native_qualification_batch_source(
         self: &Arc<Self>,
@@ -5400,55 +5408,26 @@ impl Engine {
             }
         }
 
-        let mut virtual_lengths = self.core.cache.qualification_layer_lengths();
-        let mut virtual_total = virtual_lengths.iter().sum::<usize>();
-        let total_capacity = self.core.cache.capacity();
+        let reservation_outcome = self
+            .core
+            .cache
+            .try_reserve_exact_demand(&nvme_ids)
+            .map_err(|_| {
+                qualification
+                    .pool_capacity_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                GpuNativeDemandResidencyError::QualificationBatchVictimUnavailable {
+                    global_id: nvme_ids[0],
+                }
+            })?;
+        for &victim_id in &reservation_outcome.eviction_ids {
+            qualification.record_cache_eviction(victim_id);
+        }
+        drop(reservation_outcome.victims);
+        let mut cache_reservation = reservation_outcome.reservation;
+
         let mut buffers = Vec::with_capacity(nvme_ids.len());
-        for &global_id in &nvme_ids {
-            if virtual_total >= total_capacity {
-                let victim = self
-                    .core
-                    .cache
-                    .qualification_evict_lru_with_virtual_lengths(&virtual_lengths)
-                    .ok_or_else(|| {
-                        qualification
-                            .pool_capacity_failures
-                            .fetch_add(1, Ordering::Relaxed);
-                        GpuNativeDemandResidencyError::QualificationBatchVictimUnavailable {
-                            global_id,
-                        }
-                    })?;
-                let victim_layer = self.core.cache.layer_of(victim.id);
-                virtual_lengths[victim_layer] = virtual_lengths[victim_layer].saturating_sub(1);
-                virtual_total = virtual_total.saturating_sub(1);
-                qualification.record_cache_eviction(victim.id);
-                drop(victim);
-            }
-
-            let target_layer = self.core.cache.layer_of(global_id);
-            let target_capacity = self.core.cache.capacity_of_layer(target_layer);
-            if virtual_lengths[target_layer] >= target_capacity {
-                let victim = self
-                    .core
-                    .cache
-                    .qualification_evict_lru_from_layer(target_layer)
-                    .ok_or_else(|| {
-                        qualification
-                            .pool_capacity_failures
-                            .fetch_add(1, Ordering::Relaxed);
-                        GpuNativeDemandResidencyError::QualificationBatchVictimUnavailable {
-                            global_id,
-                        }
-                    })?;
-                let victim_layer = self.core.cache.layer_of(victim.id);
-                virtual_lengths[victim_layer] = virtual_lengths[victim_layer].saturating_sub(1);
-                virtual_total = virtual_total.saturating_sub(1);
-                qualification.record_cache_eviction(victim.id);
-                drop(victim);
-            }
-
-            virtual_lengths[target_layer] = virtual_lengths[target_layer].saturating_add(1);
-            virtual_total = virtual_total.saturating_add(1);
+        for _ in &nvme_ids {
             let Some(buffer) = self.core.pool.try_acquire() else {
                 qualification
                     .pool_capacity_failures
@@ -5549,23 +5528,10 @@ impl Engine {
             .collect::<HashMap<_, _>>();
         let staged = qualification_order_completed_residents(&nvme_ids, completed)?;
         for (global_id, resident) in staged {
-            match self.core.cache.insert(resident.clone()) {
-                Ok(None) => {
+            match cache_reservation.commit(resident.clone()) {
+                Ok(_) => {
                     qualification.record_cache_insert(global_id);
                     residents.insert(global_id, resident);
-                }
-                Ok(Some(evicted)) => {
-                    qualification
-                        .ordered_commit_violations
-                        .fetch_add(1, Ordering::Relaxed);
-                    qualification.record_cache_insert(global_id);
-                    qualification.record_cache_eviction(evicted.id);
-                    return Err(
-                        GpuNativeDemandResidencyError::QualificationUnexpectedCommitEviction {
-                            inserted_global_id: global_id,
-                            evicted_global_id: evicted.id,
-                        },
-                    );
                 }
                 Err(_rejected) => {
                     qualification
@@ -8604,6 +8570,59 @@ mod tests {
         ))
     }
 
+    fn build_multi_layer_source_engine(
+        data_dir: &std::path::Path,
+        per_layer_caps: Vec<usize>,
+        experts_per_layer: u32,
+        top_k: usize,
+        seed: u64,
+    ) -> Arc<Engine> {
+        let d_model = 8usize;
+        let d_ff = 8usize;
+        let num_experts = experts_per_layer * per_layer_caps.len() as u32;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        generate_synthetic_experts(data_dir, num_experts, expert_size, d_model, d_ff)
+            .expect("generate multi-layer synthetic experts");
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: data_dir.to_path_buf(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: Some(experts_per_layer),
+            })
+            .expect("multi-layer storage init"),
+        );
+        storage
+            .warmup_fds(0..num_experts)
+            .expect("pre-open multi-layer expert fds");
+        let cache = Arc::new(MultiLayerExpertCache::with_capacities(
+            per_layer_caps,
+            experts_per_layer,
+        ));
+        let pool = BufferPool::new(
+            cache.capacity() + top_k.max(1),
+            expert_size,
+            block_align,
+        );
+        let router = Router::Markov(Arc::new(TopKRouter::new(num_experts, top_k, seed)));
+        let predictor = Arc::new(PredictiveLoader::new(num_experts, 0, 0.05, seed));
+        Arc::new(Engine::new(
+            cache,
+            pool,
+            storage,
+            router,
+            predictor,
+            ModelShape {
+                d_model,
+                d_ff,
+                hidden_seed: seed,
+            },
+        ))
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gpu_native_demand_source_reuses_ram_without_duplicate_nvme_read() {
         let dir = TempDir::new("gpu-native-demand-source");
@@ -8990,6 +9009,8 @@ mod tests {
             .unwrap();
         drop(priming);
         engine.core.cache.pin(0);
+        engine.core.cache.pin(2);
+        engine.core.cache.pin(3);
         enable_source_arm(
             &engine,
             GpuNativeDemandSourceQualificationArm::Treatment,
@@ -9151,6 +9172,95 @@ mod tests {
         assert_eq!(control_snapshot.ram_cache_evictions, 2);
         assert_eq!(treatment_snapshot.ram_cache_evictions, 2);
         assert_eq!(control.core.cache.resident_ids(), treatment.core.cache.resident_ids());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_multilayer_warmup_shape_reconciles_ordered_hashes_and_full_state() {
+        let control_dir = TempDir::new("production-multilayer-warmup-control");
+        let treatment_dir = TempDir::new("production-multilayer-warmup-treatment");
+        let control =
+            build_multi_layer_source_engine(&control_dir.path, vec![3, 2], 8, 2, 0xA21);
+        let treatment =
+            build_multi_layer_source_engine(&treatment_dir.path, vec![3, 2], 8, 2, 0xA21);
+        control
+            .enable_gpu_native_demand_source_production_qualification(
+                GpuNativeDemandSourceQualificationArm::Control,
+            )
+            .unwrap();
+        treatment
+            .enable_gpu_native_demand_source_production_qualification(
+                GpuNativeDemandSourceQualificationArm::Treatment,
+            )
+            .unwrap();
+
+        // Cold start, then alternate layers until both aggregate and
+        // per-layer limits have been crossed repeatedly. Every set is an
+        // exact all-RAM-miss pair and treatment uses ordinary production.
+        let source_sets = [
+            [0, 1],
+            [8, 9],
+            [2, 3],
+            [10, 11],
+            [4, 5],
+            [12, 13],
+            [6, 7],
+            [14, 15],
+        ];
+        for ids in source_sets {
+            run_production_source_set(control.clone(), ids.to_vec())
+                .await
+                .unwrap();
+            run_production_source_set(treatment.clone(), ids.to_vec())
+                .await
+                .unwrap();
+        }
+
+        let control_source = control
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        let treatment_source = treatment
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        assert_eq!(
+            control_source.demand_ram_eviction_ids_sha256,
+            treatment_source.demand_ram_eviction_ids_sha256,
+            "authoritative warmup-shaped ordered eviction stream"
+        );
+        assert_eq!(
+            control_source.demand_ram_insert_ids_sha256,
+            treatment_source.demand_ram_insert_ids_sha256,
+            "authoritative warmup-shaped ordered insertion stream"
+        );
+        assert_eq!(
+            control.core.cache.qualification_state_sha256(),
+            treatment.core.cache.qualification_state_sha256(),
+            "complete layer-indexed MRU-to-LRU cache state"
+        );
+        assert_eq!(control.core.cache.len(), treatment.core.cache.len());
+        for layer in 0..control.core.cache.num_layers() {
+            assert_eq!(
+                control
+                    .core
+                    .cache
+                    .cache_for_layer(layer as u32)
+                    .resident_ids(),
+                treatment
+                    .core
+                    .cache
+                    .cache_for_layer(layer as u32)
+                    .resident_ids()
+            );
+        }
+        assert!(control_source.ram_cache_evictions > 0);
+        assert_eq!(
+            control_source.ram_cache_evictions,
+            treatment_source.ram_cache_evictions
+        );
+        let production = treatment.production_demand_source_snapshot();
+        assert_eq!(production.production_batch_successes, source_sets.len() as u64);
+        assert_eq!(production.production_cache_reservation_leaks, 0);
+        assert_eq!(production.production_batch_commit_violations, 0);
+        assert_eq!(production.stale_singleflight_entries, 0);
     }
 
     async fn wait_for_production_snapshot<F>(engine: &Arc<Engine>, condition: F)
@@ -9367,44 +9477,93 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn production_batch_device_failure_discards_buffers_and_preserves_sequential_recovery() {
+    async fn production_batch_device_failure_after_victims_fails_closed_without_late_fallback() {
         let dir = TempDir::new("production-batch-read-error");
-        let engine = build_engine(&dir.path, 4, 8, 8, 4, 2, 0, 22);
+        let engine = build_engine(&dir.path, 6, 8, 8, 4, 2, 0, 22);
+        let mut priming = HashMap::new();
+        for id in 0..4 {
+            engine
+                .gpu_native_demand_source(id, &mut priming)
+                .await
+                .unwrap();
+        }
+        drop(priming);
         std::fs::OpenOptions::new()
             .write(true)
-            .open(dir.path.join("expert_0.bin"))
+            .open(dir.path.join("expert_4.bin"))
             .unwrap()
             .set_len(0)
             .unwrap();
         let mut residents = HashMap::new();
         let error = engine
-            .gpu_native_source_physical_missing_set(&[0, 1], &mut residents)
+            .gpu_native_source_physical_missing_set(&[4, 5], &mut residents)
             .await
             .unwrap_err();
         assert!(matches!(
             error,
-            GpuNativeDemandResidencyError::ExpertRead(ExpertReadError::Io { id: 0, .. })
+            GpuNativeDemandResidencyError::ProductionBatchReadFailedAfterReservation { .. }
         ));
         assert!(residents.is_empty());
         assert!(!engine.core.cache.contains(0));
         assert!(!engine.core.cache.contains(1));
-        assert!(engine.core.storage.is_expert_unavailable(0));
-        tokio::time::sleep(
-            crate::io_provider::STORAGE_BREAKER_PROBE_INTERVAL + Duration::from_millis(25),
-        )
-        .await;
-        if let Err(error) = engine.fetch_with_retry(1).await {
+        assert!(engine.core.cache.contains(2));
+        assert!(engine.core.cache.contains(3));
+        assert!(!engine.core.cache.contains(4));
+        assert!(!engine.core.cache.contains(5));
+        if let Err(error) = engine.fetch_with_retry(5).await {
             panic!("sequential recovery for healthy expert failed: {error}");
         }
-        assert!(!engine.core.storage.is_drive_unavailable(1));
-        assert!(engine.core.storage.is_expert_unavailable(0));
+        assert!(!engine.core.storage.is_drive_unavailable(5));
         let snapshot = engine.production_demand_source_snapshot();
-        assert_eq!(snapshot.production_sequential_fallback_batch_read_error, 1);
+        assert_eq!(snapshot.production_sequential_fallback_batch_read_error, 0);
         assert_eq!(snapshot.production_batch_successes, 0);
         assert_eq!(snapshot.production_cache_reservations_released, 2);
         assert_eq!(snapshot.production_singleflight_claim_rollbacks, 2);
         assert_eq!(snapshot.production_cache_reservation_leaks, 0);
         assert_eq!(snapshot.stale_singleflight_entries, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_pool_failure_after_victims_fails_closed_and_releases_transaction() {
+        let dir = TempDir::new("production-pool-fail-closed");
+        let engine = build_engine(&dir.path, 4, 8, 8, 2, 2, 0, 122);
+        let mut retained = HashMap::new();
+        for id in [0, 1] {
+            engine
+                .gpu_native_demand_source(id, &mut retained)
+                .await
+                .unwrap();
+        }
+
+        // Eviction removes both cache references, but request-local Arcs keep
+        // those victim buffers unavailable. Only the single headroom buffer
+        // can be acquired, forcing the post-reservation fail-closed path.
+        let mut residents = HashMap::new();
+        let error = engine
+            .gpu_native_source_physical_missing_set(&[2, 3], &mut residents)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GpuNativeDemandResidencyError::ProductionBatchPoolUnavailableAfterReservation {
+                requested: 2,
+                acquired: 1,
+            }
+        ));
+        assert!(residents.is_empty());
+        assert_eq!(engine.core.cache.len(), 0);
+        assert_eq!(engine.core.cache.reserved_slots(), 0);
+        let snapshot = engine.production_demand_source_snapshot();
+        assert_eq!(snapshot.production_sequential_fallback_pool, 0);
+        assert_eq!(snapshot.production_cache_reservations_released, 2);
+        assert_eq!(snapshot.production_singleflight_claim_rollbacks, 2);
+        assert_eq!(snapshot.production_cache_reservation_leaks, 0);
+        assert_eq!(snapshot.stale_singleflight_entries, 0);
+        drop(retained);
+        assert_eq!(
+            engine.core.pool.primary_available(),
+            engine.core.pool.capacity()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
