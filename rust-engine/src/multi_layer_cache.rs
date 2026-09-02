@@ -389,10 +389,7 @@ impl MultiLayerExpertCache {
         }
     }
 
-    /// Whether an expert is already pinned in its owning per-layer cache.
-    /// Qualification-only callers use this to install temporary demand-set
-    /// pins without accidentally removing a pre-existing production pin when
-    /// the temporary guard is dropped.
+    /// Whether an expert is pinned in its owning per-layer cache.
     pub(crate) fn is_pinned(&self, id: u32) -> bool {
         self.try_layer_idx(id)
             .is_some_and(|idx| self.caches[idx].is_pinned(id))
@@ -717,22 +714,6 @@ mod tests {
             run_legacy_sequential(&legacy, &legacy_pool, &requested);
         let legacy_states = layer_states(&legacy);
 
-        // Reproduce the superseded e700 target-only assumption: reserve two
-        // positions solely by removing the requested layer's strict LRUs.
-        let old_pool = BufferPool::new(9, 4096, 4096);
-        let old = MultiLayerExpertCache::with_capacities(vec![3, 2], 8);
-        seed(&old, &old_pool);
-        let target = old.cache_for_layer(1);
-        let mut old_evictions = Vec::new();
-        for _ in &requested {
-            let victim = target.evict_lru().expect("old target-only victim");
-            old_evictions.push(victim.id);
-            drop(victim);
-        }
-        for &id in &requested {
-            assert!(old.insert(make(id, &old_pool)).is_ok());
-        }
-
         let corrected_pool = BufferPool::new(9, 4096, 4096);
         let corrected = MultiLayerExpertCache::with_capacities(vec![3, 2], 8);
         seed(&corrected, &corrected_pool);
@@ -750,9 +731,6 @@ mod tests {
         }
 
         assert_eq!(legacy_evictions, vec![0, 8, 9]);
-        assert_eq!(old_evictions, vec![8, 9]);
-        assert_ne!(old_evictions, legacy_evictions);
-        assert_ne!(layer_states(&old), legacy_states);
         assert_eq!(corrected_evictions, legacy_evictions);
         assert_eq!(corrected_insertions, legacy_insertions);
         assert_eq!(layer_states(&corrected), legacy_states);
