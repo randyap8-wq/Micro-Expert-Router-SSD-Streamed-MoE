@@ -136,6 +136,7 @@ mod distributed;
 mod draft;
 mod engine;
 mod expert_cache;
+mod expert_source_throughput;
 mod gating;
 mod gguf;
 mod gguf_loader;
@@ -928,6 +929,10 @@ enum Cmd {
         #[arg(long)]
         report_out: PathBuf,
     },
+
+    /// Qualification-only expert source reads; no model or GPU runtime.
+    #[command(name = "qualify-expert-source-throughput")]
+    QualifyExpertSourceThroughput(Box<crate::expert_source_throughput::CommandArgs>),
 
     /// ORACLE-0B-S perfect-future source scheduling with either source-only
     /// treatment or serialized same-queue H2D at a proven token boundary.
@@ -2003,6 +2008,11 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     let cli = Cli::parse();
+    // This storage-only diagnostic must precede all engine, math-backend,
+    // GPU, config, predictor and autotune startup.
+    if let Cmd::QualifyExpertSourceThroughput(args) = &cli.cmd {
+        return crate::expert_source_throughput::run_command(args);
+    }
     let worker_protocol_stdout = matches!(
         cli.cmd,
         Cmd::GreedyParityHybridWorkerInternal { .. }
@@ -2154,6 +2164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match cli.cmd {
+        Cmd::QualifyExpertSourceThroughput(_) => unreachable!("handled before engine startup"),
         Cmd::GenData {
             data_dir,
             num_experts,
