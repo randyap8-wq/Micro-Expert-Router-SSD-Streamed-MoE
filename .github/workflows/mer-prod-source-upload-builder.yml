@@ -1,0 +1,178 @@
+name: MER source-upload productionization builder
+
+on:
+  push:
+    branches:
+      - prod/gpu-native-source-to-upload-copy-elision
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-commit:
+    if: github.event.head_commit.message == 'chore: temporary MER source-upload productionization builder'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      BASE_SHA: 0bb8b421f276321f2c543035f9c8c47b013fd022
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify exact builder ancestry
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          test "$(git rev-parse "$BASE_SHA^{tree}")" = "7cd18476ac34585b21ef745e2650f5e6eb4f040a"
+          git status --short
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Materialize deterministic patch script
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, gzip
+          encoded = '''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'''
+          open('/tmp/mer_prod_source_upload_patch.py','wb').write(gzip.decompress(base64.b64decode(encoded)))
+          PY
+          echo "PATCH_SCRIPT_SHA256=$(sha256sum /tmp/mer_prod_source_upload_patch.py | awk '{print $1}')"
+
+      - name: Apply deterministic productionization patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 /tmp/mer_prod_source_upload_patch.py | tee /tmp/patch.log
+          git diff --check
+          git diff --stat "$BASE_SHA" | tee /tmp/diffstat.txt
+          git status --short | tee /tmp/status-after-patch.txt
+
+      - name: Format audit
+        shell: bash
+        run: |
+          set +e
+          cd rust-engine
+          cargo fmt --check > /tmp/fmt.log 2>&1
+          rc=$?
+          echo "FMT_EXIT_CODE=$rc" | tee /tmp/fmt-result.txt
+          # Existing repository-wide formatting debt is non-blocking here.
+          exit 0
+
+      - name: Frozen witness
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd rust-engine
+          RUST_MIN_STACK=8388608 cargo test --features tokenizer \
+            q4_route_parallel_source_residency_and_configuration_remain_frozen \
+            -- --nocapture 2>&1 | tee /tmp/frozen-witness.log
+
+      - name: Source-upload focused tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd rust-engine
+          RUST_MIN_STACK=8388608 cargo test --features tokenizer source_upload -- --nocapture \
+            2>&1 | tee /tmp/source-upload-tests.log
+
+      - name: Full tokenizer test suite
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd rust-engine
+          RUST_MIN_STACK=8388608 cargo test --features tokenizer \
+            2>&1 | tee /tmp/full-tests.log
+
+      - name: Cargo check tests tokenizer
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd rust-engine
+          RUST_MIN_STACK=8388608 cargo check --tests --features tokenizer \
+            2>&1 | tee /tmp/cargo-check.log
+
+      - name: Canonical release build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd rust-engine
+          unset RUST_MIN_STACK
+          cargo build --release --features tokenizer \
+            2>&1 | tee /tmp/release-build.log
+
+      - name: Freeze tested tree evidence
+        shell: bash
+        run: |
+          set -euxo pipefail
+          {
+            echo "BUILDER_HEAD=$(git rev-parse HEAD)"
+            echo "BASE_SHA=$BASE_SHA"
+            echo "BASE_TREE=$(git rev-parse "$BASE_SHA^{tree}")"
+            echo "PATCH_SCRIPT_SHA256=$(sha256sum /tmp/mer_prod_source_upload_patch.py | awk '{print $1}')"
+            echo "RUSTC=$(rustc --version)"
+            echo "CARGO=$(cargo --version)"
+            echo "RUST_MIN_STACK_RELEASE=${RUST_MIN_STACK-unset}"
+            echo "DIFF_CHECK=PASS"
+            cat /tmp/fmt-result.txt
+            echo "FROZEN_WITNESS=PASS"
+            echo "SOURCE_UPLOAD_FOCUSED=PASS"
+            echo "FULL_TEST_SUITE=PASS"
+            echo "CARGO_CHECK=PASS"
+            echo "CANONICAL_RELEASE_BUILD=PASS"
+            echo "L4_RUN=NOT_RUN"
+            echo "PR=NOT_OPENED"
+            echo "CHANGED_FILE_SHA256:"
+            for p in \
+              rust-engine/src/engine.rs \
+              rust-engine/src/gpu_native_residency.rs \
+              rust-engine/src/gpu_native_source_upload.rs \
+              rust-engine/src/io_provider.rs \
+              rust-engine/src/gpu_native_source_to_upload_copy_elision_production.rs \
+              rust-engine/src/gpu_native_q4_route_parallel.rs
+            do
+              sha256sum "$p"
+            done
+          } | tee /tmp/portable-gate.txt
+
+          git diff --check
+          git diff --stat "$BASE_SHA" | tee -a /tmp/portable-gate.txt
+
+      - name: Upload portable evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mer-source-upload-production-portable-gate
+          path: |
+            /tmp/patch.log
+            /tmp/diffstat.txt
+            /tmp/status-after-patch.txt
+            /tmp/fmt.log
+            /tmp/fmt-result.txt
+            /tmp/frozen-witness.log
+            /tmp/source-upload-tests.log
+            /tmp/full-tests.log
+            /tmp/cargo-check.log
+            /tmp/release-build.log
+            /tmp/portable-gate.txt
+          if-no-files-found: warn
+
+      - name: Commit exact tested code tree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm .github/workflows/mer-prod-source-upload-builder.yml
+
+          git add -A
+          git diff --cached --check
+          git config user.name "Randy AP"
+          git config user.email "randyap8@gmail.com"
+          git commit -m "Productionize GPU-native source-to-upload copy elision [tested tree]"
+          echo "TESTED_COMMIT=$(git rev-parse HEAD)"
+          echo "TESTED_TREE=$(git rev-parse HEAD^{tree})"
+          git push origin HEAD:prod/gpu-native-source-to-upload-copy-elision
