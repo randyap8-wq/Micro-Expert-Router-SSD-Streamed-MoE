@@ -52,6 +52,8 @@ pub(crate) struct Metrics {
     pub(crate) direct_source_reads: u64,
     pub(crate) direct_source_bytes: u64,
     pub(crate) direct_payload_bytes: u64,
+    pub(crate) fd_proof_cache_hits: u64,
+    pub(crate) fd_proof_cache_misses: u64,
     pub(crate) source_failures: u64,
     pub(crate) source_fallback_reads: u64,
     pub(crate) fused_source_us: u64,
@@ -465,11 +467,21 @@ impl State {
             .zip(&offsets)
             .map(|(v, &o)| &mut v[o..o + FULL])
             .collect::<Vec<_>>();
+        let (proof_hits_before, proof_misses_before) = storage.source_upload_fd_proof_snapshot();
         let started = Instant::now();
         let result = storage
             .read_experts_batch_into_aligned_slices(ids, &mut destinations)
             .await;
         self.add(|m| &mut m.fused_source_us, elapsed(started));
+        let (proof_hits_after, proof_misses_after) = storage.source_upload_fd_proof_snapshot();
+        self.add(
+            |m| &mut m.fd_proof_cache_hits,
+            proof_hits_after.saturating_sub(proof_hits_before),
+        );
+        self.add(
+            |m| &mut m.fd_proof_cache_misses,
+            proof_misses_after.saturating_sub(proof_misses_before),
+        );
         drop(destinations);
         let bytes = result.map_err(|e| {
             self.add(|m| &mut m.source_failures, 1);

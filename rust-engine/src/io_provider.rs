@@ -48,7 +48,7 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
@@ -434,6 +434,13 @@ pub struct NvmeStorage {
     /// always safe. Guarded by a [`Mutex`] (not an `RwLock`) because
     /// `LruCache::get` mutates recency order.
     files: Mutex<LruCache<u32, Arc<File>>>,
+    /// Source/upload-only proof cache. Each proof belongs to one exact
+    /// opened `Arc<File>` object, never merely an expert id or raw fd number.
+    /// An fd-cache eviction/reopen makes the Weak identity stale and forces
+    /// the replacement file to prove O_DIRECT + full-file length again.
+    source_upload_fd_proofs: Mutex<HashMap<u32, Weak<File>>>,
+    source_upload_fd_proof_hits: AtomicU64,
+    source_upload_fd_proof_misses: AtomicU64,
     /// Optional multi-drive layout. When non-empty, expert `id` lives at
     /// `extra_paths[id as usize % extra_paths.len()] / expert_<id>.bin`
     /// (with `cfg.base_path` *included* as `extra_paths[0]`). When
@@ -488,6 +495,9 @@ impl NvmeStorage {
                 NonZeroUsize::new(default_fd_cache_cap())
                     .expect("default_fd_cache_cap() is clamped to >= 64"),
             )),
+            source_upload_fd_proofs: Mutex::new(HashMap::new()),
+            source_upload_fd_proof_hits: AtomicU64::new(0),
+            source_upload_fd_proof_misses: AtomicU64::new(0),
             striped_paths: Vec::new(),
             manifest: None,
             breakers: RwLock::new(HashMap::new()),
@@ -760,6 +770,63 @@ impl NvmeStorage {
         // any read already in progress against it.
         guard.put(id, f.clone());
         Ok(f)
+    }
+
+    /// Resolve the exact cached file used by source/upload and prove its
+    /// direct-I/O contract once per opened `Arc<File>` object. A Weak proof
+    /// cannot survive fd-cache eviction/reopen, and `Arc::ptr_eq` prevents
+    /// raw-fd-number reuse from aliasing a stale proof.
+    fn source_upload_fd_for(&self, id: u32) -> io::Result<Arc<File>> {
+        let file = self.fd_for(id)?;
+        let cached = self
+            .source_upload_fd_proofs
+            .lock()
+            .get(&id)
+            .and_then(Weak::upgrade)
+            .is_some_and(|proven| Arc::ptr_eq(&proven, &file));
+        if cached {
+            self.source_upload_fd_proof_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(file);
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `file` is the live Arc<File> handed to the read/retry
+            // scheduler below; F_GETFL has no third argument.
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if flags & libc::O_DIRECT == 0 || file.metadata()?.len() != self.cfg.expert_size as u64
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "source/upload source fd must be O_DIRECT and exactly one full expert",
+                ));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "source/upload direct source requires Linux O_DIRECT",
+            ));
+        }
+
+        self.source_upload_fd_proofs
+            .lock()
+            .insert(id, Arc::downgrade(&file));
+        self.source_upload_fd_proof_misses
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(file)
+    }
+
+    pub(crate) fn source_upload_fd_proof_snapshot(&self) -> (u64, u64) {
+        (
+            self.source_upload_fd_proof_hits.load(Ordering::Relaxed),
+            self.source_upload_fd_proof_misses.load(Ordering::Relaxed),
+        )
     }
 
     /// Per-expert circuit-breaker state (gist Task 3). Lazily
@@ -1380,35 +1447,7 @@ impl NvmeStorage {
         }
         let mut files: Vec<Arc<File>> = Vec::with_capacity(ids.len());
         for &id in ids {
-            files.push(self.fd_for(id)?);
-        }
-        // Prove O_DIRECT on the actual Arc<File> passed to the retry helper;
-        // cache churn cannot substitute a different fd after this check.
-        for file in &files {
-            #[cfg(target_os = "linux")]
-            {
-                // SAFETY: files owns this live fd; F_GETFL has no third argument.
-                let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-                if flags < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if flags & libc::O_DIRECT == 0
-                    || file.metadata()?.len() != self.cfg.expert_size as u64
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "source/upload source fd must be O_DIRECT and exactly one full expert",
-                    ));
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = file;
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "source/upload direct source requires Linux O_DIRECT",
-                ));
-            }
+            files.push(self.source_upload_fd_for(id)?);
         }
         let id_vec: Vec<u32> = ids.to_vec();
         tokio::task::block_in_place(|| -> io::Result<usize> {
@@ -3511,19 +3550,63 @@ mod source_to_upload_tests {
             .split("/// **Tier 2.**")
             .next()
             .unwrap();
-        for body in [production, treatment] {
+        for (body, resolver) in [
+            (production, "files.push(self.fd_for(id)?)"),
+            (treatment, "files.push(self.source_upload_fd_for(id)?)"),
+        ] {
             assert_eq!(body.matches("tokio::task::block_in_place(").count(), 1);
             assert_eq!(body.matches("std::thread::scope(").count(), 1);
             assert!(body.contains("scope.spawn("));
             assert!(body.contains("read_at_with_retries("));
             assert!(
-                body.find("files.push(self.fd_for(id)?)").unwrap()
-                    < body.find("tokio::task::block_in_place(").unwrap()
+                body.find(resolver).unwrap() < body.find("tokio::task::block_in_place(").unwrap()
             );
             assert!(body.contains(".zip(id_vec.iter())"));
             assert!(body.contains("h.join()"));
         }
+        assert!(!production.contains("source_upload_fd_for"));
+        assert!(!treatment.contains("libc::F_GETFL"));
+        assert!(!treatment.contains("file.metadata()?.len()"));
         assert!(!treatment.contains("read_expert("));
         assert!(!treatment.contains("spawn_blocking"));
+    }
+}
+
+#[cfg(test)]
+mod hma1a_source_upload_fd_proof_tests {
+    #[test]
+    fn source_upload_fd_proof_is_object_identity_cached_and_hot_read_has_no_reproof_syscalls() {
+        let source = include_str!("io_provider.rs");
+        let helper = source
+            .split("fn source_upload_fd_for")
+            .nth(1)
+            .expect("source-upload fd proof helper")
+            .split("/// Per-expert circuit-breaker state")
+            .next()
+            .unwrap();
+        assert!(helper.contains("Weak::upgrade"));
+        assert!(helper.contains("Arc::ptr_eq"));
+        assert!(helper.contains("libc::F_GETFL"));
+        assert!(helper.contains("file.metadata()?.len()"));
+
+        let hot = source
+            .split("pub(crate) async fn read_experts_batch_into_aligned_slices")
+            .nth(1)
+            .expect("source-upload batch reader")
+            .split("/// **Tier 2.** Packed-blob sibling")
+            .next()
+            .unwrap();
+        assert!(hot.contains("self.source_upload_fd_for(id)?"));
+        assert!(!hot.contains("libc::F_GETFL"));
+        assert!(!hot.contains("file.metadata()?.len()"));
+
+        let control = source
+            .split("pub async fn read_experts_batch(")
+            .nth(1)
+            .expect("ordinary batch reader")
+            .split("/// Source/upload external destinations")
+            .next()
+            .unwrap();
+        assert!(!control.contains("source_upload_fd_for"));
     }
 }

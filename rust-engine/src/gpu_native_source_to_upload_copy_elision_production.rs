@@ -3,7 +3,7 @@
 use super::*;
 use crate::engine::GpuNativePhysicalInstallConcurrencyQualificationSnapshot as Snapshot;
 
-pub(crate) const SCHEMA: &str = "mer.gpu-native-source-to-upload-copy-elision-production.v2";
+pub(crate) const SCHEMA: &str = "mer.gpu-native-source-to-upload-copy-elision-production.v3";
 pub(crate) const MODE: &str = "qualify-gpu-native-source-to-upload-copy-elision-production";
 const LOGICAL_EXPERT_BYTES: u64 = 2_654_208;
 const SLOT_STRIDE_BYTES: u64 = 2_654_212;
@@ -23,6 +23,7 @@ struct PairMechanismGate {
     control_copy_accounting_exact: bool,
     treatment_fused_and_fallback_bytes_exact: bool,
     treatment_every_nvme_read_fused: bool,
+    source_upload_fd_proof_cache_exact: bool,
     ring_and_submission_accounting_exact: bool,
     production_upload_ownership_exact: bool,
     failures_and_accounting_errors_zero: bool,
@@ -113,6 +114,8 @@ fn ring_exact(c: &UploadSnapshot, t: &UploadSnapshot) -> bool {
         c.fused_install_sets,
         c.fallback_installs,
         c.fallback_payload_copy_bytes,
+        c.fd_proof_cache_hits,
+        c.fd_proof_cache_misses,
     ]
     .iter()
     .all(|v| *v == 0)
@@ -237,6 +240,10 @@ fn pair_mechanism_gate(
         && tm.direct_source_reads.checked_mul(FULL as u64) == Some(tm.direct_source_bytes)
         && tm.direct_source_reads.checked_mul(PAYLOAD as u64) == Some(tm.direct_payload_bytes)
         && tm.odirect_observations == tm.direct_source_reads;
+    let source_upload_fd_proof_cache_exact = cm.fd_proof_cache_hits == 0
+        && cm.fd_proof_cache_misses == 0
+        && tm.fd_proof_cache_hits.checked_add(tm.fd_proof_cache_misses)
+            == Some(tm.direct_source_reads);
     let ring_and_submission_accounting_exact = ring_exact(cu, tu);
     let production_upload_ownership_exact = !cu.production_owned && tu.production_owned;
     let failures_and_accounting_errors_zero = upload_errors_zero(cu)
@@ -253,6 +260,7 @@ fn pair_mechanism_gate(
         && control_copy_accounting_exact
         && treatment_fused_and_fallback_bytes_exact
         && treatment_every_nvme_read_fused
+        && source_upload_fd_proof_cache_exact
         && ring_and_submission_accounting_exact
         && production_upload_ownership_exact
         && failures_and_accounting_errors_zero
@@ -265,6 +273,7 @@ fn pair_mechanism_gate(
         control_copy_accounting_exact,
         treatment_fused_and_fallback_bytes_exact,
         treatment_every_nvme_read_fused,
+        source_upload_fd_proof_cache_exact,
         ring_and_submission_accounting_exact,
         production_upload_ownership_exact,
         failures_and_accounting_errors_zero,
@@ -787,6 +796,7 @@ mod tests {
             m.leases_released = 2;
             m.odirect_observations = 2;
             m.direct_source_reads = 2;
+            m.fd_proof_cache_misses = 2;
             m.direct_source_bytes = 2 * FULL as u64;
             m.direct_payload_bytes = 2 * PAYLOAD as u64;
             m.fused_install_sets = 1;
@@ -820,6 +830,7 @@ mod tests {
             |s| s.metrics.fused_installs += 1,
             |s| s.metrics.fallback_installs += 1,
             |s| s.metrics.direct_source_reads += 1,
+            |s| s.metrics.fd_proof_cache_hits += 1,
             |s| s.metrics.direct_source_bytes += 1,
             |s| s.metrics.source_fallback_reads = 1,
             |s| s.metrics.odirect_observations -= 1,
@@ -954,7 +965,7 @@ mod tests {
         assert!(crate::Cli::try_parse_from(invalid).is_err());
         assert_eq!(
             SCHEMA,
-            "mer.gpu-native-source-to-upload-copy-elision-production.v2"
+            "mer.gpu-native-source-to-upload-copy-elision-production.v3"
         );
         assert_eq!(
             (
