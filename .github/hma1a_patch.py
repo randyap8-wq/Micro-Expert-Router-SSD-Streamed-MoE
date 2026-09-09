@@ -86,8 +86,7 @@ helper = r'''    /// Resolve the exact cached file used by source/upload and pro
             if flags < 0 {
                 return Err(io::Error::last_os_error());
             }
-            if flags & libc::O_DIRECT == 0
-                || file.metadata()?.len() != self.cfg.expert_size as u64
+            if flags & libc::O_DIRECT == 0 || file.metadata()?.len() != self.cfg.expert_size as u64
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -173,7 +172,6 @@ s = s[:loop_start] + replacement + s[id_vec:]
 if "mod hma1a_source_upload_fd_proof_tests" in s:
     raise SystemExit("HMA-1A structural test already present")
 s += r'''
-
 #[cfg(test)]
 mod hma1a_source_upload_fd_proof_tests {
     #[test]
@@ -236,15 +234,13 @@ u = replace_once(
             .read_experts_batch_into_aligned_slices(ids, &mut destinations)
             .await;
         self.add(|m| &mut m.fused_source_us, elapsed(started));""",
-    """        let (proof_hits_before, proof_misses_before) =
-            storage.source_upload_fd_proof_snapshot();
+    """        let (proof_hits_before, proof_misses_before) = storage.source_upload_fd_proof_snapshot();
         let started = Instant::now();
         let result = storage
             .read_experts_batch_into_aligned_slices(ids, &mut destinations)
             .await;
         self.add(|m| &mut m.fused_source_us, elapsed(started));
-        let (proof_hits_after, proof_misses_after) =
-            storage.source_upload_fd_proof_snapshot();
+        let (proof_hits_after, proof_misses_after) = storage.source_upload_fd_proof_snapshot();
         self.add(
             |m| &mut m.fd_proof_cache_hits,
             proof_hits_after.saturating_sub(proof_hits_before),
@@ -296,9 +292,7 @@ q = replace_once(
     let production_upload_ownership_exact = !cu.production_owned && tu.production_owned;""",
     """    let source_upload_fd_proof_cache_exact = cm.fd_proof_cache_hits == 0
         && cm.fd_proof_cache_misses == 0
-        && tm
-            .fd_proof_cache_hits
-            .checked_add(tm.fd_proof_cache_misses)
+        && tm.fd_proof_cache_hits.checked_add(tm.fd_proof_cache_misses)
             == Some(tm.direct_source_reads);
     let ring_and_submission_accounting_exact = ring_exact(cu, tu);
     let production_upload_ownership_exact = !cu.production_owned && tu.production_owned;""",

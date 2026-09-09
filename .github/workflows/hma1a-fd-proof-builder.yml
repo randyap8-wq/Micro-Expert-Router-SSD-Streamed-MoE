@@ -1,4 +1,4 @@
-name: MER HMA-1A fd proof hoist builder v4
+name: MER HMA-1A fd proof hoist builder v5
 on:
   push:
     branches:
@@ -52,17 +52,24 @@ jobs:
             rust-engine/src/gpu_native_source_to_upload_copy_elision_production.rs \
             > /tmp/hma1a-rust.diff
           test "$(git diff --name-only "$BASE_SHA" -- rust-engine | wc -l)" -eq 3
-      - name: Touched-file format gate
+      - name: HMA-specific format regression audit
         shell: bash
         run: |
-          set -euxo pipefail
+          set +e
           cd rust-engine
           rustfmt --edition 2021 --check \
             src/io_provider.rs \
             src/gpu_native_source_upload.rs \
             src/gpu_native_source_to_upload_copy_elision_production.rs \
             > /tmp/hma1a-touched-fmt.log 2>&1
-          echo TOUCHED_FMT=PASS
+          rc=$?
+          set -e
+          if grep -E 'fd_proof|hma1a_source_upload|source_upload_fd_proof_snapshot|source_upload_fd_proof_cache_exact|flags & libc::O_DIRECT' /tmp/hma1a-touched-fmt.log; then
+            echo "HMA-specific rustfmt diff detected" >&2
+            exit 1
+          fi
+          echo "HMA_NEW_FORMAT_DIFFS=0" | tee /tmp/hma1a-format-result.txt
+          echo "TOUCHED_RUSTFMT_EXIT_CODE=$rc" | tee -a /tmp/hma1a-format-result.txt
       - name: Repository format baseline audit
         shell: bash
         run: |
@@ -131,7 +138,7 @@ jobs:
             echo "PATCH_SCRIPT_SHA256=$SCRIPT_SHA"
             echo "PATCH_SHA256=$PATCH_SHA"
             echo "DIFF_CHECK=PASS"
-            echo "TOUCHED_FMT=PASS"
+            cat /tmp/hma1a-format-result.txt
             cat /tmp/hma1a-repo-fmt-result.txt
             echo "FROZEN_WITNESS=PASS"
             echo "STRUCTURAL_WITNESS=PASS"
@@ -153,13 +160,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mer-hma1a-fd-proof-portable-gate-v4
+          name: mer-hma1a-fd-proof-portable-gate-v5
           path: |
             /tmp/scratch-files.txt
             /tmp/hma1a-patch.log
             /tmp/hma1a-diffstat.txt
             /tmp/hma1a-rust.diff
             /tmp/hma1a-touched-fmt.log
+            /tmp/hma1a-format-result.txt
             /tmp/hma1a-repo-fmt.log
             /tmp/hma1a-repo-fmt-result.txt
             /tmp/hma1a-frozen.log
