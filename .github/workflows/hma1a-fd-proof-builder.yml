@@ -1,4 +1,4 @@
-name: MER HMA-1A fd proof hoist builder v5
+name: MER HMA-1A fd proof hoist builder v6
 on:
   push:
     branches:
@@ -13,6 +13,7 @@ jobs:
       BASE_SHA: 9ed3794dd7ef1fe01cc443ba5c19a491c9beabc1
       CLEAN_BRANCH: opt/hma1a-fd-proof-hoist-tested
       PATCH_SCRIPT: .github/hma1a_patch.py
+      TEST_FIX_SCRIPT: .github/hma1a_test_contract_fix.py
     steps:
       - uses: actions/checkout@v4
         with:
@@ -26,24 +27,28 @@ jobs:
           git diff --name-only "$BASE_SHA" HEAD | sort > /tmp/scratch-files.txt
           printf '%s\n' \
             .github/hma1a_patch.py \
+            .github/hma1a_test_contract_fix.py \
             .github/workflows/hma1a-fd-proof-builder.yml \
             | sort > /tmp/expected-scratch-files.txt
           cmp /tmp/expected-scratch-files.txt /tmp/scratch-files.txt
           test -f "$PATCH_SCRIPT"
+          test -f "$TEST_FIX_SCRIPT"
           if git ls-remote --exit-code --heads origin "$CLEAN_BRANCH" >/dev/null 2>&1; then
             echo "clean candidate branch already exists: $CLEAN_BRANCH" >&2
             exit 1
           fi
           echo "PATCH_SCRIPT_SHA256=$(sha256sum "$PATCH_SCRIPT" | awk '{print $1}')"
+          echo "TEST_FIX_SCRIPT_SHA256=$(sha256sum "$TEST_FIX_SCRIPT" | awk '{print $1}')"
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.96.0
           components: rustfmt
-      - name: Apply exact HMA-1A patch
+      - name: Apply exact HMA-1A patch and test contract
         shell: bash
         run: |
           set -euxo pipefail
           python3 "$PATCH_SCRIPT" 2>&1 | tee /tmp/hma1a-patch.log
+          python3 "$TEST_FIX_SCRIPT" 2>&1 | tee /tmp/hma1a-test-fix.log
           git diff --check
           git diff --stat "$BASE_SHA" -- rust-engine | tee /tmp/hma1a-diffstat.txt
           git diff "$BASE_SHA" -- \
@@ -64,7 +69,7 @@ jobs:
             > /tmp/hma1a-touched-fmt.log 2>&1
           rc=$?
           set -e
-          if grep -E 'fd_proof|hma1a_source_upload|source_upload_fd_proof_snapshot|source_upload_fd_proof_cache_exact|flags & libc::O_DIRECT' /tmp/hma1a-touched-fmt.log; then
+          if grep -E 'fd_proof|hma1a_source_upload|source_upload_fd_proof_snapshot|source_upload_fd_proof_cache_exact|flags & libc::O_DIRECT|source_upload_fd_for\(id\)' /tmp/hma1a-touched-fmt.log; then
             echo "HMA-specific rustfmt diff detected" >&2
             exit 1
           fi
@@ -131,11 +136,14 @@ jobs:
           git diff --binary "$BASE_SHA" -- rust-engine > /tmp/hma1a-tested.patch
           PATCH_SHA="$(sha256sum /tmp/hma1a-tested.patch | awk '{print $1}')"
           SCRIPT_SHA="$(sha256sum "$PATCH_SCRIPT" | awk '{print $1}')"
+          TEST_FIX_SHA="$(sha256sum "$TEST_FIX_SCRIPT" | awk '{print $1}')"
           {
             echo "BASE_SHA=$BASE_SHA"
             echo "SCRATCH_HEAD=$(git rev-parse HEAD)"
             echo "PATCH_SCRIPT_GIT_BLOB=$(git rev-parse HEAD:$PATCH_SCRIPT)"
             echo "PATCH_SCRIPT_SHA256=$SCRIPT_SHA"
+            echo "TEST_FIX_SCRIPT_GIT_BLOB=$(git rev-parse HEAD:$TEST_FIX_SCRIPT)"
+            echo "TEST_FIX_SCRIPT_SHA256=$TEST_FIX_SHA"
             echo "PATCH_SHA256=$PATCH_SHA"
             echo "DIFF_CHECK=PASS"
             cat /tmp/hma1a-format-result.txt
@@ -160,10 +168,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mer-hma1a-fd-proof-portable-gate-v5
+          name: mer-hma1a-fd-proof-portable-gate-v6
           path: |
             /tmp/scratch-files.txt
             /tmp/hma1a-patch.log
+            /tmp/hma1a-test-fix.log
             /tmp/hma1a-diffstat.txt
             /tmp/hma1a-rust.diff
             /tmp/hma1a-touched-fmt.log
