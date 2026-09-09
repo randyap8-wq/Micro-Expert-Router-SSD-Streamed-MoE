@@ -1,4 +1,4 @@
-name: MER source-upload productionization builder v9
+name: MER source-upload productionization builder v10
 on:
   push:
     branches: [prod/gpu-native-source-to-upload-copy-elision]
@@ -10,7 +10,7 @@ jobs:
     timeout-minutes: 120
     env:
       BASE_SHA: 0bb8b421f276321f2c543035f9c8c47b013fd022
-      SCRATCH_PARENT_SHA: e7c288102cf196da8e821727da3118f864b88dd7
+      SCRATCH_PARENT_SHA: 0e4484585b6fd06c936f1d9f8bc00cac5a187dab
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +19,7 @@ jobs:
         run: |
           set -euxo pipefail
           test "$(git rev-parse HEAD^)" = "$SCRATCH_PARENT_SHA"
-          test "$(git rev-parse HEAD^^^^)" = "$BASE_SHA"
+          test "$(git rev-parse HEAD^^^^^)" = "$BASE_SHA"
           test "$(git rev-parse "$BASE_SHA^{tree}")" = "7cd18476ac34585b21ef745e2650f5e6eb4f040a"
       - name: Install frozen Rust
         uses: dtolnay/rust-toolchain@stable
@@ -102,22 +102,22 @@ jobs:
           set -euxo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib
+          import hashlib,re
           engine=Path('rust-engine/src/engine.rs')
           residency=Path('rust-engine/src/gpu_native_residency.rs')
           q4=Path('rust-engine/src/gpu_native_q4_route_parallel.rs')
           engine_sha=hashlib.sha256(engine.read_bytes()).hexdigest()
           residency_sha=hashlib.sha256(residency.read_bytes()).hexdigest()
-          expected_engine='b32a12eefed862f617612ff697d1072081110594b94264960fa7d79d823a8a3e'
-          expected_residency='662feee8293175a06a26ee3a400fdff23ce245513d1ebaa44a51b3cc9f601cbe'
-          if engine_sha != expected_engine: raise SystemExit(f'unexpected engine production SHA: {engine_sha}')
-          if residency_sha != expected_residency: raise SystemExit(f'unexpected residency production SHA: {residency_sha}')
+          if engine_sha!='b32a12eefed862f617612ff697d1072081110594b94264960fa7d79d823a8a3e': raise SystemExit(f'unexpected engine production SHA: {engine_sha}')
+          if residency_sha!='662feee8293175a06a26ee3a400fdff23ce245513d1ebaa44a51b3cc9f601cbe': raise SystemExit(f'unexpected residency production SHA: {residency_sha}')
           s=q4.read_text()
-          old_engine='df78f271e19ff9528e8a8a670e24044e530e867481688e80bc5b3e04c94656cc'
-          old_residency='de408213f4ae97fa5651d5e240c3cf6fb1d16f812b289ad5bf1ac0047fa1b2c8'
-          if s.count(old_engine)!=1: raise SystemExit(f'engine witness matches={s.count(old_engine)}')
-          if s.count(old_residency)!=1: raise SystemExit(f'residency witness matches={s.count(old_residency)}')
-          s=s.replace(old_engine,engine_sha,1).replace(old_residency,residency_sha,1)
+          def refresh(source, filename, digest):
+              pat=rf'(include_str!\(\"{re.escape(filename)}\"\),\s*\n\s*\")[0-9a-f]{{64}}(\")'
+              out,n=re.subn(pat,rf'\g<1>{digest}\g<2>',source,count=1)
+              if n!=1: raise SystemExit(f'{filename} structural witness matches={n}')
+              return out
+          s=refresh(s,'engine.rs',engine_sha)
+          s=refresh(s,'gpu_native_residency.rs',residency_sha)
           q4.write_text(s)
           print('PRODUCTION_WITNESS_REFRESH=PASS')
           print('ENGINE_SHA256='+engine_sha)
@@ -171,7 +171,7 @@ jobs:
         run: |
           set -euxo pipefail
           {
-            echo "BUILDER9_HEAD=$(git rev-parse HEAD)"
+            echo "BUILDER10_HEAD=$(git rev-parse HEAD)"
             echo "BASE_SHA=$BASE_SHA"
             echo "BASE_TREE=$(git rev-parse "$BASE_SHA^{tree}")"
             echo "PATCH_SCRIPT_SHA256=$(sha256sum /tmp/prod_patch.py | awk '{print $1}')"
@@ -195,7 +195,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mer-source-upload-production-portable-gate-v9
+          name: mer-source-upload-production-portable-gate-v10
           path: |
             /tmp/patch.log
             /tmp/diffstat.txt
