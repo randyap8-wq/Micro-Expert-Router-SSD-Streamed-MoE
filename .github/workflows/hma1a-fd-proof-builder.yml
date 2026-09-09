@@ -1,0 +1,152 @@
+name: MER HMA-1A fd proof hoist builder v3
+on:
+  push:
+    branches:
+      - scratch/hma1a-fd-proof-hoist-builder
+permissions:
+  contents: write
+jobs:
+  build-test-clean-child:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      BASE_SHA: 9ed3794dd7ef1fe01cc443ba5c19a491c9beabc1
+      CLEAN_BRANCH: opt/hma1a-fd-proof-hoist-tested
+      PATCH_SCRIPT_SHA256: 837b933a03ce683ad0309576548ef110aa09dcf2f5d491206a86bcfb6cf89b01
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify exact clean scratch ancestry
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          test -z "$(git diff --name-only "$BASE_SHA" HEAD -- rust-engine)"
+          git diff --name-only "$BASE_SHA" HEAD | sort > /tmp/scratch-files.txt
+          printf '%s\n' .github/workflows/hma1a-fd-proof-builder.yml > /tmp/expected-scratch-files.txt
+          cmp /tmp/expected-scratch-files.txt /tmp/scratch-files.txt
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+          components: rustfmt
+      - name: Decode and apply exact HMA-1A patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import base64, gzip, hashlib
+          encoded = "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"
+          raw = gzip.decompress(base64.b64decode(encoded))
+          sha = hashlib.sha256(raw).hexdigest()
+          if sha != "837b933a03ce683ad0309576548ef110aa09dcf2f5d491206a86bcfb6cf89b01":
+              raise SystemExit(f"patch script sha mismatch: {sha}")
+          open("/tmp/hma1a_patch.py", "wb").write(raw)
+          print("PATCH_SCRIPT_SHA256=" + sha)
+          PY
+          python3 /tmp/hma1a_patch.py
+          git diff --check
+          git diff --stat "$BASE_SHA" -- rust-engine | tee /tmp/hma1a-diffstat.txt
+          git diff "$BASE_SHA" -- rust-engine/src/io_provider.rs rust-engine/src/gpu_native_source_upload.rs rust-engine/src/gpu_native_source_to_upload_copy_elision_production.rs > /tmp/hma1a-rust.diff
+      - name: Format audit
+        shell: bash
+        run: |
+          set +e
+          cd rust-engine
+          cargo fmt --check > /tmp/hma1a-fmt.log 2>&1
+          echo "FMT_EXIT_CODE=$?" | tee /tmp/hma1a-fmt-result.txt
+          exit 0
+      - name: HMA-1A structural witness
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd rust-engine
+          RUST_MIN_STACK=8388608 cargo test --features tokenizer source_upload_fd_proof_is_object_identity_cached_and_hot_read_has_no_reproof_syscalls -- --nocapture 2>&1 | tee /tmp/hma1a-witness.log
+      - name: Source-upload focused tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd rust-engine
+          RUST_MIN_STACK=8388608 cargo test --features tokenizer source_upload -- --nocapture 2>&1 | tee /tmp/hma1a-focused.log
+      - name: Full tokenizer suite
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd rust-engine
+          RUST_MIN_STACK=8388608 cargo test --features tokenizer 2>&1 | tee /tmp/hma1a-full.log
+      - name: Cargo check tests tokenizer
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd rust-engine
+          RUST_MIN_STACK=8388608 cargo check --tests --features tokenizer 2>&1 | tee /tmp/hma1a-check.log
+      - name: Canonical release build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd rust-engine
+          unset RUST_MIN_STACK RAYON_NUM_THREADS MER_PIN_CORES
+          cargo build --release --features tokenizer 2>&1 | tee /tmp/hma1a-release.log
+      - name: Freeze tested patch and evidence
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          git diff --binary "$BASE_SHA" -- rust-engine > /tmp/hma1a-tested.patch
+          PATCH_SHA="$(sha256sum /tmp/hma1a-tested.patch | awk '{print $1}')"
+          {
+            echo "BASE_SHA=$BASE_SHA"
+            echo "SCRATCH_HEAD=$(git rev-parse HEAD)"
+            echo "PATCH_SCRIPT_SHA256=$PATCH_SCRIPT_SHA256"
+            echo "PATCH_SHA256=$PATCH_SHA"
+            echo "DIFF_CHECK=PASS"
+            cat /tmp/hma1a-fmt-result.txt
+            echo "STRUCTURAL_WITNESS=PASS"
+            echo "SOURCE_UPLOAD_FOCUSED=PASS"
+            echo "FULL_TOKENIZER_SUITE=PASS"
+            echo "CARGO_CHECK=PASS"
+            echo "CANONICAL_RELEASE_BUILD=PASS"
+            echo "QUALIFIER_SCHEMA=mer.gpu-native-source-to-upload-copy-elision-production.v3"
+            echo "L4_RUN=NOT_RUN"
+            echo "PR=NOT_OPENED"
+            echo "TOUCHED_FILE_SHA256:"
+            sha256sum rust-engine/src/io_provider.rs rust-engine/src/gpu_native_source_upload.rs rust-engine/src/gpu_native_source_to_upload_copy_elision_production.rs
+            git diff --stat "$BASE_SHA" -- rust-engine
+          } | tee /tmp/hma1a-portable-gate.txt
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mer-hma1a-fd-proof-portable-gate-v3
+          path: |
+            /tmp/scratch-files.txt
+            /tmp/hma1a-diffstat.txt
+            /tmp/hma1a-rust.diff
+            /tmp/hma1a-fmt.log
+            /tmp/hma1a-fmt-result.txt
+            /tmp/hma1a-witness.log
+            /tmp/hma1a-focused.log
+            /tmp/hma1a-full.log
+            /tmp/hma1a-check.log
+            /tmp/hma1a-release.log
+            /tmp/hma1a-tested.patch
+            /tmp/hma1a-portable-gate.txt
+          if-no-files-found: warn
+      - name: Create exact clean tested child
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PATCH_SHA="$(sha256sum /tmp/hma1a-tested.patch | awk '{print $1}')"
+          git checkout -B "$CLEAN_BRANCH" "$BASE_SHA"
+          git apply /tmp/hma1a-tested.patch
+          git diff --check
+          git add rust-engine
+          git diff --cached --check
+          git config user.name "Randy AP"
+          git config user.email "randyap8@gmail.com"
+          git commit -m "Hoist source-upload fd proof out of fused hot path [HMA-1A tested]"
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          echo "CLEAN_HEAD=$(git rev-parse HEAD)"
+          echo "CLEAN_TREE=$(git rev-parse HEAD^{tree})"
+          echo "PATCH_SHA256=$PATCH_SHA"
+          git push origin "HEAD:refs/heads/$CLEAN_BRANCH"
