@@ -1,26 +1,33 @@
-name: MER source-upload productionization builder v10
+name: MER source-upload productionization builder v11
 on:
   push:
     branches: [prod/gpu-native-source-to-upload-copy-elision]
 permissions:
   contents: write
 jobs:
-  build-test-commit:
+  build-test-clean-candidate:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
       BASE_SHA: 0bb8b421f276321f2c543035f9c8c47b013fd022
-      SCRATCH_PARENT_SHA: 0e4484585b6fd06c936f1d9f8bc00cac5a187dab
+      BASE_TREE: 7cd18476ac34585b21ef745e2650f5e6eb4f040a
+      FINAL_BRANCH: prod/gpu-native-source-to-upload-copy-elision-tested
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v4
-        with: {fetch-depth: 0}
-      - name: Verify ancestry
+        with:
+          fetch-depth: 0
+      - name: Verify immutable ancestry
+        shell: bash
         run: |
           set -euxo pipefail
-          test "$(git rev-parse HEAD^)" = "$SCRATCH_PARENT_SHA"
-          test "$(git rev-parse HEAD^^^^^)" = "$BASE_SHA"
-          test "$(git rev-parse "$BASE_SHA^{tree}")" = "7cd18476ac34585b21ef745e2650f5e6eb4f040a"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          test "$(git rev-parse "$BASE_SHA^{tree}")" = "$BASE_TREE"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/prod/gpu-native-source-to-upload-copy-elision)"
+          if git ls-remote --exit-code --heads origin "refs/heads/$FINAL_BRANCH" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing clean candidate branch $FINAL_BRANCH" >&2
+            exit 1
+          fi
       - name: Install frozen Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -31,103 +38,160 @@ jobs:
         run: |
           set -euxo pipefail
           python3 - <<'PY'
-          import base64,gzip,hashlib,re
+          import base64, gzip, hashlib, re
           from pathlib import Path
-          src=Path('.github/workflows/mer-prod-source-upload-builder.yml').read_text()
-          m=re.search(r"encoded = '''([A-Za-z0-9+/=]+)'''",src)
-          if not m: raise SystemExit('embedded patch missing')
-          raw=gzip.decompress(base64.b64decode(m.group(1)))
-          sha=hashlib.sha256(raw).hexdigest()
-          if sha!='8a283cf6185f163d1492eebe0204fdc57da8e7c095e38bdf7edccd5bddf64071': raise SystemExit(sha)
-          t=raw.decode()
-          fixes=[
-            (r'(\n\s*)2,(\n\s*"engine source set sequential calls",)',r'\g<1>1,\g<2>','source'),
-            (r'(\n\s*)4,(\n\s*"engine production sequential fallbacks",)',r'\g<1>3,\g<2>','fallback'),
-            (r'(\n\s*)2,(\n\s*"residency parallel install source parameter",)',r'\g<1>3,\g<2>','residency'),
+
+          src = Path('.github/workflows/mer-prod-source-upload-builder.yml').read_text()
+          match = re.search(r"encoded = '''([A-Za-z0-9+/=]+)'''", src)
+          if not match:
+              raise SystemExit('embedded production patch missing')
+          raw = gzip.decompress(base64.b64decode(match.group(1)))
+          original_sha = hashlib.sha256(raw).hexdigest()
+          expected = '8a283cf6185f163d1492eebe0204fdc57da8e7c095e38bdf7edccd5bddf64071'
+          if original_sha != expected:
+              raise SystemExit(f'embedded patch SHA mismatch: {original_sha}')
+
+          text = raw.decode()
+          fixes = [
+              (r'(\n\s*)2,(\n\s*"engine source set sequential calls",)', r'\g<1>1,\g<2>', 'source'),
+              (r'(\n\s*)4,(\n\s*"engine production sequential fallbacks",)', r'\g<1>3,\g<2>', 'fallback'),
+              (r'(\n\s*)2,(\n\s*"residency parallel install source parameter",)', r'\g<1>3,\g<2>', 'residency'),
           ]
-          for pat,repl,name in fixes:
-            t,n=re.subn(pat,repl,t,count=1)
-            if n!=1: raise SystemExit(f'{name} normalization={n}')
-          label='"engine production batch fusion decision"'
-          lp=t.find(label); cp=t.rfind('replace_once(',0,lp)
-          if lp<0 or cp<0: raise SystemExit('batch decision call missing')
-          t=t[:cp]+'replace_first('+t[cp+len('replace_once('):]
-          t='''def replace_first(s, old, new, label):\n    count=s.count(old)\n    if count < 1:\n        raise SystemExit(f"{label}: expected at least one match, found {count}")\n    return s.replace(old,new,1)\n\n'''+t
-          Path('/tmp/prod_patch.py').write_text(t)
-          print('ORIGINAL_PATCH_SHA256='+sha)
-          print('NORMALIZED_PATCH_SHA256='+hashlib.sha256(t.encode()).hexdigest())
+          for pattern, replacement, name in fixes:
+              text, count = re.subn(pattern, replacement, text, count=1)
+              if count != 1:
+                  raise SystemExit(f'{name} normalization count={count}')
+
+          label = '"engine production batch fusion decision"'
+          label_pos = text.find(label)
+          call_pos = text.rfind('replace_once(', 0, label_pos)
+          if label_pos < 0 or call_pos < 0:
+              raise SystemExit('production batch fusion decision transform missing')
+          text = text[:call_pos] + 'replace_first(' + text[call_pos + len('replace_once('):]
+          text = '''def replace_first(s, old, new, label):\n    count = s.count(old)\n    if count < 1:\n        raise SystemExit(f"{label}: expected at least one match, found {count}")\n    return s.replace(old, new, 1)\n\n''' + text
+          Path('/tmp/prod_patch.py').write_text(text)
+          print('ORIGINAL_PATCH_SHA256=' + original_sha)
+          print('NORMALIZED_PATCH_SHA256=' + hashlib.sha256(text.encode()).hexdigest())
           PY
-      - name: Apply production patch and compile fixes
+      - name: Apply productionization and explicit plumbing fixes
         shell: bash
         run: |
           set -euxo pipefail
           python3 /tmp/prod_patch.py 2>&1 | tee /tmp/patch.log
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib,re
-          engine=Path('rust-engine/src/engine.rs')
-          s=engine.read_text()
-          old='''            Self::AlreadyInstalled => {\n                f.write_str("GPU-native tiered residency manager is already installed")\n            }'''
-          new='''            Self::SourceUploadInitializationFailed => f.write_str(\n                "GPU-native source-upload production state initialization failed",\n            ),\n            Self::AlreadyInstalled => {\n                f.write_str("GPU-native tiered residency manager is already installed")\n            }'''
-          if s.count(old)!=1: raise SystemExit(f'display insertion matches={s.count(old)}')
-          s=s.replace(old,new,1)
-          move_count=s.count('let upload = source_upload;')
-          if move_count < 1: raise SystemExit('no source_upload move sites')
-          s=s.replace('let upload = source_upload;','let upload = source_upload.clone();')
-          seq='.gpu_native_sequential_source_physical_missing_set(global_ids, residents)'
-          seq_count=s.count(seq)
-          if seq_count < 2: raise SystemExit(f'sequential propagation matches={seq_count}')
-          s=s.replace(seq,'.gpu_native_sequential_source_physical_missing_set(\n                            global_ids,\n                            residents,\n                            source_upload.clone(),\n                        )')
-          s,n1=re.subn(r'(\.gpu_native_demand_source\([^,\n]+,\s*&mut\s+[A-Za-z_][A-Za-z0-9_]*)(\))',r'\1, None\2',s)
-          s,n2=re.subn(r'(\.gpu_native_source_physical_missing_set\([^\n]*&mut\s+[A-Za-z_][A-Za-z0-9_]*)(\))',r'\1, None\2',s)
-          if n1 < 5: raise SystemExit(f'demand-source legacy call fixes too few={n1}')
-          if n2 < 3: raise SystemExit(f'source-set legacy call fixes too few={n2}')
-          engine.write_text(s)
-          residency=Path('rust-engine/src/gpu_native_residency.rs')
-          r=residency.read_text()
-          pat=r'(let residency = self\.install_locked::<OBSERVE>\([\s\S]*?\n\s*observer),\n\s*production_source_upload,\n(\s*\)\?;)'
-          r,n3=re.subn(pat,r'\1,\n\2',r,count=1)
-          if n3!=1: raise SystemExit(f'sequential install extra upload removal={n3}')
+          import hashlib, re
+
+          engine = Path('rust-engine/src/engine.rs')
+          source = engine.read_text()
+
+          old = '''            Self::AlreadyInstalled => {\n                f.write_str("GPU-native tiered residency manager is already installed")\n            }'''
+          new = '''            Self::SourceUploadInitializationFailed => f.write_str(\n                "GPU-native source-upload production state initialization failed",\n            ),\n            Self::AlreadyInstalled => {\n                f.write_str("GPU-native tiered residency manager is already installed")\n            }'''
+          if source.count(old) != 1:
+              raise SystemExit(f'install error display insertion matches={source.count(old)}')
+          source = source.replace(old, new, 1)
+
+          move_count = source.count('let upload = source_upload;')
+          if move_count < 1:
+              raise SystemExit('no source_upload move sites')
+          source = source.replace('let upload = source_upload;', 'let upload = source_upload.clone();')
+
+          sequential = '.gpu_native_sequential_source_physical_missing_set(global_ids, residents)'
+          sequential_count = source.count(sequential)
+          if sequential_count < 2:
+              raise SystemExit(f'sequential propagation matches={sequential_count}')
+          source = source.replace(
+              sequential,
+              '.gpu_native_sequential_source_physical_missing_set(\n                            global_ids,\n                            residents,\n                            source_upload.clone(),\n                        )',
+          )
+
+          source, demand_fixes = re.subn(
+              r'(\.gpu_native_demand_source\([^,\n]+,\s*&mut\s+[A-Za-z_][A-Za-z0-9_]*)(\))',
+              r'\1, None\2',
+              source,
+          )
+          source, source_set_fixes = re.subn(
+              r'(\.gpu_native_source_physical_missing_set\([^\n]*&mut\s+[A-Za-z_][A-Za-z0-9_]*)(\))',
+              r'\1, None\2',
+              source,
+          )
+          if demand_fixes < 5:
+              raise SystemExit(f'legacy demand-source call fixes too few={demand_fixes}')
+          if source_set_fixes < 3:
+              raise SystemExit(f'legacy source-set call fixes too few={source_set_fixes}')
+
+          # These two tests intentionally install an explicit source-upload state.
+          # Preserve that exact state through the new explicit parameter rather
+          # than weakening the tests to None during the signature migration.
+          for old_call, new_call, label in [
+              (
+                  '.gpu_native_source_physical_missing_set(&[0], &mut residents, None)',
+                  '.gpu_native_source_physical_missing_set(&[0], &mut residents, Some(upload.clone()))',
+                  'RAM-hit source-upload test',
+              ),
+              (
+                  '.gpu_native_source_physical_missing_set(&[2, 0], &mut residents, None)',
+                  '.gpu_native_source_physical_missing_set(&[2, 0], &mut residents, Some(upload.clone()))',
+                  'Control source-order test',
+              ),
+          ]:
+              count = source.count(old_call)
+              if count != 1:
+                  raise SystemExit(f'{label} explicit plumbing matches={count}')
+              source = source.replace(old_call, new_call, 1)
+
+          engine.write_text(source)
+
+          residency = Path('rust-engine/src/gpu_native_residency.rs')
+          r = residency.read_text()
+          pattern = r'(let residency = self\.install_locked::<OBSERVE>\([\s\S]*?\n\s*observer),\n\s*production_source_upload,\n(\s*\)\?;)'
+          r, residency_fix = re.subn(pattern, r'\1,\n\2', r, count=1)
+          if residency_fix != 1:
+              raise SystemExit(f'sequential install extra upload removal={residency_fix}')
           residency.write_text(r)
-          print('COMPILE_FIX_RESULT=PASS')
+
+          print('COMPILE_AND_TEST_PLUMBING_FIX=PASS')
           print(f'SOURCE_UPLOAD_MOVES_CLONED={move_count}')
-          print(f'LEGACY_DEMAND_CALLS_FIXED={n1}')
-          print(f'LEGACY_SOURCE_SET_CALLS_FIXED={n2}')
-          print('ENGINE_SHA256='+hashlib.sha256(engine.read_bytes()).hexdigest())
-          print('RESIDENCY_SHA256='+hashlib.sha256(residency.read_bytes()).hexdigest())
+          print(f'LEGACY_DEMAND_CALLS_FIXED={demand_fixes}')
+          print(f'LEGACY_SOURCE_SET_CALLS_FIXED={source_set_fixes}')
+          print('ENGINE_PRE_WITNESS_SHA256=' + hashlib.sha256(engine.read_bytes()).hexdigest())
+          print('RESIDENCY_PRE_WITNESS_SHA256=' + hashlib.sha256(residency.read_bytes()).hexdigest())
           PY
-      - name: Refresh intentional production frozen witness
+      - name: Refresh only intentional frozen source witnesses
         shell: bash
         run: |
           set -euxo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib,re
-          engine=Path('rust-engine/src/engine.rs')
-          residency=Path('rust-engine/src/gpu_native_residency.rs')
-          q4=Path('rust-engine/src/gpu_native_q4_route_parallel.rs')
-          engine_sha=hashlib.sha256(engine.read_bytes()).hexdigest()
-          residency_sha=hashlib.sha256(residency.read_bytes()).hexdigest()
-          if engine_sha!='b32a12eefed862f617612ff697d1072081110594b94264960fa7d79d823a8a3e': raise SystemExit(f'unexpected engine production SHA: {engine_sha}')
-          if residency_sha!='662feee8293175a06a26ee3a400fdff23ce245513d1ebaa44a51b3cc9f601cbe': raise SystemExit(f'unexpected residency production SHA: {residency_sha}')
-          s=q4.read_text()
+          import hashlib, re
+
+          engine = Path('rust-engine/src/engine.rs')
+          residency = Path('rust-engine/src/gpu_native_residency.rs')
+          witness = Path('rust-engine/src/gpu_native_q4_route_parallel.rs')
+          engine_sha = hashlib.sha256(engine.read_bytes()).hexdigest()
+          residency_sha = hashlib.sha256(residency.read_bytes()).hexdigest()
+          text = witness.read_text()
+
           def refresh(source, filename, digest):
-              pat=rf'(include_str!\(\"{re.escape(filename)}\"\),\s*\n\s*\")[0-9a-f]{{64}}(\")'
-              out,n=re.subn(pat,rf'\g<1>{digest}\g<2>',source,count=1)
-              if n!=1: raise SystemExit(f'{filename} structural witness matches={n}')
+              pattern = rf'(include_str!\("{re.escape(filename)}"\),\s*\n\s*")[0-9a-f]{{64}}(")'
+              out, count = re.subn(pattern, rf'\g<1>{digest}\g<2>', source, count=1)
+              if count != 1:
+                  raise SystemExit(f'{filename} structural witness matches={count}')
               return out
-          s=refresh(s,'engine.rs',engine_sha)
-          s=refresh(s,'gpu_native_residency.rs',residency_sha)
-          q4.write_text(s)
+
+          text = refresh(text, 'engine.rs', engine_sha)
+          text = refresh(text, 'gpu_native_residency.rs', residency_sha)
+          witness.write_text(text)
           print('PRODUCTION_WITNESS_REFRESH=PASS')
-          print('ENGINE_SHA256='+engine_sha)
-          print('RESIDENCY_SHA256='+residency_sha)
-          print('Q4_WITNESS_FILE_SHA256='+hashlib.sha256(q4.read_bytes()).hexdigest())
+          print('ENGINE_SHA256=' + engine_sha)
+          print('RESIDENCY_SHA256=' + residency_sha)
+          print('Q4_WITNESS_FILE_SHA256=' + hashlib.sha256(witness.read_bytes()).hexdigest())
           PY
           git diff --check
           git diff --stat "$BASE_SHA" | tee /tmp/diffstat.txt
           git status --short | tee /tmp/status.txt
-          git diff "$BASE_SHA" -- rust-engine/src/engine.rs rust-engine/src/gpu_native_residency.rs rust-engine/src/gpu_native_source_upload.rs rust-engine/src/gpu_native_q4_route_parallel.rs | tee /tmp/rust.diff
+          git diff "$BASE_SHA" -- rust-engine > /tmp/rust.diff
+          sha256sum /tmp/rust.diff | tee /tmp/rust-diff.sha256
       - name: Format audit
         shell: bash
         run: |
@@ -167,14 +231,16 @@ jobs:
           cd rust-engine
           unset RUST_MIN_STACK
           cargo build --release --features tokenizer 2>&1 | tee /tmp/release.log
-      - name: Evidence
+      - name: Portable evidence
+        shell: bash
         run: |
           set -euxo pipefail
           {
-            echo "BUILDER10_HEAD=$(git rev-parse HEAD)"
+            echo "BUILDER11_HEAD=$(git rev-parse HEAD)"
             echo "BASE_SHA=$BASE_SHA"
             echo "BASE_TREE=$(git rev-parse "$BASE_SHA^{tree}")"
             echo "PATCH_SCRIPT_SHA256=$(sha256sum /tmp/prod_patch.py | awk '{print $1}')"
+            echo "RUST_DIFF_SHA256=$(sha256sum /tmp/rust.diff | awk '{print $1}')"
             echo "RUSTC=$(rustc --version)"
             echo "CARGO=$(cargo --version)"
             echo "DIFF_CHECK=PASS"
@@ -186,21 +252,47 @@ jobs:
             echo "CANONICAL_RELEASE_BUILD=PASS"
             echo "L4_RUN=NOT_RUN"
             echo "PR=NOT_OPENED"
-            echo CHANGED_FILE_SHA256:
-            for p in rust-engine/src/engine.rs rust-engine/src/gpu_native_residency.rs rust-engine/src/gpu_native_source_upload.rs rust-engine/src/io_provider.rs rust-engine/src/gpu_native_source_to_upload_copy_elision_production.rs rust-engine/src/gpu_native_q4_route_parallel.rs; do sha256sum "$p"; done
-            git diff --stat "$BASE_SHA"
+            echo "CHANGED_RUST_FILE_SHA256:"
+            git diff --name-only "$BASE_SHA" -- rust-engine | while read -r path; do sha256sum "$path"; done
+            git diff --stat "$BASE_SHA" -- rust-engine
           } | tee /tmp/portable-gate.txt
           git diff --check
-      - name: Upload evidence
+      - name: Create clean exact tested candidate from qualified parent
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff "$BASE_SHA" -- rust-engine > /tmp/tested-rust.patch
+          test -s /tmp/tested-rust.patch
+          sha256sum /tmp/tested-rust.patch | tee /tmp/tested-rust-patch.sha256
+          git reset --hard HEAD
+          git checkout --detach "$BASE_SHA"
+          git apply --index /tmp/tested-rust.patch
+          git diff --cached --check
+          test -z "$(git status --porcelain | grep '^??' || true)"
+          git config user.name "Randy AP"
+          git config user.email "randyap8@gmail.com"
+          git commit -m "Productionize GPU-native source-to-upload copy elision"
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          {
+            echo "FINAL_BRANCH=$FINAL_BRANCH"
+            echo "TESTED_COMMIT=$(git rev-parse HEAD)"
+            echo "TESTED_PARENT=$(git rev-parse HEAD^)"
+            echo "TESTED_TREE=$(git rev-parse HEAD^{tree})"
+            echo "TESTED_PATCH_SHA256=$(sha256sum /tmp/tested-rust.patch | awk '{print $1}')"
+            git show --stat --oneline --decorate HEAD
+          } | tee /tmp/final-candidate.txt
+          git push origin "HEAD:refs/heads/$FINAL_BRANCH"
+      - name: Upload complete portable evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mer-source-upload-production-portable-gate-v10
+          name: mer-source-upload-production-portable-gate-v11
           path: |
             /tmp/patch.log
             /tmp/diffstat.txt
             /tmp/status.txt
             /tmp/rust.diff
+            /tmp/rust-diff.sha256
             /tmp/fmt.log
             /tmp/fmt-result.txt
             /tmp/frozen.log
@@ -209,16 +301,7 @@ jobs:
             /tmp/check.log
             /tmp/release.log
             /tmp/portable-gate.txt
+            /tmp/tested-rust.patch
+            /tmp/tested-rust-patch.sha256
+            /tmp/final-candidate.txt
           if-no-files-found: warn
-      - name: Commit exact tested code tree
-        run: |
-          set -euxo pipefail
-          rm .github/workflows/mer-prod-source-upload-builder.yml .github/workflows/mer-prod-source-upload-builder7.yml
-          git add -A
-          git diff --cached --check
-          git config user.name "Randy AP"
-          git config user.email "randyap8@gmail.com"
-          git commit -m "Productionize GPU-native source-to-upload copy elision [tested tree]"
-          echo "TESTED_COMMIT=$(git rev-parse HEAD)"
-          echo "TESTED_TREE=$(git rev-parse HEAD^{tree})"
-          git push origin HEAD:prod/gpu-native-source-to-upload-copy-elision
