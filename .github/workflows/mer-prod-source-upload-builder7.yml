@@ -1,4 +1,4 @@
-name: MER source-upload productionization builder v7
+name: MER source-upload productionization builder v8
 on:
   push:
     branches: [prod/gpu-native-source-to-upload-copy-elision]
@@ -10,7 +10,7 @@ jobs:
     timeout-minutes: 120
     env:
       BASE_SHA: 0bb8b421f276321f2c543035f9c8c47b013fd022
-      BUILDER1_SHA: 9c457029b6d7e58bb4613cfcaba01663f30cdf15
+      SCRATCH_PARENT_SHA: e61836558be88dcb881c5ce0040e2c510d7e8184
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v4
@@ -18,8 +18,8 @@ jobs:
       - name: Verify ancestry
         run: |
           set -euxo pipefail
-          test "$(git rev-parse HEAD^)" = "$BUILDER1_SHA"
-          test "$(git rev-parse HEAD^^)" = "$BASE_SHA"
+          test "$(git rev-parse HEAD^)" = "$SCRATCH_PARENT_SHA"
+          test "$(git rev-parse HEAD^^^)" = "$BASE_SHA"
           test "$(git rev-parse "$BASE_SHA^{tree}")" = "7cd18476ac34585b21ef745e2650f5e6eb4f040a"
       - name: Install frozen Rust
         uses: dtolnay/rust-toolchain@stable
@@ -96,9 +96,38 @@ jobs:
           print('ENGINE_SHA256='+hashlib.sha256(engine.read_bytes()).hexdigest())
           print('RESIDENCY_SHA256='+hashlib.sha256(residency.read_bytes()).hexdigest())
           PY
+      - name: Refresh intentional production frozen witness
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          engine=Path('rust-engine/src/engine.rs')
+          residency=Path('rust-engine/src/gpu_native_residency.rs')
+          q4=Path('rust-engine/src/gpu_native_q4_route_parallel.rs')
+          engine_sha=hashlib.sha256(engine.read_bytes()).hexdigest()
+          residency_sha=hashlib.sha256(residency.read_bytes()).hexdigest()
+          expected_engine='b32a618c1d5fd284e326e1ec8a2d55a059d5f471fd1d05e4544c77bca2ed0fce'
+          expected_residency='d3b6e66934889a90c11d653fc8781157a9fb84ab3ba9db7be60d38b862549aa7'
+          if engine_sha != expected_engine: raise SystemExit(f'unexpected engine production SHA: {engine_sha}')
+          if residency_sha != expected_residency: raise SystemExit(f'unexpected residency production SHA: {residency_sha}')
+          s=q4.read_text()
+          old_engine='df78f271e19ff9528e8a8a670e24044e530e867481688e80bc5b3e04c94656cc'
+          old_residency='de408213f4ae97fa5651d5e240c3cf6fb1d16f812b289ad5bf1ac0047fa1b2c8'
+          if s.count(old_engine)!=1: raise SystemExit(f'engine witness matches={s.count(old_engine)}')
+          if s.count(old_residency)!=1: raise SystemExit(f'residency witness matches={s.count(old_residency)}')
+          s=s.replace(old_engine,engine_sha,1).replace(old_residency,residency_sha,1)
+          q4.write_text(s)
+          print('PRODUCTION_WITNESS_REFRESH=PASS')
+          print('ENGINE_SHA256='+engine_sha)
+          print('RESIDENCY_SHA256='+residency_sha)
+          print('Q4_WITNESS_FILE_SHA256='+hashlib.sha256(q4.read_bytes()).hexdigest())
+          PY
           git diff --check
           git diff --stat "$BASE_SHA" | tee /tmp/diffstat.txt
           git status --short | tee /tmp/status.txt
+          git diff "$BASE_SHA" -- rust-engine/src/engine.rs rust-engine/src/gpu_native_residency.rs rust-engine/src/gpu_native_source_upload.rs rust-engine/src/gpu_native_q4_route_parallel.rs | tee /tmp/rust.diff
       - name: Format audit
         shell: bash
         run: |
@@ -142,7 +171,7 @@ jobs:
         run: |
           set -euxo pipefail
           {
-            echo "BUILDER7_HEAD=$(git rev-parse HEAD)"
+            echo "BUILDER8_HEAD=$(git rev-parse HEAD)"
             echo "BASE_SHA=$BASE_SHA"
             echo "BASE_TREE=$(git rev-parse "$BASE_SHA^{tree}")"
             echo "PATCH_SCRIPT_SHA256=$(sha256sum /tmp/prod_patch.py | awk '{print $1}')"
@@ -166,11 +195,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mer-source-upload-production-portable-gate-v7
+          name: mer-source-upload-production-portable-gate-v8
           path: |
             /tmp/patch.log
             /tmp/diffstat.txt
             /tmp/status.txt
+            /tmp/rust.diff
             /tmp/fmt.log
             /tmp/fmt-result.txt
             /tmp/frozen.log
