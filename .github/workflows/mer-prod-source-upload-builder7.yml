@@ -1,4 +1,4 @@
-name: MER source-upload productionization builder v8
+name: MER source-upload productionization builder v9
 on:
   push:
     branches: [prod/gpu-native-source-to-upload-copy-elision]
@@ -10,7 +10,7 @@ jobs:
     timeout-minutes: 120
     env:
       BASE_SHA: 0bb8b421f276321f2c543035f9c8c47b013fd022
-      SCRATCH_PARENT_SHA: e61836558be88dcb881c5ce0040e2c510d7e8184
+      SCRATCH_PARENT_SHA: e7c288102cf196da8e821727da3118f864b88dd7
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +19,7 @@ jobs:
         run: |
           set -euxo pipefail
           test "$(git rev-parse HEAD^)" = "$SCRATCH_PARENT_SHA"
-          test "$(git rev-parse HEAD^^^)" = "$BASE_SHA"
+          test "$(git rev-parse HEAD^^^^)" = "$BASE_SHA"
           test "$(git rev-parse "$BASE_SHA^{tree}")" = "7cd18476ac34585b21ef745e2650f5e6eb4f040a"
       - name: Install frozen Rust
         uses: dtolnay/rust-toolchain@stable
@@ -108,8 +108,8 @@ jobs:
           q4=Path('rust-engine/src/gpu_native_q4_route_parallel.rs')
           engine_sha=hashlib.sha256(engine.read_bytes()).hexdigest()
           residency_sha=hashlib.sha256(residency.read_bytes()).hexdigest()
-          expected_engine='b32a618c1d5fd284e326e1ec8a2d55a059d5f471fd1d05e4544c77bca2ed0fce'
-          expected_residency='d3b6e66934889a90c11d653fc8781157a9fb84ab3ba9db7be60d38b862549aa7'
+          expected_engine='b32a12eefed862f617612ff697d1072081110594b94264960fa7d79d823a8a3e'
+          expected_residency='662feee8293175a06a26ee3a400fdff23ce245513d1ebaa44a51b3cc9f601cbe'
           if engine_sha != expected_engine: raise SystemExit(f'unexpected engine production SHA: {engine_sha}')
           if residency_sha != expected_residency: raise SystemExit(f'unexpected residency production SHA: {residency_sha}')
           s=q4.read_text()
@@ -171,7 +171,7 @@ jobs:
         run: |
           set -euxo pipefail
           {
-            echo "BUILDER8_HEAD=$(git rev-parse HEAD)"
+            echo "BUILDER9_HEAD=$(git rev-parse HEAD)"
             echo "BASE_SHA=$BASE_SHA"
             echo "BASE_TREE=$(git rev-parse "$BASE_SHA^{tree}")"
             echo "PATCH_SCRIPT_SHA256=$(sha256sum /tmp/prod_patch.py | awk '{print $1}')"
@@ -195,7 +195,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mer-source-upload-production-portable-gate-v8
+          name: mer-source-upload-production-portable-gate-v9
           path: |
             /tmp/patch.log
             /tmp/diffstat.txt
