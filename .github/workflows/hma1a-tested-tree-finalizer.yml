@@ -1,0 +1,113 @@
+name: MER HMA-1A tested-tree finalizer
+on:
+  push:
+    branches:
+      - scratch/hma1a-fd-proof-finalizer
+permissions:
+  contents: write
+jobs:
+  publish-exact-tested-tree:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      BASE_SHA: 9ed3794dd7ef1fe01cc443ba5c19a491c9beabc1
+      BASE_TREE: df7ef590442baf6b0b9683671fa345569b59634b
+      CLEAN_BRANCH: opt/hma1a-fd-proof-hoist-tested
+      PATCH_SCRIPT: .github/hma1a_patch.py
+      TEST_FIX_SCRIPT: .github/hma1a_test_contract_fix.py
+      EXPECTED_PATCH_SCRIPT_BLOB: c767b61db9908e6ce596b3ad4d1340b2ed13d8e3
+      EXPECTED_PATCH_SCRIPT_SHA256: 289d16f91d883de8e47bf26782e42637665dc6939698064ebe975af18f16fc49
+      EXPECTED_TEST_FIX_BLOB: 8af9dcf480a5c166f1720ce284892e2ab65bc426
+      EXPECTED_TEST_FIX_SHA256: df42ab3b436805aa623f4d78a72a45849096166c32183ae1097cf5d6e6d43047
+      EXPECTED_PATCH_SHA256: d5a315f4a94db237984fdf1014d56e1e8e8ef20755a39df9904dedd75db1dad4
+      EXPECTED_IO_SHA256: 9a1bd0b2c19b3f484db55811f77c5d7535ed53154c88012d57eabcb7a1accd80
+      EXPECTED_UPLOAD_SHA256: 84af6e224b74cbe03db2a2d4e3cabb75752545be455a53200c806153312e1314
+      EXPECTED_QUALIFIER_SHA256: bf5e62a41d364cceb2bf48c64ba01599627174a0de764fdbf7a6ebc19c81d36e
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify finalizer provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          test "$(git rev-parse "$BASE_SHA^{tree}")" = "$BASE_TREE"
+          test -z "$(git diff --name-only "$BASE_SHA" HEAD -- rust-engine)"
+          test "$(git rev-parse HEAD:$PATCH_SCRIPT)" = "$EXPECTED_PATCH_SCRIPT_BLOB"
+          test "$(git rev-parse HEAD:$TEST_FIX_SCRIPT)" = "$EXPECTED_TEST_FIX_BLOB"
+          test "$(sha256sum "$PATCH_SCRIPT" | awk '{print $1}')" = "$EXPECTED_PATCH_SCRIPT_SHA256"
+          test "$(sha256sum "$TEST_FIX_SCRIPT" | awk '{print $1}')" = "$EXPECTED_TEST_FIX_SHA256"
+          if git ls-remote --exit-code --heads origin "$CLEAN_BRANCH" >/dev/null 2>&1; then
+            echo "clean branch already exists; refusing publication replay" >&2
+            exit 1
+          fi
+      - name: Reconstruct exact v6 tested Rust tree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 "$PATCH_SCRIPT" | tee /tmp/finalizer-patch.log
+          python3 "$TEST_FIX_SCRIPT" | tee /tmp/finalizer-test-fix.log
+          git diff --check
+          git diff --name-only "$BASE_SHA" -- rust-engine | sort > /tmp/actual-files.txt
+          cat > /tmp/expected-files.txt <<'EOF'
+          rust-engine/src/gpu_native_source_to_upload_copy_elision_production.rs
+          rust-engine/src/gpu_native_source_upload.rs
+          rust-engine/src/io_provider.rs
+          EOF
+          sed -i 's/^          //' /tmp/expected-files.txt
+          sort -o /tmp/expected-files.txt /tmp/expected-files.txt
+          cmp /tmp/expected-files.txt /tmp/actual-files.txt
+          git diff --binary "$BASE_SHA" -- rust-engine > /tmp/hma1a-tested.patch
+          PATCH_SHA="$(sha256sum /tmp/hma1a-tested.patch | awk '{print $1}')"
+          test "$PATCH_SHA" = "$EXPECTED_PATCH_SHA256"
+          test "$(sha256sum rust-engine/src/io_provider.rs | awk '{print $1}')" = "$EXPECTED_IO_SHA256"
+          test "$(sha256sum rust-engine/src/gpu_native_source_upload.rs | awk '{print $1}')" = "$EXPECTED_UPLOAD_SHA256"
+          test "$(sha256sum rust-engine/src/gpu_native_source_to_upload_copy_elision_production.rs | awk '{print $1}')" = "$EXPECTED_QUALIFIER_SHA256"
+          {
+            echo "RECONSTRUCTION=PASS"
+            echo "BASE_SHA=$BASE_SHA"
+            echo "BASE_TREE=$BASE_TREE"
+            echo "PATCH_SHA256=$PATCH_SHA"
+            echo "IO_SHA256=$EXPECTED_IO_SHA256"
+            echo "UPLOAD_SHA256=$EXPECTED_UPLOAD_SHA256"
+            echo "QUALIFIER_SHA256=$EXPECTED_QUALIFIER_SHA256"
+            echo "V6_PORTABLE_GATE=PASS_ALREADY_FROZEN"
+            echo "RUST_TESTS_RERUN=NO"
+          } | tee /tmp/finalizer-evidence.txt
+      - name: Publish clean one-commit child in isolated worktree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CLEAN=/tmp/hma1a-clean
+          git worktree add --detach "$CLEAN" "$BASE_SHA"
+          cd "$CLEAN"
+          git apply /tmp/hma1a-tested.patch
+          git diff --check
+          test "$(sha256sum rust-engine/src/io_provider.rs | awk '{print $1}')" = "$EXPECTED_IO_SHA256"
+          test "$(sha256sum rust-engine/src/gpu_native_source_upload.rs | awk '{print $1}')" = "$EXPECTED_UPLOAD_SHA256"
+          test "$(sha256sum rust-engine/src/gpu_native_source_to_upload_copy_elision_production.rs | awk '{print $1}')" = "$EXPECTED_QUALIFIER_SHA256"
+          git add rust-engine
+          git diff --cached --check
+          git config user.name "Randy AP"
+          git config user.email "randyap8@gmail.com"
+          git commit -m "Hoist source-upload fd proof out of fused hot path [HMA-1A tested]"
+          HEAD_SHA="$(git rev-parse HEAD)"
+          TREE_SHA="$(git rev-parse HEAD^{tree})"
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          echo "CLEAN_HEAD=$HEAD_SHA" | tee -a /tmp/finalizer-evidence.txt
+          echo "CLEAN_TREE=$TREE_SHA" | tee -a /tmp/finalizer-evidence.txt
+          git push origin "HEAD:refs/heads/$CLEAN_BRANCH"
+      - name: Upload publication evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mer-hma1a-tested-tree-finalizer
+          path: |
+            /tmp/finalizer-patch.log
+            /tmp/finalizer-test-fix.log
+            /tmp/actual-files.txt
+            /tmp/expected-files.txt
+            /tmp/hma1a-tested.patch
+            /tmp/finalizer-evidence.txt
+          if-no-files-found: warn
