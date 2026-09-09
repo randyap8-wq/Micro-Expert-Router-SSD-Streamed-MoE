@@ -8,7 +8,9 @@ pub(crate) const MODE: &str = "qualify-gpu-native-source-to-upload-copy-elision-
 const LOGICAL_EXPERT_BYTES: u64 = 2_654_208;
 const SLOT_STRIDE_BYTES: u64 = 2_654_212;
 const EPOCH_BYTES: u64 = 4;
-use crate::gpu_native_source_upload::{Arm, Snapshot as UploadSnapshot, CAPACITY, FULL, PAYLOAD};
+use crate::gpu_native_source_upload::{
+    Arm, Snapshot as UploadSnapshot, ARENAS, ARENA_WIDTH, CAPACITY, FULL, PAYLOAD,
+};
 
 const fn qualification_arms() -> (Arm, Arm) {
     (Arm::Control, Arm::Treatment)
@@ -65,6 +67,77 @@ fn source_upload_fd_proof_gate(
         first_use_misses_observed,
         measured_hits_observed,
         passed: warmup_accounting_exact && measured_accounting_exact && first_use_misses_observed,
+    }
+}
+
+/// Additive arena diagnostics. Source, lease and copy counters stay expert-level;
+/// actual mapping operations are reconciled independently at arena granularity.
+#[derive(Clone, Debug, Serialize)]
+struct TwoArenaGate {
+    diagnostic_version: &'static str,
+    warmup_accounting_exact: bool,
+    measured_accounting_exact: bool,
+    fd_proof_exact: bool,
+    passed: bool,
+}
+fn arena_interval_exact(c: &UploadSnapshot, t: &UploadSnapshot) -> bool {
+    let z = &c.metrics;
+    let m = &t.metrics;
+    [z.arena_map_attempts, z.arena_map_completions, z.arena_unmaps,
+     z.arena_remap_attempts, z.arena_remap_completions, z.arena_remap_failures,
+     z.arena_map_wait_us, z.arena_high_water, z.source_sets_mapped,
+     z.source_slots_mapped, z.arena_generation_errors].iter().all(|v| *v == 0)
+        && c.arm == Arm::Control && c.ring_capacity == 0
+        && t.arm == Arm::Treatment && t.production_owned
+        && ring_exact(c, t) && upload_errors_zero(c) && upload_errors_zero(t)
+        && m.arena_map_attempts > 0
+        && m.arena_map_attempts == m.arena_map_completions
+        && m.arena_unmaps == m.arena_map_completions
+        && m.arena_remap_attempts == m.arena_remap_completions
+        && m.arena_remap_completions <= m.arena_map_completions
+        && m.arena_map_completions.checked_sub(m.arena_remap_completions)
+            .is_some_and(|first_maps| first_maps <= ARENAS as u64)
+        && m.arena_remap_failures == 0
+        && m.arena_high_water > 0 && m.arena_high_water <= ARENAS as u64
+        && m.arena_high_water <= m.high_water
+        && m.arena_high_water <= m.arena_map_completions
+        && m.arena_map_attempts == m.map_attempts
+        && m.arena_map_completions == m.map_completions
+        && m.arena_unmaps == m.unmaps
+        && m.arena_remap_attempts == m.remap_attempts
+        && m.arena_remap_completions == m.remap_completions
+        && m.arena_remap_failures == m.remap_failures
+        && m.arena_map_wait_us == m.map_wait_us
+        && m.source_slots_mapped == m.direct_source_reads
+        && m.source_sets_mapped > 0
+        // One source set uses one arena, or two if wider than eight; it still
+        // issues one storage batch. No per-expert mapping or hidden arena fits.
+        && m.arena_map_completions >= m.source_sets_mapped
+        && m.source_sets_mapped.checked_mul(ARENAS as u64)
+            .is_some_and(|max| m.arena_map_completions <= max)
+        && m.arena_map_completions.checked_mul(ARENA_WIDTH as u64)
+            .is_some_and(|max| m.source_slots_mapped <= max)
+        && m.arena_map_completions.checked_sub(m.source_sets_mapped)
+            .and_then(|extra| extra.checked_mul(ARENA_WIDTH as u64))
+            .and_then(|full| full.checked_add(m.source_sets_mapped))
+            .is_some_and(|min| m.source_slots_mapped >= min)
+        && m.arena_generation_errors == 0
+}
+fn two_arena_gate(
+    cw: &UploadSnapshot,
+    tw: &UploadSnapshot,
+    cm: &UploadSnapshot,
+    tm: &UploadSnapshot,
+) -> TwoArenaGate {
+    let warmup_accounting_exact = arena_interval_exact(cw, tw);
+    let measured_accounting_exact = arena_interval_exact(cm, tm);
+    let fd_proof_exact = source_upload_fd_proof_gate(cw, tw, cm, tm).passed;
+    TwoArenaGate {
+        diagnostic_version: "hma1b.two-arena.v1",
+        warmup_accounting_exact,
+        measured_accounting_exact,
+        fd_proof_exact,
+        passed: warmup_accounting_exact && measured_accounting_exact && fd_proof_exact,
     }
 }
 
@@ -136,6 +209,8 @@ fn upload_errors_zero(u: &UploadSnapshot) -> bool {
         && m.alignment_failures == 0
         && m.mapped_direct_io_rejections == 0
         && m.remap_failures == 0
+        && m.arena_remap_failures == 0
+        && m.arena_generation_errors == 0
         && m.copy_failures == 0
         && m.accounting_errors == 0
         && m.leases_dropped_unconsumed == 0
@@ -187,7 +262,7 @@ fn ring_exact(c: &UploadSnapshot, t: &UploadSnapshot) -> bool {
         && m.leases_released == m.leases_created
         && m.leases_consumed == m.fused_installs
         && m.map_attempts == m.map_completions
-        && m.map_completions == m.leases_created
+        && m.map_completions == m.arena_map_completions
         && m.unmaps == m.map_completions
         && m.remap_attempts == m.remap_completions
         && m.remap_completions <= m.map_completions
@@ -343,6 +418,7 @@ impl std::ops::Deref for UploadArmReport {
 
 #[derive(Clone, Debug, Serialize)]
 struct Gates {
+    hma1b_two_arena: TwoArenaGate,
     source_upload_fd_proof: SourceUploadFdProofGate,
     behavioral: BehavioralGate,
     work_equivalence: WorkEquivalenceGate,
@@ -622,7 +698,14 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         c.upload.as_ref().unwrap(),
         t.upload.as_ref().unwrap(),
     );
-    let passed = source_upload_fd_proof.passed
+    let hma1b_two_arena = two_arena_gate(
+        c.warmup_upload.as_ref().unwrap(),
+        t.warmup_upload.as_ref().unwrap(),
+        c.upload.as_ref().unwrap(),
+        t.upload.as_ref().unwrap(),
+    );
+    let passed = hma1b_two_arena.passed
+        && source_upload_fd_proof.passed
         && behavioral.passed
         && work_equivalence.passed
         && warmup_mechanism.passed
@@ -633,6 +716,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         && physical_installs_reconcile_with_residency
         && source_bytes_and_logical_admissions_reconcile;
     let gates = Gates {
+        hma1b_two_arena,
         source_upload_fd_proof,
         behavioral,
         work_equivalence,
@@ -842,9 +926,15 @@ mod tests {
             m.shared_payload_constructions = 2;
             m.acquisition_attempts = 2;
             m.high_water = 2;
-            m.map_attempts = 2;
-            m.map_completions = 2;
-            m.unmaps = 2;
+            m.map_attempts = 1;
+            m.map_completions = 1;
+            m.unmaps = 1;
+            m.arena_map_attempts = 1;
+            m.arena_map_completions = 1;
+            m.arena_unmaps = 1;
+            m.arena_high_water = 1;
+            m.source_sets_mapped = 1;
+            m.source_slots_mapped = 2;
             m.leases_created = 2;
             m.leases_consumed = 2;
             m.leases_released = 2;
@@ -860,6 +950,94 @@ mod tests {
         }
         (s, p, u)
     }
+    fn arena_fixture() -> (UploadSnapshot, UploadSnapshot) {
+        use crate::io_provider::SourceUploadFdProofSnapshot as Proof;
+        let (_, _, mut c) = fixture(Arm::Control);
+        let (_, _, mut t) = fixture(Arm::Treatment);
+        c.source_upload_fd_proof = Some(Proof::default());
+        t.source_upload_fd_proof = Some(Proof {
+            source_upload_fd_proof_requests: 2,
+            source_upload_fd_proof_misses: 2,
+            ..Proof::default()
+        });
+        (c, t)
+    }
+    #[test]
+    fn source_upload_hma1b_gate_accepts_exact_arena_and_expert_accounting() {
+        let (c, mut t) = arena_fixture();
+        assert!(two_arena_gate(&c, &t, &c, &t).passed);
+        assert_ne!(t.metrics.map_completions, t.metrics.leases_created);
+        t.metrics.arena_remap_attempts = 1;
+        t.metrics.arena_remap_completions = 1;
+        t.metrics.remap_attempts = 1;
+        t.metrics.remap_completions = 1;
+        assert!(two_arena_gate(&c, &t, &c, &t).passed);
+        assert_eq!(
+            serde_json::to_value(two_arena_gate(&c, &t, &c, &t)).unwrap()["diagnostic_version"],
+            "hma1b.two-arena.v1"
+        );
+    }
+    #[test]
+    fn source_upload_hma1b_gate_rejects_corrupt_missing_or_control_arena_activity() {
+        let (c, t) = arena_fixture();
+        let mutations: &[fn(&mut crate::gpu_native_source_upload::Metrics)] = &[
+            |m| m.arena_map_attempts = 0,
+            |m| m.arena_map_attempts += 1,
+            |m| m.arena_map_completions = 0,
+            |m| m.arena_map_completions += 1,
+            |m| m.arena_unmaps += 1,
+            |m| m.arena_unmaps = 0,
+            |m| m.arena_remap_attempts += 1,
+            |m| m.arena_remap_completions += 1,
+            |m| m.arena_remap_failures = 1,
+            |m| m.arena_map_wait_us += 1,
+            |m| m.arena_high_water = 0,
+            |m| m.arena_high_water = 2,
+            |m| m.arena_high_water = 3,
+            |m| m.source_sets_mapped = 0,
+            |m| m.source_sets_mapped = 2,
+            |m| m.source_sets_mapped = u64::MAX,
+            |m| m.source_slots_mapped += 1,
+            |m| m.arena_generation_errors = 1,
+            |m| m.accounting_errors = 1,
+            |m| m.leases_released -= 1,
+            |m| m.leases_consumed -= 1,
+            |m| m.copy_submissions += 1,
+        ];
+        for mutate in mutations {
+            let mut bad = t.clone();
+            mutate(&mut bad.metrics);
+            assert!(!two_arena_gate(&c, &bad, &c, &t).passed);
+            assert!(!two_arena_gate(&c, &t, &c, &bad).passed);
+        }
+        let control_mutations: &[fn(&mut crate::gpu_native_source_upload::Metrics)] = &[
+            |m| m.arena_map_attempts = 1,
+            |m| m.arena_map_completions = 1,
+            |m| m.arena_unmaps = 1,
+            |m| m.arena_remap_attempts = 1,
+            |m| m.arena_remap_completions = 1,
+            |m| m.arena_remap_failures = 1,
+            |m| m.arena_map_wait_us = 1,
+            |m| m.arena_high_water = 1,
+            |m| m.source_sets_mapped = 1,
+            |m| m.source_slots_mapped = 1,
+            |m| m.arena_generation_errors = 1,
+        ];
+        for mutate in control_mutations {
+            let mut bad = c.clone();
+            mutate(&mut bad.metrics);
+            assert!(!two_arena_gate(&bad, &t, &c, &t).passed);
+            assert!(!two_arena_gate(&c, &t, &bad, &t).passed);
+        }
+        let mut missing = t.clone();
+        missing.metrics = Default::default();
+        assert!(!two_arena_gate(&c, &missing, &c, &t).passed);
+        let mut fd_failure = t.clone();
+        fd_failure.source_upload_fd_proof = None;
+        assert!(!two_arena_gate(&c, &fd_failure, &c, &t).passed);
+        assert!(!two_arena_gate(&c, &t, &c, &fd_failure).passed);
+    }
+
     #[test]
     fn source_upload_fd_proof_gate_accepts_churn_and_warm_cache_intervals() {
         let (_, _, mut c) = fixture(Arm::Control);

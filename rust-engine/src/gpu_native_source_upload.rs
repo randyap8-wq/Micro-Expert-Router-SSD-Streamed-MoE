@@ -1,5 +1,5 @@
-//! Private real-inference source/upload mechanism. No production constructor
-//! creates this state. Source I/O lives here; physical installation receives only
+//! Bounded real-inference source/upload mechanism. Source I/O lives here;
+//! physical installation receives only
 //! a one-shot, identity-checked unmapped lease, never a storage handle.
 use crate::backend::gpu_native::GpuNativeExecutorContext;
 use crate::buffer_pool::PooledBuffer;
@@ -17,8 +17,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub(crate) const FULL: usize = 2_658_304;
 pub(crate) const PAYLOAD: usize = 2_654_208;
 pub(crate) const ALIGN: usize = 4096;
-pub(crate) const CAPACITY: usize = 16;
-pub(crate) const UPLOAD_BYTES: usize = FULL + ALIGN;
+pub(crate) const ARENAS: usize = 2;
+pub(crate) const ARENA_WIDTH: usize = 8;
+pub(crate) const CAPACITY: usize = ARENAS * ARENA_WIDTH;
+pub(crate) const UPLOAD_BYTES: usize = ARENA_WIDTH * FULL + ALIGN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -42,6 +44,19 @@ pub(crate) struct Metrics {
     pub(crate) remap_completions: u64,
     pub(crate) remap_failures: u64,
     pub(crate) remap_wait_us: u64,
+    // Map counters above still count actual WGPU mapping operations/time.
+    // Lease, acquisition and high_water counters retain expert-level units.
+    pub(crate) arena_map_attempts: u64,
+    pub(crate) arena_map_completions: u64,
+    pub(crate) arena_unmaps: u64,
+    pub(crate) arena_remap_attempts: u64,
+    pub(crate) arena_remap_completions: u64,
+    pub(crate) arena_remap_failures: u64,
+    pub(crate) arena_map_wait_us: u64,
+    pub(crate) arena_high_water: u64,
+    pub(crate) source_sets_mapped: u64,
+    pub(crate) source_slots_mapped: u64,
+    pub(crate) arena_generation_errors: u64,
     pub(crate) alignment_failures: u64,
     pub(crate) leases_created: u64,
     pub(crate) leases_consumed: u64,
@@ -107,40 +122,239 @@ pub(crate) struct Snapshot {
     pub(crate) metrics: Metrics,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SlotState {
+enum ArenaPhase {
     Available,
     Mapping,
     Mapped,
     Ready,
-    Submitted,
+    Poisoned,
 }
-impl SlotState {
-    fn transition(&mut self, expected: Self, next: Self) -> Result<(), String> {
-        if *self != expected {
-            return Err(format!(
-                "upload state mismatch: expected {expected:?}, got {self:?}"
-            ));
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeasePhase {
+    Ready,
+    Encoded,
+    Submitted,
+    Released,
+}
+
+/// A generation owns the entire buffer, including unused slots. A released
+/// prefix never makes it available. An uncertain encoded/submission lifetime
+/// poisons the arena permanently; stale tokens cannot mutate a new generation.
+#[derive(Debug)]
+struct ArenaGeneration {
+    phase: ArenaPhase,
+    generation: u64,
+    width: usize,
+    leases: [LeasePhase; ARENA_WIDTH],
+    ever_mapped: bool,
+}
+impl Default for ArenaGeneration {
+    fn default() -> Self {
+        Self {
+            phase: ArenaPhase::Available,
+            generation: 0,
+            width: 0,
+            leases: [LeasePhase::Released; ARENA_WIDTH],
+            ever_mapped: false,
         }
-        *self = next;
-        Ok(())
     }
 }
-fn reserve_slot<'a>(states: impl Iterator<Item = &'a Mutex<SlotState>>) -> Option<usize> {
-    states.enumerate().find_map(|(i, s)| {
-        s.lock()
-            .transition(SlotState::Available, SlotState::Mapping)
-            .ok()
-            .map(|_| i)
-    })
+fn generation_error(m: &mut Metrics) -> String {
+    m.add(|m| &mut m.arena_generation_errors, 1);
+    m.add(|m| &mut m.accounting_errors, 1);
+    "invalid upload arena generation/lifecycle".into()
 }
-struct Slot {
+impl ArenaGeneration {
+    fn reserve(&mut self, width: usize, m: &mut Metrics) -> Result<u64, String> {
+        if self.phase != ArenaPhase::Available || width == 0 || width > ARENA_WIDTH {
+            return Err(generation_error(m));
+        }
+        let next = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| generation_error(m))?;
+        self.generation = next;
+        self.width = width;
+        self.leases = [LeasePhase::Released; ARENA_WIDTH];
+        self.leases[..width].fill(LeasePhase::Ready);
+        self.phase = ArenaPhase::Mapping;
+        Ok(next)
+    }
+    fn transition(
+        &mut self,
+        generation: u64,
+        expected: ArenaPhase,
+        next: ArenaPhase,
+        m: &mut Metrics,
+    ) -> Result<(), String> {
+        if self.generation != generation || self.phase != expected {
+            return Err(generation_error(m));
+        }
+        self.phase = next;
+        Ok(())
+    }
+    fn lease_is(&self, generation: u64, slot: usize, phase: LeasePhase) -> bool {
+        self.generation == generation
+            && self.phase == ArenaPhase::Ready
+            && slot < self.width
+            && self.leases[slot] == phase
+    }
+    fn lease_transition(
+        &mut self,
+        generation: u64,
+        slot: usize,
+        expected: LeasePhase,
+        next: LeasePhase,
+        m: &mut Metrics,
+    ) -> Result<(), String> {
+        if !self.lease_is(generation, slot, expected) {
+            return Err(generation_error(m));
+        }
+        self.leases[slot] = next;
+        Ok(())
+    }
+    fn release(&mut self, generation: u64, slot: usize, m: &mut Metrics) -> Result<(), String> {
+        if self.generation != generation
+            || self.phase != ArenaPhase::Ready
+            || slot >= self.width
+            || self.leases[slot] == LeasePhase::Released
+        {
+            return Err(generation_error(m));
+        }
+        if self.leases[slot] == LeasePhase::Encoded {
+            // The command may still exist or submission may have unwound.
+            self.phase = ArenaPhase::Poisoned;
+            return Err(generation_error(m));
+        }
+        if self.leases[slot] != LeasePhase::Submitted {
+            m.add(|m| &mut m.leases_dropped_unconsumed, 1);
+        }
+        self.leases[slot] = LeasePhase::Released;
+        m.add(|m| &mut m.leases_released, 1);
+        if self.leases[..self.width]
+            .iter()
+            .all(|p| *p == LeasePhase::Released)
+        {
+            self.phase = ArenaPhase::Available;
+        }
+        Ok(())
+    }
+    fn abort_mapping(&mut self, generation: u64, m: &mut Metrics) -> Result<(), String> {
+        if self.generation != generation
+            || !matches!(self.phase, ArenaPhase::Mapping | ArenaPhase::Mapped)
+        {
+            return Err(generation_error(m));
+        }
+        m.add(|m| &mut m.leases_dropped_unconsumed, self.width as u64);
+        m.add(|m| &mut m.leases_released, self.width as u64);
+        self.leases.fill(LeasePhase::Released);
+        self.phase = ArenaPhase::Available;
+        Ok(())
+    }
+    fn active_leases(&self) -> usize {
+        self.leases[..self.width]
+            .iter()
+            .filter(|p| **p != LeasePhase::Released)
+            .count()
+    }
+}
+fn reserve_arena<'a>(
+    states: impl Iterator<Item = &'a Mutex<ArenaGeneration>>,
+    width: usize,
+    m: &mut Metrics,
+) -> Result<(usize, u64), String> {
+    for (i, state) in states.enumerate() {
+        let mut state = state.lock();
+        if state.phase == ArenaPhase::Available {
+            return state.reserve(width, m).map(|generation| (i, generation));
+        }
+    }
+    Err(generation_error(m))
+}
+struct Arena {
     buffer: wgpu::Buffer,
-    state: Mutex<SlotState>,
-    ever_mapped: Mutex<bool>,
+    state: Mutex<ArenaGeneration>,
 }
 struct Ring {
     executor: Arc<GpuNativeExecutorContext>,
-    slots: Vec<Slot>,
+    arenas: [Arena; ARENAS],
+}
+
+/// Sole mapping owner, declared before every view. Drop therefore cancels only
+/// after all mapped borrows are destroyed, including async cancellation/errors.
+struct ArenaMapping {
+    state: Arc<State>,
+    index: usize,
+    generation: u64,
+    width: usize,
+    mapped: bool,
+    armed: bool,
+}
+impl ArenaMapping {
+    fn arena(&self) -> &Arena {
+        &self.state.ring.as_ref().expect("treatment ring").arenas[self.index]
+    }
+    fn into_leases(mut self, ids: &[u32], aligned_base: usize) -> Result<Vec<Lease>, String> {
+        if ids.len() != self.width {
+            return Err(generation_error(&mut self.state.metrics.lock()));
+        }
+        let offsets = (0..self.width)
+            .map(|slot| slot_offset(aligned_base, slot, UPLOAD_BYTES))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                self.state.add(|m| &mut m.alignment_failures, 1);
+                e
+            })?;
+        let mut generation = self.arena().state.lock();
+        if generation.generation != self.generation || generation.phase != ArenaPhase::Mapped {
+            return Err(generation_error(&mut self.state.metrics.lock()));
+        }
+        self.arena().buffer.unmap();
+        generation.transition(
+            self.generation,
+            ArenaPhase::Mapped,
+            ArenaPhase::Ready,
+            &mut self.state.metrics.lock(),
+        )?;
+        drop(generation);
+        self.mapped = false;
+        self.state.record_unmap();
+        self.armed = false;
+        Ok(ids
+            .iter()
+            .zip(offsets)
+            .enumerate()
+            .map(|(slot, (&id, offset))| Lease {
+                state: self.state.clone(),
+                index: self.index,
+                generation: self.generation,
+                slot,
+                id,
+                offset,
+                payload: None,
+            })
+            .collect())
+    }
+}
+impl Drop for ArenaMapping {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut generation = self.arena().state.lock();
+            if generation.generation != self.generation
+                || !matches!(generation.phase, ArenaPhase::Mapping | ArenaPhase::Mapped)
+            {
+                let _ = generation_error(&mut self.state.metrics.lock());
+                return;
+            }
+            // No logical lease escapes until the successful unmap transition.
+            // Mapping failure still cancels map_async, but is not a successful unmap.
+            self.arena().buffer.unmap();
+            if self.mapped {
+                self.state.record_unmap();
+            }
+            let _ = generation.abort_mapping(self.generation, &mut self.state.metrics.lock());
+        }
+    }
 }
 
 pub(crate) struct State {
@@ -198,19 +412,16 @@ impl State {
         }
         let ring = if arm == Arm::Treatment {
             let gpu = executor.authoritative_gpu().map_err(|e| e.to_string())?;
-            let slots = (0..CAPACITY)
-                .map(|_| Slot {
-                    buffer: gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("source-to-upload bounded slot"),
-                        size: UPLOAD_BYTES as u64,
-                        usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-                        mapped_at_creation: false,
-                    }),
-                    state: Mutex::new(SlotState::Available),
-                    ever_mapped: Mutex::new(false),
-                })
-                .collect();
-            Some(Ring { executor, slots })
+            let arenas = std::array::from_fn(|_| Arena {
+                buffer: gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("source-to-upload bounded eight-slot arena"),
+                    size: UPLOAD_BYTES as u64,
+                    usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+                state: Mutex::new(ArenaGeneration::default()),
+            });
+            Some(Ring { executor, arenas })
         } else {
             None
         };
@@ -297,7 +508,10 @@ impl State {
             source_upload_fd_proof: None,
             arm: self.arm,
             production_owned: self.production_owned,
-            ring_capacity: self.ring.as_ref().map_or(0, |r| r.slots.len()),
+            ring_capacity: self
+                .ring
+                .as_ref()
+                .map_or(0, |r| r.arenas.len() * ARENA_WIDTH),
             active_leases: self.active_leases(),
             pending_leases: self.pending.lock().len(),
             metrics: self.metrics.lock().clone(),
@@ -314,10 +528,10 @@ impl State {
     }
     fn active_leases(&self) -> usize {
         self.ring.as_ref().map_or(0, |r| {
-            r.slots
+            r.arenas
                 .iter()
-                .filter(|s| *s.state.lock() != SlotState::Available)
-                .count()
+                .map(|a| a.state.lock().active_leases())
+                .sum()
         })
     }
     pub(crate) fn reset(&self) -> Result<(), String> {
@@ -352,49 +566,75 @@ impl State {
         self.add(|m| &mut m.logical_admissions, new_ids.len() as u64);
         self.add(|m| &mut m.logical_generation_observations, ids.len() as u64);
     }
-    fn acquire(self: &Arc<Self>, id: u32) -> Result<Lease, String> {
-        self.add(|m| &mut m.acquisition_attempts, 1);
+    fn record_unmap(&self) {
+        let mut m = self.metrics.lock();
+        m.add(|m| &mut m.unmaps, 1);
+        m.add(|m| &mut m.arena_unmaps, 1);
+    }
+    fn acquire(self: &Arc<Self>, width: usize) -> Result<ArenaMapping, String> {
+        self.add(|m| &mut m.acquisition_attempts, width as u64);
         let ring = self
             .ring
             .as_ref()
-            .ok_or("control cannot acquire an upload lease")?;
-        let index = reserve_slot(ring.slots.iter().map(|s| &s.state)).ok_or_else(|| {
-            // The frozen single demand stream cannot release an outstanding
-            // source lease while waiting here. Fail closed instead of deadlock
-            // or creating a seventeenth buffer.
-            self.add(|m| &mut m.accounting_errors, 1);
-            "bounded upload ring exhausted".to_string()
-        })?;
-        self.add(|m| &mut m.leases_created, 1);
-        let active = self.active_leases() as u64;
-        let mut metrics = self.metrics.lock();
-        metrics.high_water = metrics.high_water.max(active);
-        drop(metrics);
-        let lease = Lease {
+            .ok_or("control cannot acquire an upload arena")?;
+        // Never hold the metrics lock while acquiring an arena lock. Merge
+        // reservation errors after releasing the arena lock.
+        let mut reservation_metrics = Metrics::default();
+        let reserved = reserve_arena(
+            ring.arenas.iter().map(|a| &a.state),
+            width,
+            &mut reservation_metrics,
+        );
+        self.add(
+            |m| &mut m.arena_generation_errors,
+            reservation_metrics.arena_generation_errors,
+        );
+        self.add(
+            |m| &mut m.accounting_errors,
+            reservation_metrics.accounting_errors,
+        );
+        let (index, generation) = reserved?;
+        let mut mapping = ArenaMapping {
             state: self.clone(),
             index,
-            id,
-            offset: 0,
-            payload: None,
-            consumed: false,
+            generation,
+            width,
+            mapped: false,
+            armed: true,
         };
-        let slot = &ring.slots[index];
-        let remap = *slot.ever_mapped.lock();
-        self.add(|m| &mut m.map_attempts, 1);
-        if remap {
-            self.add(|m| &mut m.remap_attempts, 1);
+        self.add(|m| &mut m.leases_created, width as u64);
+        let active = self.active_leases() as u64;
+        let arenas = ring
+            .arenas
+            .iter()
+            .filter(|a| a.state.lock().phase != ArenaPhase::Available)
+            .count() as u64;
+        {
+            let mut m = self.metrics.lock();
+            m.high_water = m.high_water.max(active);
+            m.arena_high_water = m.arena_high_water.max(arenas);
         }
-        let start = Instant::now();
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        slot.buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Write, move |r| {
-                let _ = tx.send(r);
-            });
+        let arena = &ring.arenas[index];
+        let remap = arena.state.lock().ever_mapped;
+        // Resolve the GPU before starting a mapping that could be abandoned.
         let gpu = ring
             .executor
             .authoritative_gpu()
             .map_err(|e| e.to_string())?;
+        self.add(|m| &mut m.map_attempts, 1);
+        self.add(|m| &mut m.arena_map_attempts, 1);
+        if remap {
+            self.add(|m| &mut m.remap_attempts, 1);
+            self.add(|m| &mut m.arena_remap_attempts, 1);
+        }
+        let start = Instant::now();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        arena
+            .buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Write, move |r| {
+                let _ = tx.send(r);
+            });
         gpu.device.poll(wgpu::Maintain::Wait);
         let result = rx
             .recv()
@@ -402,25 +642,33 @@ impl State {
             .and_then(|r| r.map_err(|e| e.to_string()));
         let wait_us = elapsed(start);
         self.add(|m| &mut m.map_wait_us, wait_us);
+        self.add(|m| &mut m.arena_map_wait_us, wait_us);
         if remap {
             self.add(|m| &mut m.remap_wait_us, wait_us);
         }
         if let Err(error) = result {
             if remap {
                 self.add(|m| &mut m.remap_failures, 1);
+                self.add(|m| &mut m.arena_remap_failures, 1);
             }
             self.add(|m| &mut m.copy_failures, 1);
             return Err(error);
         }
-        slot.state
-            .lock()
-            .transition(SlotState::Mapping, SlotState::Mapped)?;
+        mapping.mapped = true;
+        arena.state.lock().transition(
+            generation,
+            ArenaPhase::Mapping,
+            ArenaPhase::Mapped,
+            &mut self.metrics.lock(),
+        )?;
         self.add(|m| &mut m.map_completions, 1);
+        self.add(|m| &mut m.arena_map_completions, 1);
         if remap {
             self.add(|m| &mut m.remap_completions, 1);
+            self.add(|m| &mut m.arena_remap_completions, 1);
         }
-        *slot.ever_mapped.lock() = true;
-        Ok(lease)
+        arena.state.lock().ever_mapped = true;
+        Ok(mapping)
     }
     pub(crate) async fn read_source(
         self: &Arc<Self>,
@@ -429,10 +677,18 @@ impl State {
         buffers: Vec<PooledBuffer>,
         logical: &GpuExpertCache,
     ) -> Result<Vec<Arc<ExpertResident>>, String> {
-        if self.arm != Arm::Treatment || ids.len() != buffers.len() || ids.len() > CAPACITY {
+        if self.arm != Arm::Treatment
+            || ids.is_empty()
+            || ids.len() != buffers.len()
+            || ids.len() > CAPACITY
+        {
             return Err("invalid qualification source set".into());
         }
-        if ids.iter().any(|id| self.pending.lock().contains_key(id)) {
+        if ids
+            .iter()
+            .enumerate()
+            .any(|(i, id)| ids[..i].contains(id) || self.pending.lock().contains_key(id))
+        {
             self.add(|m| &mut m.accounting_errors, 1);
             return Err("second source read while an upload lease exists".into());
         }
@@ -447,13 +703,15 @@ impl State {
                 return Err("non-shared logical admission prevents source fusion".into());
             }
         }
-        let mut leases = ids
-            .iter()
-            .map(|&id| self.acquire(id))
+        // Keep original ID order and a single storage batch even for a source
+        // set wider than eight: its two arena views supply one destination list.
+        let mappings = ids
+            .chunks(ARENA_WIDTH)
+            .map(|chunk| self.acquire(chunk.len()))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut views = leases
+        let mut views = mappings
             .iter()
-            .map(|l| l.buffer().slice(..).get_mapped_range_mut())
+            .map(|a| a.arena().buffer.slice(..).get_mapped_range_mut())
             .collect::<Vec<_>>();
         let offsets = views
             .iter()
@@ -463,11 +721,12 @@ impl State {
                 self.add(|m| &mut m.alignment_failures, 1);
                 e
             })?;
-        let mut destinations = views
-            .iter_mut()
-            .zip(&offsets)
-            .map(|(v, &o)| &mut v[o..o + FULL])
-            .collect::<Vec<_>>();
+        let mut destinations = Vec::with_capacity(ids.len());
+        for ((view, &offset), mapping) in views.iter_mut().zip(&offsets).zip(&mappings) {
+            destinations.extend(view[offset..offset + mapping.width * FULL].chunks_exact_mut(FULL));
+        }
+        self.add(|m| &mut m.source_sets_mapped, 1);
+        self.add(|m| &mut m.source_slots_mapped, ids.len() as u64);
         let started = Instant::now();
         let result = storage
             .read_experts_batch_into_aligned_slices(ids, &mut destinations)
@@ -491,21 +750,26 @@ impl State {
             (ids.len() * PAYLOAD) as u64,
         );
         let mut shared = Vec::with_capacity(ids.len());
-        for ((&id, view), &offset) in ids.iter().zip(&views).zip(&offsets) {
+        for (i, &id) in ids.iter().enumerate() {
+            let view = &views[i / ARENA_WIDTH];
+            let offset = slot_offset(offsets[i / ARENA_WIDTH], i % ARENA_WIDTH, view.len())?;
             let payload = checked_payload(&view[offset..offset + FULL])?;
             let bytes = self.materialize_source_payload(id, payload, logical)?;
             shared.push(bytes);
         }
-        // Every view is gone before the first unmap, including error unwinds
-        // (views was declared after leases and therefore drops first).
+        // Views/slices precede unmap even on error or future cancellation.
         drop(views);
-        let mut residents = Vec::with_capacity(ids.len());
-        for (((lease, offset), payload), capacity_lease) in
-            leases.iter_mut().zip(offsets).zip(shared).zip(buffers)
+        let mut leases = Vec::with_capacity(ids.len());
+        for ((mapping, chunk), offset) in mappings
+            .into_iter()
+            .zip(ids.chunks(ARENA_WIDTH))
+            .zip(offsets)
         {
-            lease.offset = offset;
+            leases.extend(mapping.into_leases(chunk, offset)?);
+        }
+        let mut residents = Vec::with_capacity(ids.len());
+        for ((lease, payload), capacity_lease) in leases.iter_mut().zip(shared).zip(buffers) {
             lease.payload = Some(payload.clone());
-            lease.unmap();
             residents.push(Arc::new(ExpertResident::new_qualification_shared(
                 lease.id,
                 capacity_lease,
@@ -562,7 +826,11 @@ impl State {
                     .qualification_shared_payload()
                     .zip(lease.payload.as_ref())
                     .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
-                || *lease.slot().state.lock() != SlotState::Ready
+                || !lease.arena().state.lock().lease_is(
+                    lease.generation,
+                    lease.slot,
+                    LeasePhase::Ready,
+                )
             {
                 self.add(|m| &mut m.accounting_errors, 1);
                 return Err("source/upload resident identity or unmap mismatch".into());
@@ -589,10 +857,11 @@ impl State {
 pub(crate) struct Lease {
     state: Arc<State>,
     index: usize,
+    generation: u64,
+    slot: usize,
     id: u32,
     offset: usize,
     payload: Option<Arc<[u8]>>,
-    consumed: bool,
 }
 
 /// One encoder for the physical install set. Concurrent stage jobs append
@@ -600,14 +869,20 @@ pub(crate) struct Lease {
 /// submit returns; upload leases remain owned here through that submission.
 pub(crate) struct CopySet<'a> {
     state: &'a State,
-    encoder: Mutex<Option<wgpu::CommandEncoder>>,
+    commands: Mutex<CopyCommands>,
     leases: Mutex<Vec<Lease>>,
+}
+#[derive(Default)]
+struct CopyCommands {
+    encoder: Option<wgpu::CommandEncoder>,
+    closed: bool,
+    submission_started: bool,
 }
 impl<'a> CopySet<'a> {
     pub(crate) fn new(state: &'a State) -> Self {
         Self {
             state,
-            encoder: Mutex::new(None),
+            commands: Mutex::new(CopyCommands::default()),
             leases: Mutex::new(Vec::new()),
         }
     }
@@ -627,19 +902,28 @@ impl<'a> CopySet<'a> {
         {
             return Err("invalid physical upload destination".into());
         }
-        let mut encoder = self.encoder.lock();
-        let encoder = encoder.get_or_insert_with(|| {
+        let mut commands = self.commands.lock();
+        if commands.closed || !std::ptr::eq(self.state, lease.state.as_ref()) {
+            return Err(generation_error(&mut self.state.metrics.lock()));
+        }
+        let encoder = commands.encoder.get_or_insert_with(|| {
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("qualification residency copy set"),
             })
         });
+        lease.transition(LeasePhase::Ready, LeasePhase::Encoded)?;
         encoder.copy_buffer_to_buffer(lease.buffer(), source, destination, offset, PAYLOAD as u64);
         self.leases.lock().push(lease);
         self.state.add(|m| &mut m.copy_encode_us, elapsed(start));
         Ok(())
     }
     pub(crate) fn submit(&self, executor: &GpuNativeExecutorContext) -> Result<(), String> {
-        let Some(encoder) = self.encoder.lock().take() else {
+        let mut commands = self.commands.lock();
+        if commands.closed {
+            return Err(generation_error(&mut self.state.metrics.lock()));
+        }
+        commands.closed = true;
+        let Some(encoder) = commands.encoder.take() else {
             return Ok(());
         };
         let gpu = executor.authoritative_gpu().map_err(|e| e.to_string())?;
@@ -650,6 +934,9 @@ impl<'a> CopySet<'a> {
         let command = encoder.finish();
         self.state.add(|m| &mut m.copy_command_buffers, 1);
         let start = Instant::now();
+        // If queue submission unwinds, encoded leases poison their arena.
+        // No retry or potentially unsafe reuse is permitted for that generation.
+        commands.submission_started = true;
         gpu.queue.submit(Some(command));
         self.state.add(|m| &mut m.copy_submit_us, elapsed(start));
         self.state.add(|m| &mut m.copy_submissions, 1);
@@ -667,50 +954,68 @@ impl<'a> CopySet<'a> {
         Ok(())
     }
 }
+impl Drop for CopySet<'_> {
+    fn drop(&mut self) {
+        let commands = self.commands.get_mut();
+        // Destroy every unsubmitted command reference BEFORE cancelling leases.
+        drop(commands.encoder.take());
+        let leases = self.leases.get_mut();
+        if !commands.submission_started {
+            for lease in leases.iter() {
+                let _ = lease.transition(LeasePhase::Encoded, LeasePhase::Ready);
+            }
+        }
+        // Submitted leases release normally. Encoded leases after an uncertain
+        // submission fail closed in Drop and leave their arena poisoned.
+        leases.clear();
+    }
+}
 impl Lease {
-    fn slot(&self) -> &Slot {
-        &self.state.ring.as_ref().expect("treatment ring").slots[self.index]
+    fn arena(&self) -> &Arena {
+        &self.state.ring.as_ref().expect("treatment ring").arenas[self.index]
     }
     pub(crate) fn buffer(&self) -> &wgpu::Buffer {
-        &self.slot().buffer
+        &self.arena().buffer
     }
     pub(crate) fn copy_source_offset(&self) -> Result<u64, String> {
+        let arena = self.arena().state.lock();
+        if !arena.lease_is(self.generation, self.slot, LeasePhase::Ready) {
+            return Err(generation_error(&mut self.state.metrics.lock()));
+        }
+        let base = self
+            .offset
+            .checked_sub(self.slot * FULL)
+            .ok_or_else(|| generation_error(&mut self.state.metrics.lock()))?;
+        if slot_offset(base, self.slot, UPLOAD_BYTES)? != self.offset {
+            return Err(generation_error(&mut self.state.metrics.lock()));
+        }
         copy_source_offset(self.offset, UPLOAD_BYTES)
     }
     pub(crate) fn context_id(&self) -> u64 {
         self.state.ring.as_ref().unwrap().executor.context_id()
     }
-    fn unmap(&self) {
-        self.buffer().unmap();
-        *self.slot().state.lock() = SlotState::Ready;
-        self.state.add(|m| &mut m.unmaps, 1);
+    fn transition(&self, expected: LeasePhase, next: LeasePhase) -> Result<(), String> {
+        self.arena().state.lock().lease_transition(
+            self.generation,
+            self.slot,
+            expected,
+            next,
+            &mut self.state.metrics.lock(),
+        )
     }
-    pub(crate) fn submitted(&mut self) -> Result<(), String> {
-        if self.consumed || *self.slot().state.lock() != SlotState::Ready {
-            return Err("upload lease consumed twice or while mapped".into());
-        }
-        self.consumed = true;
-        self.slot()
-            .state
-            .lock()
-            .transition(SlotState::Ready, SlotState::Submitted)?;
+    fn submitted(&mut self) -> Result<(), String> {
+        self.transition(LeasePhase::Encoded, LeasePhase::Submitted)?;
         self.state.add(|m| &mut m.leases_consumed, 1);
         Ok(())
     }
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        if matches!(
-            *self.slot().state.lock(),
-            SlotState::Mapping | SlotState::Mapped
-        ) {
-            self.unmap();
-        }
-        if !self.consumed {
-            self.state.add(|m| &mut m.leases_dropped_unconsumed, 1);
-        }
-        *self.slot().state.lock() = SlotState::Available;
-        self.state.add(|m| &mut m.leases_released, 1);
+        let _ = self.arena().state.lock().release(
+            self.generation,
+            self.slot,
+            &mut self.state.metrics.lock(),
+        );
     }
 }
 pub(crate) fn elapsed(start: Instant) -> u64 {
@@ -719,7 +1024,9 @@ pub(crate) fn elapsed(start: Instant) -> u64 {
 pub(crate) fn aligned_offset(base: usize, capacity: usize) -> Result<usize, String> {
     let offset = (ALIGN - base % ALIGN) % ALIGN;
     if offset % 4 != 0
-        || offset.checked_add(FULL).is_none_or(|end| end > capacity)
+        || offset
+            .checked_add(ARENA_WIDTH * FULL)
+            .is_none_or(|end| end > capacity)
         || base.checked_add(offset).is_none_or(|p| p % ALIGN != 0)
     {
         return Err("invalid mapped alignment/range".into());
@@ -727,13 +1034,25 @@ pub(crate) fn aligned_offset(base: usize, capacity: usize) -> Result<usize, Stri
     Ok(offset)
 }
 pub(crate) fn copy_source_offset(offset: usize, capacity: usize) -> Result<u64, String> {
-    if offset >= ALIGN
+    if offset / FULL >= ARENA_WIDTH
+        || offset % FULL >= ALIGN
         || offset % 4 != 0
         || offset.checked_add(FULL).is_none_or(|end| end > capacity)
     {
         return Err("invalid upload copy range".into());
     }
     Ok((offset + ALIGN) as u64)
+}
+fn slot_offset(aligned_base: usize, slot: usize, capacity: usize) -> Result<usize, String> {
+    if aligned_base >= ALIGN || aligned_base % 4 != 0 || slot >= ARENA_WIDTH {
+        return Err("invalid upload arena slot".into());
+    }
+    let offset = slot
+        .checked_mul(FULL)
+        .and_then(|n| aligned_base.checked_add(n))
+        .ok_or("upload arena slot overflow")?;
+    copy_source_offset(offset, capacity)?;
+    Ok(offset)
 }
 fn checked_payload(source: &[u8]) -> Result<&[u8], String> {
     let (header, payload) = TensorHeader::strip(source, ALIGN);
@@ -873,56 +1192,202 @@ mod tests {
         assert!(aligned_offset(0x1001, UPLOAD_BYTES).is_err());
         assert!(aligned_offset(0x1000, FULL - 1).is_err());
     }
-    #[test]
-    fn source_upload_ring_capacity_is_bounded_and_released_slots_reuse() {
-        let slots = (0..CAPACITY)
-            .map(|_| Mutex::new(SlotState::Available))
-            .collect::<Vec<_>>();
-        for i in 0..CAPACITY {
-            assert_eq!(reserve_slot(slots.iter()), Some(i));
-        }
-        assert_eq!(reserve_slot(slots.iter()), None);
-        *slots[7].lock() = SlotState::Available;
-        assert_eq!(reserve_slot(slots.iter()), Some(7));
-        assert_eq!(reserve_slot(slots.iter()), None);
-        assert_eq!(slots.len(), 16);
+    fn ready_generation(width: usize, m: &mut Metrics) -> (ArenaGeneration, u64) {
+        let mut a = ArenaGeneration::default();
+        let generation = a.reserve(width, m).unwrap();
+        a.transition(generation, ArenaPhase::Mapping, ArenaPhase::Mapped, m)
+            .unwrap();
+        a.transition(generation, ArenaPhase::Mapped, ArenaPhase::Ready, m)
+            .unwrap();
+        (a, generation)
     }
     #[test]
-    fn source_upload_lease_map_unmap_submit_and_remap_transitions() {
-        let mut state = SlotState::Available;
-        for _ in 0..3 {
-            state
-                .transition(SlotState::Available, SlotState::Mapping)
-                .unwrap();
-            state
-                .transition(SlotState::Mapping, SlotState::Mapped)
-                .unwrap();
-            state
-                .transition(SlotState::Mapped, SlotState::Ready)
-                .unwrap();
-            state
-                .transition(SlotState::Ready, SlotState::Submitted)
-                .unwrap();
-            state
-                .transition(SlotState::Submitted, SlotState::Available)
-                .unwrap();
+    fn source_upload_hma1b_geometry_alignment_and_all_copy_ranges() {
+        assert_eq!((ARENAS, ARENA_WIDTH, CAPACITY), (2, 8, 16));
+        assert_eq!(FULL, 649 * ALIGN);
+        assert_eq!(UPLOAD_BYTES, 8 * FULL + ALIGN);
+        for base in (0x1000..0x4000).step_by(8) {
+            let aligned = aligned_offset(base, UPLOAD_BYTES).unwrap();
+            let mut previous_end = 0;
+            for slot in 0..ARENA_WIDTH {
+                let start = slot_offset(aligned, slot, UPLOAD_BYTES).unwrap();
+                let copy = copy_source_offset(start, UPLOAD_BYTES).unwrap() as usize;
+                assert_eq!((base + start) % ALIGN, 0);
+                assert_eq!(start, aligned + slot * FULL);
+                assert_eq!(copy - start, ALIGN);
+                assert_eq!(start + FULL - copy, PAYLOAD);
+                assert!(start >= previous_end);
+                assert!(copy + PAYLOAD <= UPLOAD_BYTES);
+                previous_end = start + FULL;
+            }
         }
+        assert!(slot_offset(0, 8, UPLOAD_BYTES).is_err());
+        assert!(slot_offset(4096, 0, UPLOAD_BYTES).is_err());
+        assert!(slot_offset(8, 7, 8 * FULL).is_err());
     }
     #[test]
-    fn source_upload_lease_consumption_is_exactly_once_and_requires_unmap() {
-        let mut state = SlotState::Mapped;
-        assert!(state
-            .transition(SlotState::Ready, SlotState::Submitted)
-            .is_err());
-        state
-            .transition(SlotState::Mapped, SlotState::Ready)
+    fn source_upload_hma1b_complete_generations_submit_release_and_remap() {
+        let mut m = Metrics::default();
+        let mut a = ArenaGeneration::default();
+        for expected in 1..=3 {
+            let generation = a.reserve(8, &mut m).unwrap();
+            assert_eq!(generation, expected);
+            a.transition(generation, ArenaPhase::Mapping, ArenaPhase::Mapped, &mut m)
+                .unwrap();
+            a.transition(generation, ArenaPhase::Mapped, ArenaPhase::Ready, &mut m)
+                .unwrap();
+            for slot in 0..8 {
+                a.lease_transition(
+                    generation,
+                    slot,
+                    LeasePhase::Ready,
+                    LeasePhase::Encoded,
+                    &mut m,
+                )
+                .unwrap();
+                a.lease_transition(
+                    generation,
+                    slot,
+                    LeasePhase::Encoded,
+                    LeasePhase::Submitted,
+                    &mut m,
+                )
+                .unwrap();
+            }
+            for (released, slot) in [3, 7, 0, 5, 1, 6, 4, 2].into_iter().enumerate() {
+                a.release(generation, slot, &mut m).unwrap();
+                assert_eq!(a.active_leases(), 7 - released);
+                assert_eq!(a.phase == ArenaPhase::Available, released == 7);
+            }
+        }
+        assert_eq!(m.leases_released, 24);
+        assert_eq!(m.leases_dropped_unconsumed, 0);
+        assert_eq!(m.arena_generation_errors, 0);
+    }
+    #[test]
+    fn source_upload_hma1b_generation_waits_for_last_partial_or_abandoned_lease() {
+        let mut m = Metrics::default();
+        let (mut a, generation) = ready_generation(8, &mut m);
+        for slot in 0..4 {
+            a.lease_transition(
+                generation,
+                slot,
+                LeasePhase::Ready,
+                LeasePhase::Encoded,
+                &mut m,
+            )
             .unwrap();
-        state
-            .transition(SlotState::Ready, SlotState::Submitted)
+            a.lease_transition(
+                generation,
+                slot,
+                LeasePhase::Encoded,
+                LeasePhase::Submitted,
+                &mut m,
+            )
             .unwrap();
-        assert!(state
-            .transition(SlotState::Ready, SlotState::Submitted)
+            a.release(generation, slot, &mut m).unwrap();
+            assert_eq!(a.phase, ArenaPhase::Ready);
+        }
+        // Unconsumed pending leases may be abandoned, but only the final one
+        // releases the buffer shared with the already-submitted prefix.
+        for slot in 4..8 {
+            a.release(generation, slot, &mut m).unwrap();
+            assert_eq!(a.phase == ArenaPhase::Available, slot == 7);
+        }
+        assert_eq!(m.leases_released, 8);
+        assert_eq!(m.leases_dropped_unconsumed, 4);
+        assert_eq!(m.arena_generation_errors, 0);
+    }
+    #[test]
+    fn source_upload_hma1b_stale_double_release_and_submit_fail_closed() {
+        let mut m = Metrics::default();
+        let (mut a, old) = ready_generation(1, &mut m);
+        a.lease_transition(old, 0, LeasePhase::Ready, LeasePhase::Encoded, &mut m)
+            .unwrap();
+        a.lease_transition(old, 0, LeasePhase::Encoded, LeasePhase::Submitted, &mut m)
+            .unwrap();
+        assert!(a
+            .lease_transition(old, 0, LeasePhase::Encoded, LeasePhase::Submitted, &mut m)
             .is_err());
+        a.release(old, 0, &mut m).unwrap();
+        assert!(a.release(old, 0, &mut m).is_err());
+        let new = a.reserve(2, &mut m).unwrap();
+        assert_ne!(old, new);
+        assert!(a.release(old, 0, &mut m).is_err());
+        assert!(a.abort_mapping(old, &mut m).is_err());
+        assert!(a
+            .lease_transition(old, 0, LeasePhase::Ready, LeasePhase::Encoded, &mut m)
+            .is_err());
+        assert_eq!(a.generation, new);
+        assert_eq!(a.phase, ArenaPhase::Mapping);
+        assert_eq!(a.active_leases(), 2);
+        assert_eq!(m.arena_generation_errors, 5);
+        assert_eq!(m.accounting_errors, 5);
+    }
+    #[test]
+    fn source_upload_hma1b_two_arenas_are_independent_and_third_fails() {
+        let mut m = Metrics::default();
+        let arenas: [_; ARENAS] = std::array::from_fn(|_| Mutex::new(ArenaGeneration::default()));
+        let (first, gen) = reserve_arena(arenas.iter(), 8, &mut m).unwrap();
+        let mut a = arenas[first].lock();
+        a.transition(gen, ArenaPhase::Mapping, ArenaPhase::Mapped, &mut m)
+            .unwrap();
+        a.transition(gen, ArenaPhase::Mapped, ArenaPhase::Ready, &mut m)
+            .unwrap();
+        a.lease_transition(gen, 0, LeasePhase::Ready, LeasePhase::Encoded, &mut m)
+            .unwrap();
+        a.lease_transition(gen, 0, LeasePhase::Encoded, LeasePhase::Submitted, &mut m)
+            .unwrap();
+        drop(a);
+        let (second, other) = reserve_arena(arenas.iter(), 8, &mut m).unwrap();
+        assert_ne!(first, second);
+        assert!(reserve_arena(arenas.iter(), 1, &mut m).is_err());
+        arenas[first].lock().release(gen, 0, &mut m).unwrap();
+        assert!(reserve_arena(arenas.iter(), 1, &mut m).is_err());
+        arenas[second].lock().abort_mapping(other, &mut m).unwrap();
+        assert_eq!(reserve_arena(arenas.iter(), 1, &mut m).unwrap().0, second);
+        assert_eq!(m.arena_generation_errors, 2);
+    }
+    #[test]
+    fn source_upload_hma1b_mapping_unwind_and_submission_uncertainty() {
+        let mut m = Metrics::default();
+        for phase in [ArenaPhase::Mapping, ArenaPhase::Mapped] {
+            let mut a = ArenaGeneration::default();
+            let gen = a.reserve(3, &mut m).unwrap();
+            a.phase = phase;
+            assert!(a
+                .lease_transition(gen, 0, LeasePhase::Ready, LeasePhase::Encoded, &mut m)
+                .is_err());
+            a.abort_mapping(gen, &mut m).unwrap();
+            assert_eq!(a.phase, ArenaPhase::Available);
+            assert_eq!(a.active_leases(), 0);
+        }
+        let (mut a, gen) = ready_generation(2, &mut m);
+        a.lease_transition(gen, 0, LeasePhase::Ready, LeasePhase::Encoded, &mut m)
+            .unwrap();
+        // Unsubmitted encoder is destroyed; only then can the copy owner cancel.
+        a.lease_transition(gen, 0, LeasePhase::Encoded, LeasePhase::Ready, &mut m)
+            .unwrap();
+        a.release(gen, 0, &mut m).unwrap();
+        assert_eq!(a.phase, ArenaPhase::Ready);
+        a.lease_transition(gen, 1, LeasePhase::Ready, LeasePhase::Encoded, &mut m)
+            .unwrap();
+        assert!(a.release(gen, 1, &mut m).is_err());
+        assert_eq!(a.phase, ArenaPhase::Poisoned);
+        assert!(a.reserve(1, &mut m).is_err());
+        assert!(a.abort_mapping(gen, &mut m).is_err());
+        assert!(m.arena_generation_errors > 0);
+    }
+    #[test]
+    fn source_upload_hma1b_generation_overflow_and_invalid_width_fail_closed() {
+        let mut m = Metrics::default();
+        let mut a = ArenaGeneration::default();
+        assert!(a.reserve(0, &mut m).is_err());
+        assert!(a.reserve(9, &mut m).is_err());
+        a.generation = u64::MAX;
+        assert!(a.reserve(1, &mut m).is_err());
+        assert_eq!(a.phase, ArenaPhase::Available);
+        assert_eq!(m.arena_generation_errors, 3);
     }
     #[test]
     fn source_upload_control_has_no_ring_or_lease_path() {
@@ -994,12 +1459,24 @@ mod tests {
             1
         );
         assert!(
-            body.find("self.acquire(id)").unwrap()
+            body.find("self.acquire(chunk.len())").unwrap()
                 < body
                     .find(".read_experts_batch_into_aligned_slices(")
                     .unwrap()
         );
-        assert!(body.find("drop(views)").unwrap() < body.find("lease.unmap()").unwrap());
+        assert!(
+            body.find("drop(views)").unwrap()
+                < body.find("mapping.into_leases(chunk, offset)").unwrap()
+        );
+        for forbidden in [
+            ".read_expert(",
+            ".read_experts_batch(",
+            ".to_vec()",
+            "vec![0",
+            "Vec::<u8>",
+        ] {
+            assert!(!body.contains(forbidden));
+        }
         let physical = include_str!("backend/gpu_native.rs")
             .split("pub(crate) fn stage_q4_expert_source_upload")
             .nth(1)
