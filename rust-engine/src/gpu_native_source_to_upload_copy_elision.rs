@@ -928,6 +928,9 @@ struct Gpu {
 }
 impl Gpu {
     async fn new(a: &mut Authority) -> Result<Self> {
+        Self::with_upload_capacity(a, UPLOAD).await
+    }
+    async fn with_upload_capacity(a: &mut Authority, upload_capacity: usize) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..Default::default()
@@ -987,7 +990,7 @@ impl Gpu {
         });
         let upload = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mapped-direct-source-upload"),
-            size: UPLOAD as u64,
+            size: upload_capacity as u64,
             usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -1575,6 +1578,12 @@ async fn execute(report: &mut Report) -> Result<()> {
 }
 
 pub(crate) async fn run_command(args: Args) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    hma1c_b::run_command(args).await
+}
+
+// A's schema and runner remain version-separated test evidence. The CLI runs B.
+#[cfg(test)]
+async fn run_command_hma1c_a(args: Args) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Exclusive creation prevents accidentally replacing an immutable experiment.
     let mut output = std::fs::OpenOptions::new()
         .write(true)
@@ -1616,6 +1625,7 @@ pub(crate) async fn run_command(args: Args) -> std::result::Result<(), Box<dyn s
 
 #[cfg(test)]
 mod tests {
+    use super::run_command_hma1c_a as run_command;
     use super::*;
     use clap::Parser;
 
@@ -2577,5 +2587,1736 @@ no_direct = false
         assert_eq!(json["classification"], "authority-failed");
         assert!(json["authority"]["adapter_name"].is_null());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// HMA-1C-B is a separate diagnostic contract. A above remains frozen evidence;
+/// only this module is reachable from the diagnostic CLI on the B branch.
+mod hma1c_b {
+    use super::*;
+    use crate::aligned_buffer::AlignedBuffer;
+    use crate::io_provider::SourceUploadFdProofSnapshot;
+    use std::collections::BTreeSet;
+
+    const B_SCHEMA: &str = "mer.gpu-native-mapped-memory-odirect-batch-discriminator.v1";
+    const B_API: &str = "read_experts_batch_into_aligned_slices";
+    const MAX_WIDTH: usize = 8;
+    const UNIVERSE_SIZE: usize = 128;
+    const HOST_ARENA: usize = MAX_WIDTH * FULL;
+    const MAPPED_ARENA: usize = HOST_ARENA + ALIGN;
+    const SCHEDULE_CONTRACT: &str = "Width-stratified deterministic sweep, not a production-weighted replay: no durable ordered production width histogram exists. Each phase starts p=0. K=p%8+1; round=p/8; start=(p*17)%128; slot j uses universe[(start+j*13)%128]. Universe[i]=floor(i*6143/127), i=0..127. Even round CONTROL then TREATMENT; odd round TREATMENT then CONTROL. Ordered source-set ID SHA256 encodes, per set, K as u32 LE followed by K ordered IDs as u32 LE. Ordered width SHA256 encodes each K as u32 LE. Raw samples retain p, round, K, IDs and order.";
+    const INTERPRETATION_CONTRACT: &str = "PRIMARY = K=2..8 aggregate; K=1 is internal comparison, all-K descriptive. STRONG: primary slowdown >=5%, primary median treatment/control ratio >1, majority primary sets treatment-slower, >=5 of 7 multi-expert widths positive, and both primary execution-order strata positive. MATERIAL: same requirements at >=3%. Evidence AGAINST a material batch substrate cause: primary slowdown within +/-1%, primary median ratio within +/-1% of 1.0, and no coherent positive width trend. AMBIGUOUS / next surrounding-helper discriminator: >1% but <3%, aggregate/median/majority disagreement, order strata reversing sign, or fewer than 5/7 multi-expert widths agreeing in direction. Primary treatment speedup is evidence against raw mapped backing as the production source-gap cause. Do not round a sub-3% result upward. No unprovided numerical definition of coherent width trend is invented; apply this frozen interpretation to exact evidence after authoritative hardware. A is frozen AMBIGUOUS at +2.8884733837131744%; K=1 cross-run differences are contextual, not causal. Correctness is independent of performance.";
+    const TIMER_CONTRACT: &str = "Only the one awaited NvmeStorage::read_experts_batch_into_aligned_slices call per arm per source set is timed. Arena allocation, map_async/device.poll, mapped-view acquisition, checked alignment and slice construction, preproof, fd evidence, hashing, GPU copy, readback and unmap are outside that interval. The helper retains its normal fd resolution, proof-cache lookup, scoped-thread scheduler, retries and breaker semantics inside the interval.";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+    enum ExecutionOrder {
+        #[serde(rename = "CONTROL-then-TREATMENT")]
+        ControlFirst,
+        #[serde(rename = "TREATMENT-then-CONTROL")]
+        TreatmentFirst,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    struct SourceSet {
+        set_index: usize,
+        round: usize,
+        width: usize,
+        ordered_expert_ids: Vec<u32>,
+        execution_order: ExecutionOrder,
+    }
+    fn schedule(count: usize) -> Result<Vec<SourceSet>> {
+        if count > MAX_ITERATIONS {
+            return Err(Failure::accounting("source-set count exceeds 65536"));
+        }
+        let universe = expert_sequence(UNIVERSE_SIZE, NAMESPACE).map_err(Failure::accounting)?;
+        (0..count)
+            .map(|p| {
+                let width = p % MAX_WIDTH + 1;
+                let round = p / MAX_WIDTH;
+                let start = p
+                    .checked_mul(17)
+                    .ok_or_else(|| Failure::accounting("schedule start overflow"))?
+                    % UNIVERSE_SIZE;
+                let ids: Vec<_> = (0..width)
+                    .map(|j| universe[(start + j * 13) % UNIVERSE_SIZE])
+                    .collect();
+                if ids.iter().any(|id| *id >= NAMESPACE)
+                    || ids.iter().copied().collect::<BTreeSet<_>>().len() != width
+                {
+                    return Err(Failure::accounting(
+                        "non-distinct or out-of-range source set",
+                    ));
+                }
+                Ok(SourceSet {
+                    set_index: p,
+                    round,
+                    width,
+                    ordered_expert_ids: ids,
+                    execution_order: if round % 2 == 0 {
+                        ExecutionOrder::ControlFirst
+                    } else {
+                        ExecutionOrder::TreatmentFirst
+                    },
+                })
+            })
+            .collect()
+    }
+    fn source_bytes(slots: u64) -> Result<u64> {
+        slots
+            .checked_mul(FULL as u64)
+            .ok_or_else(|| Failure::accounting("source byte overflow"))
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    struct ScheduleEvidence {
+        source_set_count: u64,
+        expert_slot_count: u64,
+        source_bytes: u64,
+        width_histogram: BTreeMap<usize, u64>,
+        ordered_source_set_ids_sha256: String,
+        ordered_width_sha256: String,
+    }
+    fn schedule_evidence(sets: &[SourceSet]) -> Result<ScheduleEvidence> {
+        let mut e = ScheduleEvidence {
+            source_set_count: 0,
+            expert_slot_count: 0,
+            source_bytes: 0,
+            width_histogram: (1..=MAX_WIDTH).map(|k| (k, 0)).collect(),
+            ordered_source_set_ids_sha256: String::new(),
+            ordered_width_sha256: String::new(),
+        };
+        let mut ids = Sha256::new();
+        let mut widths = Sha256::new();
+        for set in sets {
+            if !(1..=MAX_WIDTH).contains(&set.width)
+                || set.ordered_expert_ids.len() != set.width
+                || set.ordered_expert_ids.iter().any(|id| *id >= NAMESPACE)
+                || set
+                    .ordered_expert_ids
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != set.width
+            {
+                return Err(Failure::accounting("invalid source-set geometry"));
+            }
+            add(&mut e.source_set_count, 1)?;
+            add(&mut e.expert_slot_count, set.width as u64)?;
+            add(e.width_histogram.get_mut(&set.width).unwrap(), 1)?;
+            widths.update((set.width as u32).to_le_bytes());
+            ids.update((set.width as u32).to_le_bytes());
+            for id in &set.ordered_expert_ids {
+                ids.update(id.to_le_bytes());
+            }
+        }
+        e.source_bytes = source_bytes(e.expert_slot_count)?;
+        e.ordered_source_set_ids_sha256 = finish_sha(&ids);
+        e.ordered_width_sha256 = finish_sha(&widths);
+        Ok(e)
+    }
+
+    /// Split one arena with safe exclusive chunks. Check the whole eight-slot
+    /// backing range on every map, even when only the first K slices are used.
+    fn arena_offset(base: usize, capacity: usize, width: usize, treatment: bool) -> Result<usize> {
+        if !(1..=MAX_WIDTH).contains(&width)
+            || capacity != if treatment { MAPPED_ARENA } else { HOST_ARENA }
+        {
+            return Err(Failure::accounting("invalid batch arena size or width"));
+        }
+        let offset =
+            aligned_subrange(base, capacity, HOST_ARENA, ALIGN).map_err(Failure::accounting)?;
+        if !treatment && offset != 0 {
+            return Err(Failure::accounting("host arena must start page aligned"));
+        }
+        for j in 0..width {
+            let slot = j
+                .checked_mul(FULL)
+                .and_then(|n| offset.checked_add(n))
+                .ok_or_else(|| Failure::accounting("arena slot overflow"))?;
+            // This also checks COPY_BUFFER_ALIGNMENT for every mapped payload.
+            copy_offsets(slot, PREFIX, PAYLOAD, capacity).map_err(Failure::accounting)?;
+        }
+        Ok(offset)
+    }
+    fn arena_slices(
+        arena: &mut [u8],
+        width: usize,
+        treatment: bool,
+    ) -> Result<(usize, Vec<&mut [u8]>)> {
+        let offset = arena_offset(arena.as_ptr() as usize, arena.len(), width, treatment)?;
+        let len = width
+            .checked_mul(FULL)
+            .ok_or_else(|| Failure::accounting("arena length overflow"))?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Failure::accounting("arena end overflow"))?;
+        let slices = arena
+            .get_mut(offset..end)
+            .ok_or_else(|| Failure::accounting("arena out of range"))?
+            .chunks_exact_mut(FULL)
+            .collect();
+        Ok((offset, slices))
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    struct RawSample {
+        #[serde(flatten)]
+        source_set: SourceSet,
+        control_ns: u64,
+        treatment_ns: u64,
+        delta_ns: i128,
+        // The exact ratio components are control_ns and treatment_ns. No f64
+        // representation participates in correctness or threshold decisions.
+    }
+    impl RawSample {
+        fn new(source_set: SourceSet, control_ns: u64, treatment_ns: u64) -> Result<Self> {
+            if control_ns == 0 || treatment_ns == 0 {
+                return Err(Failure::accounting("zero batch source duration"));
+            }
+            let delta_ns = i128::from(treatment_ns)
+                .checked_sub(i128::from(control_ns))
+                .ok_or_else(|| Failure::accounting("batch delta overflow"))?;
+            Ok(Self {
+                source_set,
+                control_ns,
+                treatment_ns,
+                delta_ns,
+            })
+        }
+    }
+    #[derive(Default, Debug, PartialEq, Serialize)]
+    struct StratumStats {
+        samples: u64,
+        control_total_ns: u64,
+        treatment_total_ns: u64,
+        delta_ns: i128,
+        slowdown_percent: Option<f64>,
+    }
+    impl StratumStats {
+        fn observe(&mut self, s: &RawSample) -> Result<()> {
+            add(&mut self.samples, 1)?;
+            add(&mut self.control_total_ns, s.control_ns)?;
+            add(&mut self.treatment_total_ns, s.treatment_ns)?;
+            self.delta_ns = self
+                .delta_ns
+                .checked_add(s.delta_ns)
+                .ok_or_else(|| Failure::accounting("stratum delta overflow"))?;
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<()> {
+            if i128::from(self.treatment_total_ns).checked_sub(i128::from(self.control_total_ns))
+                != Some(self.delta_ns)
+            {
+                return Err(Failure::accounting("stratum sums disagree"));
+            }
+            self.slowdown_percent = (self.control_total_ns > 0)
+                .then(|| self.delta_ns as f64 / self.control_total_ns as f64 * 100.0);
+            Ok(())
+        }
+    }
+    #[derive(Default, Debug, PartialEq, Serialize)]
+    struct BatchStats {
+        #[serde(flatten)]
+        paired: PairStats,
+        aggregate_slowdown_percent: Option<f64>,
+        control_first: StratumStats,
+        treatment_first: StratumStats,
+    }
+    fn batch_stats(samples: &[RawSample]) -> Result<BatchStats> {
+        let mut stats = BatchStats::default();
+        let mut pairs = Vec::with_capacity(samples.len());
+        for s in samples {
+            if *s != RawSample::new(s.source_set.clone(), s.control_ns, s.treatment_ns)? {
+                return Err(Failure::accounting(
+                    "raw delta differs from exact components",
+                ));
+            }
+            match s.source_set.execution_order {
+                ExecutionOrder::ControlFirst => stats.control_first.observe(s)?,
+                ExecutionOrder::TreatmentFirst => stats.treatment_first.observe(s)?,
+            }
+            pairs.push(SourceReadPair {
+                pair: s.source_set.set_index,
+                expert_id: 0,
+                control_ns: s.control_ns,
+                treatment_ns: s.treatment_ns,
+            });
+        }
+        stats.paired = pair_stats(&pairs)?;
+        stats.control_first.finish()?;
+        stats.treatment_first.finish()?;
+        let p = &stats.paired;
+        if stats
+            .control_first
+            .samples
+            .checked_add(stats.treatment_first.samples)
+            != Some(p.paired_source_read_samples)
+            || stats
+                .control_first
+                .control_total_ns
+                .checked_add(stats.treatment_first.control_total_ns)
+                != Some(p.paired_control_source_read_ns)
+            || stats
+                .control_first
+                .treatment_total_ns
+                .checked_add(stats.treatment_first.treatment_total_ns)
+                != Some(p.paired_treatment_source_read_ns)
+        {
+            return Err(Failure::accounting("order strata do not reconcile"));
+        }
+        stats.aggregate_slowdown_percent = (p.paired_control_source_read_ns > 0).then(|| {
+            p.aggregate_treatment_minus_control_ns as f64 / p.paired_control_source_read_ns as f64
+                * 100.0
+        });
+        Ok(stats)
+    }
+    #[derive(Default, Debug, PartialEq, Serialize)]
+    struct Statistics {
+        per_width: BTreeMap<usize, BatchStats>,
+        primary_k2_through_k8: BatchStats,
+        descriptive_all_k: BatchStats,
+        positive_multi_expert_widths: u64,
+        negative_multi_expert_widths: u64,
+        equal_multi_expert_widths: u64,
+    }
+    fn statistics(samples: &[RawSample]) -> Result<Statistics> {
+        let mut stats = Statistics::default();
+        for k in 1..=MAX_WIDTH {
+            let selected: Vec<_> = samples
+                .iter()
+                .filter(|s| s.source_set.width == k)
+                .cloned()
+                .collect();
+            let width = batch_stats(&selected)?;
+            if k >= 2 && width.paired.paired_source_read_samples > 0 {
+                add(
+                    if width.paired.aggregate_treatment_minus_control_ns > 0 {
+                        &mut stats.positive_multi_expert_widths
+                    } else if width.paired.aggregate_treatment_minus_control_ns < 0 {
+                        &mut stats.negative_multi_expert_widths
+                    } else {
+                        &mut stats.equal_multi_expert_widths
+                    },
+                    1,
+                )?;
+            }
+            stats.per_width.insert(k, width);
+        }
+        let primary: Vec<_> = samples
+            .iter()
+            .filter(|s| (2..=MAX_WIDTH).contains(&s.source_set.width))
+            .cloned()
+            .collect();
+        stats.primary_k2_through_k8 = batch_stats(&primary)?;
+        stats.descriptive_all_k = batch_stats(samples)?;
+        for (min, aggregate) in [
+            (1, &stats.descriptive_all_k),
+            (2, &stats.primary_k2_through_k8),
+        ] {
+            let mut count = 0;
+            let mut control = 0;
+            let mut treatment = 0;
+            for (_, width) in stats.per_width.range(min..) {
+                add(&mut count, width.paired.paired_source_read_samples)?;
+                add(&mut control, width.paired.paired_control_source_read_ns)?;
+                add(&mut treatment, width.paired.paired_treatment_source_read_ns)?;
+            }
+            if (count, control, treatment)
+                != (
+                    aggregate.paired.paired_source_read_samples,
+                    aggregate.paired.paired_control_source_read_ns,
+                    aggregate.paired.paired_treatment_source_read_ns,
+                )
+            {
+                return Err(Failure::accounting(
+                    "width and aggregate statistics do not reconcile",
+                ));
+            }
+        }
+        Ok(stats)
+    }
+
+    fn proof_hits_only(proof: &SourceUploadFdProofSnapshot, slots: u64) -> bool {
+        slots.checked_mul(2).is_some_and(|requests| {
+            proof.source_upload_fd_proof_requests == requests
+                && proof.source_upload_fd_proof_hits == requests
+                && proof.source_upload_fd_proof_misses == 0
+                && proof.source_upload_fd_proof_failures == 0
+        })
+    }
+    #[derive(Debug, Serialize)]
+    struct BatchArm {
+        #[serde(flatten)]
+        evidence: Arm,
+        source_sets_attempted: u64,
+        batch_helper_calls: u64,
+        completed_source_sets: Vec<SourceSet>,
+        source_schedule: ScheduleEvidence,
+    }
+    impl BatchArm {
+        fn new() -> Result<Self> {
+            Ok(Self {
+                evidence: Arm::default(),
+                source_sets_attempted: 0,
+                batch_helper_calls: 0,
+                completed_source_sets: Vec::new(),
+                source_schedule: schedule_evidence(&[])?,
+            })
+        }
+        fn successful(&self, expected: &ScheduleEvidence, treatment: bool) -> bool {
+            let a = &self.evidence;
+            let n = expected.expert_slot_count;
+            let sets = expected.source_set_count;
+            self.source_schedule == *expected
+                && schedule_evidence(&self.completed_source_sets).is_ok_and(|e| e == *expected)
+                && self.source_sets_attempted == sets
+                && self.batch_helper_calls == sets
+                && a.reconcile(treatment)
+                && a.ops_attempted == n
+                && a.source_read_attempts == n
+                && a.source_read_ops == n
+                && a.full_source_bytes == expected.source_bytes
+                && a.payload_ops == n
+                && a.upload_ops == n
+                && a.gpu_completed_ops == n
+                && a.verified_ops == n
+                && a.fd_evidence.checks == n
+                && a.fd_evidence.direct_observed == n
+                && a.fd_evidence.full_file_length_observed == n
+                && a.fd_evidence.failures == 0
+                && a.pointers.observations == n
+                && a.verification_destination_reset_ops == n
+                && a.source_failures == 0
+                && a.gpu_failures == 0
+                && a.map_failures == 0
+                && a.alignment_failures == 0
+                && a.mapped_direct_io_rejections == 0
+                && a.rejection_errno_counts.is_empty()
+                && a.pointers.gpu_offset_failures == 0
+                && if treatment {
+                    a.map_attempts == sets
+                        && a.maps_completed == sets
+                        && a.unmaps == sets
+                        && a.pointers.gpu_offset_checks == n
+                } else {
+                    a.map_attempts == 0 && a.maps_completed == 0 && a.unmaps == 0
+                }
+        }
+    }
+    #[derive(Debug, Serialize)]
+    struct BatchPhase {
+        name: &'static str,
+        schedule: Vec<SourceSet>,
+        expected: ScheduleEvidence,
+        raw_samples: Vec<RawSample>,
+        statistics: Statistics,
+        control: BatchArm,
+        treatment: BatchArm,
+        control_witnesses: Witnesses,
+        treatment_witnesses: Witnesses,
+        fd_proof: SourceUploadFdProofSnapshot,
+        fd_proof_hits_only: bool,
+        mismatch_count: u64,
+        first_mismatch: Option<Mismatch>,
+    }
+    impl BatchPhase {
+        fn new(name: &'static str, count: usize) -> Result<Self> {
+            let schedule = schedule(count)?;
+            Ok(Self {
+                name,
+                expected: schedule_evidence(&schedule)?,
+                schedule,
+                raw_samples: Vec::new(),
+                statistics: statistics(&[])?,
+                control: BatchArm::new()?,
+                treatment: BatchArm::new()?,
+                control_witnesses: Witnesses::default(),
+                treatment_witnesses: Witnesses::default(),
+                fd_proof: SourceUploadFdProofSnapshot::default(),
+                fd_proof_hits_only: false,
+                mismatch_count: 0,
+                first_mismatch: None,
+            })
+        }
+        fn mismatch(
+            &mut self,
+            set: &SourceSet,
+            id: u32,
+            kind: &'static str,
+            c: &str,
+            t: &str,
+        ) -> Result<()> {
+            if c != t {
+                add(&mut self.mismatch_count, 1)?;
+                self.first_mismatch.get_or_insert_with(|| Mismatch {
+                    phase: self.name,
+                    pair: set.set_index,
+                    expert_id: id,
+                    kind,
+                    control: c.into(),
+                    treatment: t.into(),
+                });
+            }
+            Ok(())
+        }
+        fn compare(&mut self, set: &SourceSet, c: &[Hashes], t: &[Hashes]) -> Result<()> {
+            if c.len() != set.width || t.len() != set.width {
+                return Err(Failure::accounting("batch hash count mismatch"));
+            }
+            for ((&id, c), t) in set.ordered_expert_ids.iter().zip(c).zip(t) {
+                self.mismatch(set, id, "full-source", &c.source, &t.source)?;
+                self.mismatch(set, id, "bare-payload", &c.payload, &t.payload)?;
+                self.mismatch(set, id, "control-gpu-payload", &c.payload, &c.gpu)?;
+                self.mismatch(set, id, "treatment-gpu-payload", &t.payload, &t.gpu)?;
+                self.mismatch(
+                    set,
+                    id,
+                    "control-epoch",
+                    "true",
+                    if c.epoch { "true" } else { "false" },
+                )?;
+                self.mismatch(
+                    set,
+                    id,
+                    "treatment-epoch",
+                    "true",
+                    if t.epoch { "true" } else { "false" },
+                )?;
+            }
+            Ok(())
+        }
+        fn successful(&self) -> bool {
+            let c = &self.control_witnesses;
+            let t = &self.treatment_witnesses;
+            self.fd_proof_hits_only
+                && proof_hits_only(&self.fd_proof, self.expected.expert_slot_count)
+                && schedule(self.schedule.len()).is_ok_and(|s| s == self.schedule)
+                && schedule_evidence(&self.schedule).is_ok_and(|e| e == self.expected)
+                && self.control.completed_source_sets == self.schedule
+                && self.treatment.completed_source_sets == self.schedule
+                && self.control.successful(&self.expected, false)
+                && self.treatment.successful(&self.expected, true)
+                && self.raw_samples.len() == self.schedule.len()
+                && self
+                    .raw_samples
+                    .iter()
+                    .zip(&self.schedule)
+                    .all(|(s, set)| s.source_set == *set)
+                && statistics(&self.raw_samples).is_ok_and(|s| s == self.statistics)
+                && self
+                    .statistics
+                    .descriptive_all_k
+                    .paired
+                    .paired_control_source_read_ns
+                    == self.control.evidence.times.source_direct_read_ns
+                && self
+                    .statistics
+                    .descriptive_all_k
+                    .paired
+                    .paired_treatment_source_read_ns
+                    == self.treatment.evidence.times.source_direct_read_ns
+                && self.mismatch_count == 0
+                && self.first_mismatch.is_none()
+                && c.full_source_sha256 == t.full_source_sha256
+                && c.bare_payload_sha256 == t.bare_payload_sha256
+                && c.bare_payload_sha256 == c.gpu_destination_payload_sha256
+                && c.bare_payload_sha256 == t.gpu_destination_payload_sha256
+        }
+    }
+
+    #[derive(Debug, Serialize)]
+    struct BatchAuthority {
+        #[serde(flatten)]
+        base: Authority,
+        same_batch_source_api: bool,
+        max_batch_width: usize,
+        control_arena_capacity_bytes: usize,
+        fd_preproof_completed: bool,
+        fd_cache_capacity: usize,
+        preproof_universe_size: usize,
+        preproof_ordered_expert_ids: Vec<u32>,
+        preproof: SourceUploadFdProofSnapshot,
+        after_preproof_telemetry_reset: SourceUploadFdProofSnapshot,
+        after_warmup_telemetry_reset: SourceUploadFdProofSnapshot,
+        source_timer_excludes_fd_preproof: bool,
+        source_timer_excludes_slice_setup: bool,
+    }
+    #[derive(Debug, Serialize)]
+    struct BatchReport {
+        schema: &'static str,
+        args: Args,
+        config_sha256: Option<String>,
+        complete: bool,
+        correctness_pass: bool,
+        authoritative: bool,
+        classification: String,
+        failure: Option<String>,
+        authority: BatchAuthority,
+        warmup: BatchPhase,
+        measured: BatchPhase,
+        performance_required_for_correctness: bool,
+        primary_endpoint: &'static str,
+        schedule_contract: &'static str,
+        timing_contract: &'static str,
+        interpretation_contract: &'static str,
+        retry_evidence_contract: &'static str,
+        source_byte_evidence_contract: &'static str,
+    }
+    impl BatchReport {
+        fn new(args: Args) -> Result<Self> {
+            let mut base = Report::new(args.clone()).authority;
+            base.control_source_api = B_API;
+            base.treatment_source_api = B_API;
+            base.control_destination = "aligned-host-arena";
+            base.treatment_destination = "wgpu-map-write-arena";
+            base.upload_capacity_bytes = MAPPED_ARENA;
+            Ok(Self { schema: B_SCHEMA, args, config_sha256: None, complete: false, correctness_pass: false,
+                authoritative: false, classification: "not-run".into(), failure: None,
+                authority: BatchAuthority { base, same_batch_source_api: true, max_batch_width: MAX_WIDTH,
+                    control_arena_capacity_bytes: HOST_ARENA, fd_preproof_completed: false, fd_cache_capacity: 0,
+                    preproof_universe_size: UNIVERSE_SIZE, preproof_ordered_expert_ids: expert_sequence(UNIVERSE_SIZE, NAMESPACE).map_err(Failure::accounting)?,
+                    preproof: SourceUploadFdProofSnapshot::default(), after_preproof_telemetry_reset: SourceUploadFdProofSnapshot::default(),
+                    after_warmup_telemetry_reset: SourceUploadFdProofSnapshot::default(), source_timer_excludes_fd_preproof: true, source_timer_excludes_slice_setup: true },
+                warmup: BatchPhase::new("warmup", 0)?, measured: BatchPhase::new("measured", 0)?, performance_required_for_correctness: false,
+                primary_endpoint: "K=2..8 aggregate", schedule_contract: SCHEDULE_CONTRACT, timing_contract: TIMER_CONTRACT,
+                interpretation_contract: INTERPRETATION_CONTRACT,
+                retry_evidence_contract: "No diagnostic retry or fallback. The unmodified batch helper uses read_at_with_retries and the existing breaker. Transient retry attempts are emitted by that helper to tracing logs; the existing helper exposes no exact retry counter. A successful helper result alone must not be reported as proof of zero internal retries. Source failures below count failed helper calls; preserve the run log for retry evidence.",
+                source_byte_evidence_contract: "Source bytes count exact successful FULL reads only, K*FULL per successful batch result. Partial bytes from a failed concurrent helper are unavailable, never inferred as zero physical I/O. Failure is non-authoritative. Hash streams concatenate exact full files, bare payloads and verified GPU payloads in source-set/slot order independently per arm. Destination reset, copies and readback are verification outside source timers." })
+        }
+        fn authority_valid(&self) -> bool {
+            let a = &self.authority;
+            let b = &a.base;
+            self.schema == B_SCHEMA
+                && !self.performance_required_for_correctness
+                && a.same_batch_source_api
+                && b.same_source_api
+                && b.control_source_api == B_API
+                && b.treatment_source_api == B_API
+                && b.control_destination == "aligned-host-arena"
+                && b.treatment_destination == "wgpu-map-write-arena"
+                && a.max_batch_width == MAX_WIDTH
+                && a.control_arena_capacity_bytes == HOST_ARENA
+                && b.upload_capacity_bytes == MAPPED_ARENA
+                && b.full_source_bytes == FULL
+                && b.block_alignment == ALIGN
+                && b.uth_prefix_bytes == PREFIX
+                && b.bare_payload_bytes == PAYLOAD
+                && b.physical_slot_bytes == SLOT
+                && b.source_timer_excludes_allocation
+                && b.source_timer_excludes_map_async_device_poll
+                && b.source_timer_excludes_alignment_setup
+                && b.source_timer_excludes_hashes_readback_fd_evidence
+                && b.source_timer_excludes_gpu_copy_unmap
+                && a.source_timer_excludes_fd_preproof
+                && a.source_timer_excludes_slice_setup
+                && b.linux
+                && b.expected_adapter_name == "NVIDIA L4"
+                && b.adapter_authoritative
+                && b.direct_io_requested
+                && b.packed_storage == Some(false)
+                && b.exact_geometry
+                && a.fd_preproof_completed
+                && a.fd_cache_capacity >= a.preproof_universe_size
+                && a.preproof_universe_size == UNIVERSE_SIZE
+                && expert_sequence(UNIVERSE_SIZE, NAMESPACE)
+                    .is_ok_and(|ids| ids == a.preproof_ordered_expert_ids)
+                && a.preproof.source_upload_fd_proof_requests == UNIVERSE_SIZE as u64
+                && a.preproof.source_upload_fd_proof_hits == 0
+                && a.preproof.source_upload_fd_proof_misses == UNIVERSE_SIZE as u64
+                && a.preproof.source_upload_fd_proof_failures == 0
+                && a.after_preproof_telemetry_reset == SourceUploadFdProofSnapshot::default()
+                && a.after_warmup_telemetry_reset == SourceUploadFdProofSnapshot::default()
+                && self.warmup.fd_proof_hits_only
+                && self.measured.fd_proof_hits_only
+                && proof_hits_only(
+                    &self.warmup.fd_proof,
+                    self.warmup.expected.expert_slot_count,
+                )
+                && proof_hits_only(
+                    &self.measured.fd_proof,
+                    self.measured.expected.expert_slot_count,
+                )
+        }
+        fn classify(&mut self) {
+            self.complete = true;
+            self.correctness_pass = false;
+            self.authoritative = self.authority_valid();
+            if !self.authoritative {
+                self.classification = "authority-failed".into();
+            } else if self.warmup.schedule.len() != self.args.warmup_iterations
+                || self.measured.schedule.len() != self.args.iterations
+                || self.measured.schedule.is_empty()
+                || !self.warmup.successful()
+                || !self.measured.successful()
+            {
+                self.authoritative = false;
+                self.classification = "evidence-reconciliation-failed".into();
+            } else {
+                self.correctness_pass = true;
+                self.classification = "batch-mapped-memory-discriminator-complete".into();
+            }
+        }
+        fn fail(&mut self, failure: Failure) {
+            self.complete = failure.complete;
+            self.authoritative = false;
+            self.correctness_pass = false;
+            self.classification = failure.classification.into();
+            self.failure = Some(failure.detail);
+        }
+    }
+
+    fn begin_set(storage: &NvmeStorage, set: &SourceSet, arm: &mut BatchArm) -> Result<()> {
+        add(&mut arm.source_sets_attempted, 1)?;
+        add(&mut arm.evidence.ops_attempted, set.width as u64)?;
+        for &id in &set.ordered_expert_ids {
+            fd_evidence(storage, id, &mut arm.evidence)?;
+        }
+        Ok(())
+    }
+    fn observe_slices(
+        arm: &mut BatchArm,
+        base: usize,
+        offset: usize,
+        width: usize,
+        treatment: bool,
+    ) -> Result<()> {
+        for j in 0..width {
+            let slot = offset
+                .checked_add(
+                    j.checked_mul(FULL)
+                        .ok_or_else(|| Failure::accounting("pointer slot overflow"))?,
+                )
+                .ok_or_else(|| Failure::accounting("pointer offset overflow"))?;
+            arm.evidence.pointers.observe(base, slot, FULL)?;
+            if treatment {
+                add(&mut arm.evidence.pointers.gpu_offset_checks, 1)?;
+            }
+        }
+        Ok(())
+    }
+    /// Both arms reach this single source call exactly once per set. All caller
+    /// setup precedes entry; all accounting and verification follow the timer.
+    async fn batch_source(
+        storage: &NvmeStorage,
+        set: &SourceSet,
+        destinations: &mut [&mut [u8]],
+        arm: &mut BatchArm,
+        treatment: bool,
+    ) -> Result<u64> {
+        add(&mut arm.batch_helper_calls, 1)?;
+        add(&mut arm.evidence.source_read_attempts, set.width as u64)?;
+        let ids = set.ordered_expert_ids.as_slice();
+        let start = Instant::now();
+        let read = storage
+            .read_experts_batch_into_aligned_slices(ids, destinations)
+            .await;
+        let ns = elapsed(start)?;
+        add(&mut arm.evidence.times.source_direct_read_ns, ns)?;
+        let expected = source_bytes(set.width as u64)?;
+        match read {
+            Ok(n) if u64::try_from(n).ok() == Some(expected) => {
+                add(&mut arm.evidence.source_read_ops, set.width as u64)?;
+                add(&mut arm.evidence.full_source_bytes, expected)?;
+                arm.completed_source_sets.push(set.clone());
+            }
+            Ok(n) => {
+                add(&mut arm.evidence.exact_read_length_failures, 1)?;
+                return Err(Failure::accounting(format!(
+                    "set {}: batch returned {n} bytes, expected {expected}",
+                    set.set_index
+                )));
+            }
+            Err(e) => {
+                add(&mut arm.evidence.source_failures, 1)?;
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    add(&mut arm.evidence.exact_read_length_failures, 1)?;
+                }
+                let rejected = treatment && mapped_rejection(e.raw_os_error());
+                if rejected {
+                    add(&mut arm.evidence.mapped_direct_io_rejections, 1)?;
+                    add(
+                        arm.evidence
+                            .rejection_errno_counts
+                            .entry(e.raw_os_error().unwrap())
+                            .or_default(),
+                        1,
+                    )?;
+                }
+                return Err(Failure::runtime(
+                    if rejected {
+                        "mapped-upload-direct-io-rejected"
+                    } else {
+                        "source-failed"
+                    },
+                    format!(
+                        "set {} {:?}: {e}; errno={:?}; no fallback or diagnostic retry",
+                        set.set_index,
+                        ids,
+                        e.raw_os_error()
+                    ),
+                ));
+            }
+        }
+        if ns == 0 {
+            return Err(Failure::accounting("zero source timer"));
+        }
+        Ok(ns)
+    }
+    async fn control_batch(
+        gpu: &Gpu,
+        storage: &NvmeStorage,
+        host: &mut AlignedBuffer,
+        set: &SourceSet,
+        arm: &mut BatchArm,
+        streams: &mut Streams,
+    ) -> Result<(u64, Vec<Hashes>)> {
+        begin_set(storage, set, arm)?;
+        let base = host.as_slice().as_ptr() as usize;
+        let (offset, mut destinations) = arena_slices(host.as_mut_slice(), set.width, false)
+            .map_err(|e| {
+                arm.evidence.alignment_failures += 1;
+                e
+            })?;
+        observe_slices(arm, base, offset, set.width, false)?;
+        let ns = batch_source(storage, set, &mut destinations, arm, false).await?;
+        let mut hashes = Vec::with_capacity(set.width);
+        for source in destinations {
+            let (_, mut h) = streams.source(source).map_err(Failure::authority)?;
+            note_payload(&mut arm.evidence)?;
+            prepare_destination(gpu, &mut arm.evidence)?;
+            gpu.queue
+                .write_buffer(&gpu.destination, 0, &EPOCH.to_le_bytes());
+            let mut view = gpu
+                .queue
+                .write_buffer_with(
+                    &gpu.destination,
+                    EPOCH_OFFSET as u64,
+                    NonZeroU64::new(PAYLOAD as u64).unwrap(),
+                )
+                .ok_or_else(|| {
+                    Failure::runtime(
+                        "gpu-failed",
+                        "CONTROL verification staging view unavailable",
+                    )
+                })?;
+            view.copy_from_slice(&source[PREFIX..]);
+            add(&mut arm.evidence.cpu_payload_copy_bytes, PAYLOAD as u64)?;
+            drop(view);
+            note_upload(&mut arm.evidence, false)?;
+            gpu.drain(None)?;
+            add(&mut arm.evidence.gpu_completed_ops, 1)?;
+            verify(gpu, &mut arm.evidence, &mut h, streams)?;
+            hashes.push(h);
+        }
+        gpu.check()?;
+        Ok((ns, hashes))
+    }
+    async fn treatment_batch(
+        gpu: &Gpu,
+        storage: &NvmeStorage,
+        set: &SourceSet,
+        arm: &mut BatchArm,
+        streams: &mut Streams,
+    ) -> Result<(u64, Vec<Hashes>)> {
+        begin_set(storage, set, arm)?;
+        add(&mut arm.evidence.map_attempts, 1)?;
+        let start = Instant::now();
+        let mapped = gpu.map(&gpu.upload, wgpu::MapMode::Write);
+        timed(&mut arm.evidence.times.map_wait_ns, start)?;
+        if mapped.is_err() {
+            add(&mut arm.evidence.map_failures, 1)?;
+        }
+        mapped?;
+        add(&mut arm.evidence.maps_completed, 1)?;
+        // Catch only to guarantee unmap after the view future is dropped. A
+        // panic is then propagated to the report boundary, never retried.
+        let mapped_source = std::panic::AssertUnwindSafe(async {
+            let mut view = gpu.upload.slice(..).get_mapped_range_mut();
+            let base = view.as_ptr() as usize;
+            let capacity = view.len();
+            let (offset, mut destinations) =
+                arena_slices(&mut view, set.width, true).map_err(|e| {
+                    arm.evidence.alignment_failures += 1;
+                    e
+                })?;
+            observe_slices(arm, base, offset, set.width, true)?;
+            let ns = batch_source(storage, set, &mut destinations, arm, true).await?;
+            let mut payloads = Vec::with_capacity(set.width);
+            for (j, source) in destinations.into_iter().enumerate() {
+                let (prefix, h) = streams.source(source).map_err(Failure::authority)?;
+                note_payload(&mut arm.evidence)?;
+                let source_offset = offset
+                    .checked_add(
+                        j.checked_mul(FULL)
+                            .ok_or_else(|| Failure::accounting("copy slot overflow"))?,
+                    )
+                    .ok_or_else(|| Failure::accounting("copy base overflow"))?;
+                let gpu_offset = copy_offsets(source_offset, prefix, PAYLOAD, capacity)
+                    .map_err(Failure::accounting)?;
+                payloads.push((gpu_offset, h));
+            }
+            Ok::<_, Failure>((ns, payloads))
+        })
+        .catch_unwind()
+        .await;
+        let start = Instant::now();
+        gpu.upload.unmap();
+        timed(&mut arm.evidence.times.treatment_unmap_ns, start)?;
+        add(&mut arm.evidence.unmaps, 1)?;
+        let source = match mapped_source {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        let (ns, payloads) = source?;
+        gpu.check()?;
+        let mut hashes = Vec::with_capacity(set.width);
+        for (gpu_offset, mut h) in payloads {
+            prepare_destination(gpu, &mut arm.evidence)?;
+            gpu.queue
+                .write_buffer(&gpu.destination, 0, &EPOCH.to_le_bytes());
+            let mut encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("batch-source-verification-copy"),
+                });
+            encoder.copy_buffer_to_buffer(
+                &gpu.upload,
+                gpu_offset,
+                &gpu.destination,
+                EPOCH_OFFSET as u64,
+                PAYLOAD as u64,
+            );
+            note_upload(&mut arm.evidence, true)?;
+            gpu.drain(Some(encoder.finish()))?;
+            add(&mut arm.evidence.gpu_completed_ops, 1)?;
+            verify(gpu, &mut arm.evidence, &mut h, streams)?;
+            hashes.push(h);
+        }
+        gpu.check()?;
+        Ok((ns, hashes))
+    }
+    fn note_arm_error(arm: &mut BatchArm, failure: &Failure) -> Result<()> {
+        if failure.classification == "gpu-failed" && arm.evidence.gpu_failures == 0 {
+            add(&mut arm.evidence.gpu_failures, 1)?;
+        }
+        if failure.classification == "accounting-failed" && arm.evidence.accounting_failures == 0 {
+            add(&mut arm.evidence.accounting_failures, 1)?;
+        }
+        Ok(())
+    }
+    async fn phase(
+        phase: &mut BatchPhase,
+        gpu: &Gpu,
+        storage: &NvmeStorage,
+        host: &mut AlignedBuffer,
+    ) -> Result<()> {
+        let mut c_streams = Streams::default();
+        let mut t_streams = Streams::default();
+        let result = async {
+            for set in phase.schedule.clone() {
+                let (c, t) = match set.execution_order {
+                    ExecutionOrder::ControlFirst => {
+                        let c = control_batch(
+                            gpu,
+                            storage,
+                            host,
+                            &set,
+                            &mut phase.control,
+                            &mut c_streams,
+                        )
+                        .await;
+                        if let Err(e) = &c {
+                            note_arm_error(&mut phase.control, e)?;
+                        }
+                        let c = c?;
+                        let t = treatment_batch(
+                            gpu,
+                            storage,
+                            &set,
+                            &mut phase.treatment,
+                            &mut t_streams,
+                        )
+                        .await;
+                        if let Err(e) = &t {
+                            note_arm_error(&mut phase.treatment, e)?;
+                        }
+                        (c, t?)
+                    }
+                    ExecutionOrder::TreatmentFirst => {
+                        let t = treatment_batch(
+                            gpu,
+                            storage,
+                            &set,
+                            &mut phase.treatment,
+                            &mut t_streams,
+                        )
+                        .await;
+                        if let Err(e) = &t {
+                            note_arm_error(&mut phase.treatment, e)?;
+                        }
+                        let t = t?;
+                        let c = control_batch(
+                            gpu,
+                            storage,
+                            host,
+                            &set,
+                            &mut phase.control,
+                            &mut c_streams,
+                        )
+                        .await;
+                        if let Err(e) = &c {
+                            note_arm_error(&mut phase.control, e)?;
+                        }
+                        (c?, t)
+                    }
+                };
+                phase
+                    .raw_samples
+                    .push(RawSample::new(set.clone(), c.0, t.0)?);
+                phase.compare(&set, &c.1, &t.1)?;
+                if phase.mismatch_count != 0 {
+                    return Err(Failure::runtime(
+                        "hash-parity-failed",
+                        "source/payload/GPU/epoch mismatch",
+                    ));
+                }
+            }
+            Ok(())
+        }
+        .await;
+        // The helper joins every worker before returning, including on errors.
+        // This is an idle snapshot, with no diagnostic storage shared elsewhere.
+        phase.fd_proof = storage.source_upload_fd_proof_snapshot();
+        phase.fd_proof_hits_only =
+            proof_hits_only(&phase.fd_proof, phase.expected.expert_slot_count);
+        phase.control.source_schedule = schedule_evidence(&phase.control.completed_source_sets)?;
+        phase.treatment.source_schedule =
+            schedule_evidence(&phase.treatment.completed_source_sets)?;
+        phase.control_witnesses = c_streams.snapshot();
+        phase.treatment_witnesses = t_streams.snapshot();
+        phase.statistics = statistics(&phase.raw_samples)?;
+        phase.control.evidence.rates();
+        phase.treatment.evidence.rates();
+        result?;
+        if !phase.fd_proof_hits_only {
+            return Err(Failure::authority(format!(
+                "{} proof state is not all hits: {:?}",
+                phase.name, phase.fd_proof
+            )));
+        }
+        Ok(())
+    }
+    async fn execute(report: &mut BatchReport) -> Result<()> {
+        if !(2..=MAX_ITERATIONS).contains(&report.args.iterations)
+            || report.args.warmup_iterations > MAX_ITERATIONS
+        {
+            return Err(Failure::runtime("invalid-arguments", "measured sets must be 2..=65536; warmup sets 0..=65536; FIRST counts must be explicitly frozen by reviewer"));
+        }
+        report.warmup = BatchPhase::new("warmup", report.args.warmup_iterations)?;
+        report.measured = BatchPhase::new("measured", report.args.iterations)?;
+        let bytes =
+            std::fs::read(&report.args.config).map_err(|e| Failure::runtime("config-failed", e))?;
+        report.config_sha256 = Some(sha(&bytes));
+        let text = std::str::from_utf8(&bytes).map_err(|e| Failure::runtime("config-failed", e))?;
+        let config: Config =
+            toml::from_str(text).map_err(|e| Failure::runtime("config-failed", e))?;
+        config.validate().map_err(Failure::authority)?;
+        let a = &mut report.authority;
+        a.base.direct_io_requested = !config.storage.no_direct;
+        a.base.packed_storage =
+            Some(config.storage.packed_blob.is_some() || config.storage.packed_manifest.is_some());
+        a.base.source_data_dir = Some(config.model.data_dir.clone());
+        validate_geometry(&config)?;
+        a.base.exact_geometry = true;
+        if !a.base.linux
+            || report.args.expected_adapter_name != "NVIDIA L4"
+            || !a.base.direct_io_requested
+            || a.base.packed_storage != Some(false)
+        {
+            return Err(Failure::authority("requires Linux, exact NVIDIA L4 Vulkan, O_DIRECT, unpacked full-file Qwen geometry"));
+        }
+        let storage = NvmeStorage::new(StorageConfig {
+            base_path: config.model.data_dir,
+            expert_size: FULL,
+            block_align: ALIGN,
+            use_direct_io: true,
+            num_experts_per_layer: Some(128),
+        })
+        .map_err(|e| Failure::runtime("source-failed", e))?;
+        if storage.is_packed() {
+            return Err(Failure::authority("packed storage forbidden"));
+        }
+        a.fd_cache_capacity = storage.max_open_files();
+        if a.fd_cache_capacity < a.preproof_universe_size {
+            return Err(Failure::authority(
+                "fd cache cannot retain the complete deterministic universe",
+            ));
+        }
+        let preproof = storage.preprove_source_upload_fds(&a.preproof_ordered_expert_ids);
+        a.preproof = storage.source_upload_fd_proof_snapshot();
+        preproof.map_err(|e| Failure::authority(format!("fd preproof: {e}")))?;
+        if a.preproof.source_upload_fd_proof_requests != a.preproof_universe_size as u64
+            || a.preproof.source_upload_fd_proof_misses != a.preproof_universe_size as u64
+            || a.preproof.source_upload_fd_proof_hits != 0
+            || a.preproof.source_upload_fd_proof_failures != 0
+        {
+            return Err(Failure::authority(
+                "fresh universe preproof counters do not reconcile",
+            ));
+        }
+        a.fd_preproof_completed = true;
+        storage.reset_source_upload_fd_proof_telemetry();
+        a.after_preproof_telemetry_reset = storage.source_upload_fd_proof_snapshot();
+        if a.after_preproof_telemetry_reset != SourceUploadFdProofSnapshot::default() {
+            return Err(Failure::authority("preproof telemetry reset failed"));
+        }
+        let gpu = Gpu::with_upload_capacity(&mut a.base, MAPPED_ARENA).await?;
+        let mut host = AlignedBuffer::new(HOST_ARENA, ALIGN);
+        phase(&mut report.warmup, &gpu, &storage, &mut host).await?;
+        if !report.warmup.successful() {
+            return Err(Failure::authority("warmup evidence did not reconcile"));
+        }
+        storage.reset_source_upload_fd_proof_telemetry();
+        report.authority.after_warmup_telemetry_reset = storage.source_upload_fd_proof_snapshot();
+        if report.authority.after_warmup_telemetry_reset != SourceUploadFdProofSnapshot::default() {
+            return Err(Failure::authority("warmup telemetry reset failed"));
+        }
+        phase(&mut report.measured, &gpu, &storage, &mut host).await?;
+        gpu.check()?;
+        report.classify();
+        Ok(())
+    }
+    pub(super) async fn run_command(
+        args: Args,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&args.report_out)?;
+        let mut report = BatchReport::new(args).map_err(|e| io::Error::other(e.detail))?;
+        match std::panic::AssertUnwindSafe(execute(&mut report))
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => report.fail(e),
+            Err(p) => {
+                let detail = p
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "non-string panic".into());
+                report.fail(Failure::runtime(
+                    "runtime-failed",
+                    format!("B diagnostic panic: {detail}"),
+                ));
+            }
+        }
+        serde_json::to_writer_pretty(&mut output, &report)?;
+        output.write_all(b"\n")?;
+        output.sync_all()?;
+        if report.complete {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "{}: {}",
+                report.classification,
+                report.failure.as_deref().unwrap_or("incomplete")
+            ))
+            .into())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn args() -> Args {
+            Args {
+                config: "unused.toml".into(),
+                expected_adapter_name: "NVIDIA L4".into(),
+                warmup_iterations: 8,
+                iterations: 128,
+                report_out: "unused.json".into(),
+            }
+        }
+        fn fixture_phase(name: &'static str, count: usize, treatment_ns: u64) -> BatchPhase {
+            let mut p = BatchPhase::new(name, count).unwrap();
+            p.raw_samples = p
+                .schedule
+                .iter()
+                .cloned()
+                .map(|s| RawSample::new(s, 1000, treatment_ns).unwrap())
+                .collect();
+            p.statistics = statistics(&p.raw_samples).unwrap();
+            let n = p.expected.expert_slot_count;
+            let sets = p.expected.source_set_count;
+            for (t, arm) in [(false, &mut p.control), (true, &mut p.treatment)] {
+                arm.source_sets_attempted = sets;
+                arm.batch_helper_calls = sets;
+                arm.completed_source_sets = p.schedule.clone();
+                arm.source_schedule = p.expected.clone();
+                let a = &mut arm.evidence;
+                a.ops_attempted = n;
+                a.source_read_attempts = n;
+                a.source_read_ops = n;
+                a.full_source_bytes = n * FULL as u64;
+                a.payload_ops = n;
+                a.payload_bytes = n * PAYLOAD as u64;
+                a.upload_ops = n;
+                a.gpu_copied_bytes = n * PAYLOAD as u64;
+                a.epoch_bytes = n * 4;
+                a.gpu_completed_ops = n;
+                a.verified_ops = n;
+                a.verification_readback_bytes = n * SLOT as u64;
+                a.verification_destination_reset_ops = n;
+                a.verification_destination_reset_bytes = n * SLOT as u64;
+                a.pointers.observations = n;
+                a.pointers.aligned = n;
+                a.fd_evidence = FdEvidence {
+                    checks: n,
+                    direct_observed: n,
+                    full_file_length_observed: n,
+                    ..FdEvidence::default()
+                };
+                a.times.source_direct_read_ns = sets * if t { treatment_ns } else { 1000 };
+                if t {
+                    a.map_attempts = sets;
+                    a.maps_completed = sets;
+                    a.unmaps = sets;
+                    a.pointers.gpu_offset_checks = n;
+                    a.explicit_copy_buffer_bytes = n * PAYLOAD as u64;
+                } else {
+                    a.cpu_payload_copy_bytes = n * PAYLOAD as u64;
+                }
+            }
+            p.control_witnesses = Witnesses {
+                full_source_sha256: sha(b"source"),
+                bare_payload_sha256: sha(b"payload"),
+                gpu_destination_payload_sha256: sha(b"payload"),
+            };
+            p.treatment_witnesses = Witnesses {
+                full_source_sha256: sha(b"source"),
+                bare_payload_sha256: sha(b"payload"),
+                gpu_destination_payload_sha256: sha(b"payload"),
+            };
+            p.fd_proof = SourceUploadFdProofSnapshot {
+                source_upload_fd_proof_requests: n * 2,
+                source_upload_fd_proof_hits: n * 2,
+                ..SourceUploadFdProofSnapshot::default()
+            };
+            p.fd_proof_hits_only = true;
+            assert!(p.successful());
+            p
+        }
+        fn fixture(treatment_ns: u64) -> BatchReport {
+            let mut r = BatchReport::new(args()).unwrap();
+            let a = &mut r.authority;
+            a.base.linux = true;
+            a.base.adapter_authoritative = true;
+            a.base.direct_io_requested = true;
+            a.base.packed_storage = Some(false);
+            a.base.exact_geometry = true;
+            a.fd_cache_capacity = 256;
+            a.fd_preproof_completed = true;
+            a.preproof = SourceUploadFdProofSnapshot {
+                source_upload_fd_proof_requests: 128,
+                source_upload_fd_proof_misses: 128,
+                ..SourceUploadFdProofSnapshot::default()
+            };
+            r.warmup = fixture_phase("warmup", 8, 1000);
+            r.measured = fixture_phase("measured", 128, treatment_ns);
+            r
+        }
+        #[test]
+        fn source_to_upload_copy_elision_b_schedule_and_hashes_pinned() {
+            let s = schedule(128).unwrap();
+            let first = vec![
+                vec![0],
+                vec![822, 1451],
+                vec![1644, 2273, 2902],
+                vec![2466, 3095, 3724, 4353],
+                vec![3289, 3917, 4546, 5175, 5804],
+                vec![4111, 4740, 5369, 5997, 435, 1064],
+                vec![4933, 5562, 0, 628, 1257, 1886, 2515],
+                vec![5756, 193, 822, 1451, 2079, 2708, 3337, 3966],
+                vec![386],
+            ];
+            assert_eq!(
+                s[..9]
+                    .iter()
+                    .map(|s| s.ordered_expert_ids.clone())
+                    .collect::<Vec<_>>(),
+                first
+            );
+            assert_eq!(
+                s[127].ordered_expert_ids,
+                vec![5369, 5997, 435, 1064, 1692, 2321, 2950, 3579]
+            );
+            let e = schedule_evidence(&s).unwrap();
+            assert_eq!(
+                (e.source_set_count, e.expert_slot_count, e.source_bytes),
+                (128, 576, 1_531_183_104)
+            );
+            assert_eq!(
+                e.ordered_source_set_ids_sha256,
+                "e916156e4e83f0b34f2e66cf106dc3cf80ad42ca59dd6945ea79edd245f14321"
+            );
+            assert_eq!(
+                e.ordered_width_sha256,
+                "2a4d07514866ea5a3d597284e6c2799e60a5726bf1704c0ce80058a66dfcfecc"
+            );
+            assert_eq!(e.width_histogram, (1..=8).map(|k| (k, 16)).collect());
+            assert_eq!(s, schedule(128).unwrap());
+            for k in 1..=8 {
+                for order in [ExecutionOrder::ControlFirst, ExecutionOrder::TreatmentFirst] {
+                    assert_eq!(
+                        s.iter()
+                            .filter(|s| s.width == k && s.execution_order == order)
+                            .count(),
+                        8
+                    );
+                }
+            }
+            let all = schedule(MAX_ITERATIONS).unwrap();
+            for (p, s) in all.iter().enumerate() {
+                assert_eq!((s.set_index, s.round, s.width), (p, p / 8, p % 8 + 1));
+                assert_eq!(
+                    s.ordered_expert_ids
+                        .iter()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                        .len(),
+                    s.width
+                );
+                assert!(s.ordered_expert_ids.iter().all(|id| *id < NAMESPACE));
+            }
+            let mut reordered = s.clone();
+            reordered.swap(0, 1);
+            assert_ne!(schedule_evidence(&reordered).unwrap(), e);
+            let mut ids_reversed = s;
+            ids_reversed[7].ordered_expert_ids.reverse();
+            assert_ne!(
+                schedule_evidence(&ids_reversed)
+                    .unwrap()
+                    .ordered_source_set_ids_sha256,
+                e.ordered_source_set_ids_sha256
+            );
+            assert_eq!(
+                schedule_evidence(&schedule(8).unwrap())
+                    .unwrap()
+                    .expert_slot_count,
+                36
+            );
+            assert!(schedule(MAX_ITERATIONS + 1).is_err());
+        }
+        #[test]
+        fn source_to_upload_copy_elision_b_arenas_exact_nonoverlapping_checked() {
+            assert_eq!(HOST_ARENA, 21_266_432);
+            assert_eq!(MAPPED_ARENA, 21_270_528);
+            let mut host = AlignedBuffer::new(HOST_ARENA, ALIGN);
+            let address = host.as_slice().as_ptr() as usize;
+            assert_eq!(address % ALIGN, 0);
+            for k in 1..=8 {
+                let (offset, mut slices) = arena_slices(host.as_mut_slice(), k, false).unwrap();
+                assert_eq!(offset, 0);
+                assert_eq!(slices.len(), k);
+                for (j, s) in slices.iter_mut().enumerate() {
+                    assert_eq!(s.len(), FULL);
+                    assert_eq!(s.as_ptr() as usize, address + j * FULL);
+                    s[0] = j as u8;
+                }
+            }
+            // Model every address residue, including WGPU copy misalignment.
+            for residue in 0..ALIGN {
+                for width in 1..=8 {
+                    let offset = arena_offset(ALIGN * 16 + residue, MAPPED_ARENA, width, true);
+                    if residue % 4 == 0 {
+                        let offset = offset.unwrap();
+                        assert_eq!((residue + offset) % ALIGN, 0);
+                        assert!(offset + 8 * FULL <= MAPPED_ARENA);
+                    } else {
+                        assert!(offset.is_err());
+                    }
+                }
+            }
+            // Exercise real safe mutable slices into a simulated mapped arena.
+            let mut backing = AlignedBuffer::new(MAPPED_ARENA + ALIGN, ALIGN);
+            let start = 8;
+            let base = backing.as_slice().as_ptr() as usize + start;
+            let (offset, slices) = arena_slices(
+                &mut backing.as_mut_slice()[start..start + MAPPED_ARENA],
+                8,
+                true,
+            )
+            .unwrap();
+            assert_eq!(offset, 4088);
+            for (j, s) in slices.into_iter().enumerate() {
+                assert_eq!(s.as_ptr() as usize, base + offset + j * FULL);
+                assert_eq!(s.len(), FULL);
+                s.fill(j as u8);
+            }
+            assert!(backing.as_slice()[..ALIGN].iter().all(|b| *b == 0));
+            assert!(backing.as_slice()[ALIGN + HOST_ARENA..]
+                .iter()
+                .all(|b| *b == 0));
+            for (base, capacity, width, t) in [
+                (0, MAPPED_ARENA, 8, true),
+                (usize::MAX, MAPPED_ARENA, 8, true),
+                (ALIGN, MAPPED_ARENA - 1, 8, true),
+                (ALIGN, MAPPED_ARENA, 0, true),
+                (ALIGN, MAPPED_ARENA, 9, true),
+                (ALIGN + 4, HOST_ARENA, 8, false),
+            ] {
+                assert!(arena_offset(base, capacity, width, t).is_err());
+            }
+        }
+        #[test]
+        fn source_to_upload_copy_elision_b_stats_and_primary_reconcile() {
+            let r = fixture(1029);
+            let s = &r.measured.statistics;
+            assert_eq!(
+                s.primary_k2_through_k8.paired.paired_source_read_samples,
+                112
+            );
+            assert_eq!(s.primary_k2_through_k8.control_first.samples, 56);
+            assert_eq!(s.primary_k2_through_k8.treatment_first.samples, 56);
+            assert_eq!(
+                s.primary_k2_through_k8.paired.paired_control_source_read_ns,
+                112_000
+            );
+            assert_eq!(
+                s.primary_k2_through_k8
+                    .paired
+                    .paired_treatment_source_read_ns,
+                115_248
+            );
+            assert_eq!(s.primary_k2_through_k8.paired.treatment_slower_pairs, 112);
+            assert_eq!(
+                s.primary_k2_through_k8.aggregate_slowdown_percent,
+                Some(3248.0 / 112000.0 * 100.0)
+            );
+            assert!(s.primary_k2_through_k8.aggregate_slowdown_percent.unwrap() < 3.0);
+            assert_eq!(s.positive_multi_expert_widths, 7);
+            for k in 1..=8 {
+                let w = &s.per_width[&k];
+                assert_eq!(w.paired.paired_source_read_samples, 16);
+                assert_eq!((w.control_first.samples, w.treatment_first.samples), (8, 8));
+                assert_eq!(w.paired.mean_treatment_minus_control_ns, Some(29.0));
+                assert_eq!(w.paired.median_treatment_minus_control_ns, Some(29.0));
+                assert_eq!(w.paired.median_treatment_over_control_ratio, Some(1.029));
+            }
+            let mut samples = r.measured.raw_samples.clone();
+            for s in &mut samples {
+                if s.source_set.width == 1 {
+                    *s = RawSample::new(s.source_set.clone(), 1, 999999).unwrap();
+                }
+            }
+            assert_eq!(
+                statistics(&samples).unwrap().primary_k2_through_k8,
+                s.primary_k2_through_k8
+            );
+            let mut s = schedule(3)
+                .unwrap()
+                .into_iter()
+                .zip([(10, 9), (10, 10), (10, 12)])
+                .map(|(s, (c, t))| RawSample::new(s, c, t).unwrap())
+                .collect::<Vec<_>>();
+            let stats = batch_stats(&s).unwrap();
+            assert_eq!(
+                (
+                    stats.paired.treatment_slower_pairs,
+                    stats.paired.treatment_faster_pairs,
+                    stats.paired.equal_pairs
+                ),
+                (1, 1, 1)
+            );
+            assert_eq!(stats.paired.median_treatment_minus_control_ns, Some(0.0));
+            s.reverse();
+            assert_eq!(batch_stats(&s).unwrap(), stats);
+        }
+        #[test]
+        fn source_to_upload_copy_elision_b_schema_correctness_independent_of_performance() {
+            for t in [1, 970, 990, 1000, 1010, 1029, 1030, 1050, 10000] {
+                let mut r = fixture(t);
+                r.classify();
+                assert!(r.complete && r.correctness_pass && r.authoritative);
+                let j = serde_json::to_value(&r).unwrap();
+                assert_eq!(j["schema"], B_SCHEMA);
+                assert_ne!(B_SCHEMA, SCHEMA);
+                assert_eq!(j["performance_required_for_correctness"], false);
+                let a = &j["authority"];
+                assert_eq!(a["same_batch_source_api"], true);
+                assert_eq!(a["control_source_api"], B_API);
+                assert_eq!(a["treatment_source_api"], B_API);
+                assert_eq!(a["control_destination"], "aligned-host-arena");
+                assert_eq!(a["treatment_destination"], "wgpu-map-write-arena");
+                let sample = &j["measured"]["raw_samples"][8];
+                for key in [
+                    "set_index",
+                    "round",
+                    "width",
+                    "ordered_expert_ids",
+                    "execution_order",
+                    "control_ns",
+                    "treatment_ns",
+                    "delta_ns",
+                ] {
+                    assert!(sample.get(key).is_some(), "{key}");
+                }
+                assert_eq!(sample["execution_order"], "TREATMENT-then-CONTROL");
+                assert!(r
+                    .interpretation_contract
+                    .contains("Do not round a sub-3% result upward"));
+            }
+            let mut r = fixture(1000);
+            r.args.warmup_iterations = 0;
+            r.args.iterations = 19;
+            r.warmup = fixture_phase("warmup", 0, 1000);
+            r.measured = fixture_phase("measured", 19, 1050);
+            r.classify();
+            assert!(r.correctness_pass); // FIRST counts are not a correctness predicate.
+        }
+        #[test]
+        fn source_to_upload_copy_elision_b_proof_miss_and_evidence_tamper_fail_closed() {
+            let mutations: Vec<fn(&mut BatchReport)> = vec![
+                |r| r.authority.fd_preproof_completed = false,
+                |r| r.authority.fd_cache_capacity = 127,
+                |r| r.authority.preproof.source_upload_fd_proof_failures = 1,
+                |r| {
+                    r.authority
+                        .after_preproof_telemetry_reset
+                        .source_upload_fd_proof_requests = 1
+                },
+                |r| {
+                    r.authority
+                        .after_warmup_telemetry_reset
+                        .source_upload_fd_proof_requests = 1
+                },
+                |r| r.authority.preproof_ordered_expert_ids[0] = 1,
+                |r| r.authority.same_batch_source_api = false,
+                |r| r.authority.base.control_source_api = SOURCE_API,
+                |r| r.authority.base.treatment_source_api = SOURCE_API,
+                |r| r.authority.base.control_destination = "pool",
+                |r| r.authority.max_batch_width = 7,
+                |r| r.authority.source_timer_excludes_fd_preproof = false,
+                |r| r.authority.source_timer_excludes_slice_setup = false,
+                |r| r.measured.fd_proof.source_upload_fd_proof_misses = 1,
+                |r| r.measured.fd_proof.source_upload_fd_proof_failures = 1,
+                |r| r.measured.fd_proof.source_upload_fd_proof_hits -= 1,
+                |r| r.warmup.fd_proof.source_upload_fd_proof_misses = 1,
+                |r| r.measured.control.batch_helper_calls += 1,
+                |r| r.measured.treatment.evidence.source_read_ops -= 1,
+                |r| r.measured.control.source_schedule.source_bytes -= 1,
+                |r| r.measured.control.source_schedule.expert_slot_count -= 1,
+                |r| r.measured.treatment.source_schedule.ordered_width_sha256 = "bad".into(),
+                |r| r.measured.control.evidence.fd_evidence.direct_observed -= 1,
+                |r| r.measured.treatment.evidence.pointers.aligned -= 1,
+                |r| r.measured.treatment.evidence.unmaps -= 1,
+                |r| r.measured.treatment.evidence.source_failures = 1,
+                |r| r.measured.treatment.evidence.fallback_reads = 1,
+                |r| r.measured.treatment.evidence.mapped_direct_io_rejections = 1,
+                |r| r.measured.treatment.evidence.gpu_failures = 1,
+                |r| r.measured.treatment.evidence.map_failures = 1,
+                |r| r.measured.treatment.evidence.cpu_payload_copy_bytes = 1,
+                |r| r.measured.treatment_witnesses.full_source_sha256 = "bad".into(),
+                |r| r.measured.mismatch_count = 1,
+                |r| {
+                    r.measured.raw_samples[0].source_set.execution_order =
+                        ExecutionOrder::TreatmentFirst
+                },
+                |r| r.measured.raw_samples[0].delta_ns = 1,
+                |r| r.measured.raw_samples.swap(0, 1),
+                |r| {
+                    r.measured
+                        .statistics
+                        .per_width
+                        .get_mut(&2)
+                        .unwrap()
+                        .paired
+                        .paired_control_source_read_ns += 1
+                },
+                |r| {
+                    r.measured
+                        .statistics
+                        .primary_k2_through_k8
+                        .paired
+                        .equal_pairs += 1
+                },
+                |r| {
+                    r.measured
+                        .statistics
+                        .descriptive_all_k
+                        .control_first
+                        .samples += 1
+                },
+            ];
+            for (i, mutate) in mutations.into_iter().enumerate() {
+                let mut r = fixture(1000);
+                mutate(&mut r);
+                r.classify();
+                assert!(!r.correctness_pass && !r.authoritative, "mutation {i}");
+            }
+            assert!(!proof_hits_only(
+                &SourceUploadFdProofSnapshot::default(),
+                u64::MAX
+            ));
+        }
+        #[test]
+        fn source_to_upload_copy_elision_b_overflow_zero_and_invalid_schedules() {
+            assert!(source_bytes(u64::MAX).is_err());
+            let set = schedule(1).unwrap().remove(0);
+            assert!(RawSample::new(set.clone(), 0, 1).is_err());
+            assert!(RawSample::new(set.clone(), 1, 0).is_err());
+            for (c, t) in [(u64::MAX, 1), (1, u64::MAX)] {
+                let s = RawSample::new(set.clone(), c, t).unwrap();
+                assert!(batch_stats(&[s.clone(), s]).is_err());
+            }
+            let mut s = RawSample::new(set.clone(), 1, 2).unwrap();
+            s.delta_ns = 0;
+            assert!(batch_stats(&[s]).is_err());
+            let mut bad = set;
+            bad.width = 2;
+            bad.ordered_expert_ids = vec![0, 0];
+            assert!(schedule_evidence(&[bad.clone()]).is_err());
+            bad.ordered_expert_ids = vec![0, NAMESPACE];
+            assert!(schedule_evidence(&[bad]).is_err());
+        }
+        #[test]
+        fn source_to_upload_copy_elision_b_one_batch_call_and_timer_scope() {
+            let whole = include_str!("gpu_native_source_to_upload_copy_elision.rs");
+            let b = whole
+                .split("mod hma1c_b {")
+                .nth(1)
+                .unwrap()
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap();
+            assert_eq!(
+                b.matches(".read_experts_batch_into_aligned_slices(")
+                    .count(),
+                1
+            );
+            assert!(!b.contains(".read_expert("));
+            assert!(!b.contains(".read_expert_into_aligned_slice("));
+            let source = b
+                .split("async fn batch_source(")
+                .nth(1)
+                .unwrap()
+                .split("async fn control_batch(")
+                .next()
+                .unwrap();
+            let timed = source
+                .split("let start = Instant::now();")
+                .nth(1)
+                .unwrap()
+                .split("let ns = elapsed(start)?;")
+                .next()
+                .unwrap();
+            let compact: String = timed.split_whitespace().collect();
+            assert_eq!(
+                compact,
+                "letread=storage.read_experts_batch_into_aligned_slices(ids,destinations).await;"
+            );
+            let control = b
+                .split("async fn control_batch(")
+                .nth(1)
+                .unwrap()
+                .split("async fn treatment_batch(")
+                .next()
+                .unwrap();
+            let treatment = b
+                .split("async fn treatment_batch(")
+                .nth(1)
+                .unwrap()
+                .split("fn note_arm_error(")
+                .next()
+                .unwrap();
+            for arm in [control, treatment] {
+                assert_eq!(arm.matches("batch_source(").count(), 1);
+                assert!(arm.find("arena_slices(").unwrap() < arm.find("batch_source(").unwrap());
+                assert!(arm.find("batch_source(").unwrap() < arm.find("streams.source(").unwrap());
+                assert!(arm.find("batch_source(").unwrap() < arm.find("verify(").unwrap());
+            }
+            assert!(treatment.find("gpu.map(").unwrap() < treatment.find("batch_source(").unwrap());
+            assert!(
+                treatment.find("get_mapped_range_mut()").unwrap()
+                    < treatment.find("batch_source(").unwrap()
+            );
+            assert!(
+                treatment.find("batch_source(").unwrap()
+                    < treatment.find("gpu.upload.unmap()").unwrap()
+            );
+            assert!(
+                treatment.find("gpu.upload.unmap()").unwrap()
+                    < treatment.find("encoder.copy_buffer_to_buffer(").unwrap()
+            );
+            let run = b
+                .split("async fn phase(")
+                .nth(1)
+                .unwrap()
+                .split("async fn execute(")
+                .next()
+                .unwrap();
+            assert!(run.contains("match set.execution_order"));
+            assert!(!run.contains("% 2"));
+            let first = run
+                .split("ExecutionOrder::ControlFirst =>")
+                .nth(1)
+                .unwrap()
+                .split("ExecutionOrder::TreatmentFirst =>")
+                .next()
+                .unwrap();
+            assert!(
+                first.find("control_batch(").unwrap() < first.find("treatment_batch(").unwrap()
+            );
+            let second = run
+                .split("ExecutionOrder::TreatmentFirst =>")
+                .nth(1)
+                .unwrap();
+            assert!(
+                second.find("treatment_batch(").unwrap() < second.find("control_batch(").unwrap()
+            );
+            let exec_raw = b.split("async fn execute(").nth(1).unwrap();
+            let exec: String = exec_raw.split_whitespace().collect();
+            assert_eq!(exec.matches("AlignedBuffer::new(").count(), 1);
+            assert_eq!(exec.matches("Gpu::with_upload_capacity(").count(), 1);
+            assert!(
+                exec.find("preprove_source_upload_fds(").unwrap()
+                    < exec.find("phase(&mutreport.warmup").unwrap()
+            );
+            assert_eq!(
+                exec.matches("reset_source_upload_fd_proof_telemetry()")
+                    .count(),
+                2
+            );
+            assert!(
+                exec.find("AlignedBuffer::new(").unwrap()
+                    < exec.find("phase(&mutreport.warmup").unwrap()
+            );
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn source_to_upload_copy_elision_b_runner_preserves_report_without_gpu() {
+            let dir = std::env::temp_dir().join(format!(
+                "mer-hma1cb-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut a = args();
+            a.config = dir.join("missing.toml");
+            a.report_out = dir.join("report.json");
+            assert!(run_command(a.clone()).await.is_err());
+            let bytes = std::fs::read(&a.report_out).unwrap();
+            let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(j["schema"], B_SCHEMA);
+            assert_eq!(j["classification"], "config-failed");
+            assert_eq!(j["correctness_pass"], false);
+            assert_eq!(j["measured"]["expected"]["expert_slot_count"], 576);
+            assert!(run_command(a.clone()).await.is_err());
+            assert_eq!(std::fs::read(&a.report_out).unwrap(), bytes);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

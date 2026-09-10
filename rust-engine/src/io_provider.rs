@@ -1297,6 +1297,17 @@ impl NvmeStorage {
         c.failures.store(0, Ordering::Relaxed);
     }
 
+    /// Diagnostic idle-boundary preproof only: no source data read. Callers
+    /// must retain enough fd-cache capacity for their complete ID universe.
+    /// The normal batch helper still performs every normal proof lookup.
+    pub(crate) fn preprove_source_upload_fds(&self, ids: &[u32]) -> io::Result<()> {
+        for &id in ids {
+            let file = self.fd_for(id)?;
+            self.prove_source_upload_fd(id, &file)?;
+        }
+        Ok(())
+    }
+
     fn prove_source_upload_fd(&self, id: u32, file: &Arc<File>) -> io::Result<()> {
         self.prove_source_upload_fd_with(id, file, |file| {
             #[cfg(target_os = "linux")]
@@ -3890,6 +3901,80 @@ mod source_to_upload_tests {
             io::ErrorKind::InvalidInput
         );
         proof_counts(&s, 3, 1, 2, 1);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn source_to_upload_copy_elision_b_preproof_has_no_source_read() {
+        let source = include_str!("io_provider.rs");
+        let body = source
+            .split("pub(crate) fn preprove_source_upload_fds(")
+            .nth(1)
+            .unwrap()
+            .split("fn prove_source_upload_fd(")
+            .next()
+            .unwrap();
+        let compact: String = body.split_whitespace().collect();
+        assert_eq!(compact, "&self,ids:&[u32])->io::Result<()>{for&idinids{letfile=self.fd_for(id)?;self.prove_source_upload_fd(id,&file)?;}Ok(())}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_to_upload_copy_elision_b_preproof_reset_retains_ids_and_batch_hits() {
+        let path = directory();
+        let full = 2_658_304;
+        let s = NvmeStorage::new(StorageConfig {
+            base_path: path.clone(),
+            expert_size: full,
+            block_align: 4096,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        })
+        .unwrap()
+        .with_max_open_files(8);
+        let ids: Vec<u32> = (0..8).collect();
+        let mut files = Vec::new();
+        // Portable fixture injects only the existing proof operation. This is
+        // not Linux O_DIRECT authority; actual helper/scheduler and bytes run.
+        for &id in &ids {
+            std::fs::write(path.join(format!("expert_{id}.bin")), vec![id as u8; full]).unwrap();
+            let file = s.fd_for(id).unwrap();
+            s.prove_source_upload_fd_with(id, &file, |file| {
+                validate_source_upload_fd(full as u64, || Ok(true), || Ok(file.metadata()?.len()))
+            })
+            .unwrap();
+            files.push(file);
+        }
+        s.reset_source_upload_fd_proof_telemetry();
+        s.preprove_source_upload_fds(&ids).unwrap();
+        proof_counts(&s, 8, 8, 0, 0);
+        assert!(s.breakers.read().is_empty());
+        s.reset_source_upload_fd_proof_telemetry();
+        proof_counts(&s, 0, 0, 0, 0);
+        let mut host = AlignedBuffer::new(full * 8, 4096);
+        for _phase in 0..2 {
+            for k in 1..=8 {
+                for _arm in 0..2 {
+                    let mut destinations: Vec<_> = host.as_mut_slice()[..k * full]
+                        .chunks_exact_mut(full)
+                        .collect();
+                    assert_eq!(
+                        s.read_experts_batch_into_aligned_slices(&ids[..k], &mut destinations)
+                            .await
+                            .unwrap(),
+                        k * full
+                    );
+                    for (j, dst) in destinations.iter().enumerate() {
+                        assert!(dst.iter().all(|b| *b == j as u8));
+                    }
+                }
+            }
+            proof_counts(&s, 72, 72, 0, 0);
+            for (&id, file) in ids.iter().zip(&files) {
+                assert!(Arc::ptr_eq(file, &s.fd_for(id).unwrap()));
+            }
+            s.reset_source_upload_fd_proof_telemetry();
+            proof_counts(&s, 0, 0, 0, 0);
+        }
         std::fs::remove_dir_all(path).unwrap();
     }
 }
