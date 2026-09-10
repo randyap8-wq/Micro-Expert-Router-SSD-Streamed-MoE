@@ -16,7 +16,8 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const SCHEMA: &str = "mer.gpu-native-source-to-upload-copy-elision-feasibility.v1";
+const SCHEMA: &str = "mer.gpu-native-mapped-memory-odirect-discriminator.v1";
+const SOURCE_API: &str = "read_expert_into_aligned_slice";
 const FULL: usize = 2_658_304;
 const ALIGN: usize = 4096;
 const PREFIX: usize = 4096;
@@ -410,6 +411,112 @@ struct Mismatch {
     control: String,
     treatment: String,
 }
+/// Raw source durations are captured outside both arm calls, in pair order.
+#[derive(Clone, Debug, Serialize)]
+struct SourceReadPair {
+    pair: usize,
+    expert_id: u32,
+    control_ns: u64,
+    treatment_ns: u64,
+}
+
+#[derive(Default, Debug, PartialEq, Serialize)]
+struct PairStats {
+    paired_source_read_samples: u64,
+    treatment_slower_pairs: u64,
+    treatment_faster_pairs: u64,
+    equal_pairs: u64,
+    paired_control_source_read_ns: u64,
+    paired_treatment_source_read_ns: u64,
+    aggregate_treatment_minus_control_ns: i128,
+    mean_treatment_minus_control_ns: Option<f64>,
+    median_treatment_minus_control_ns: Option<f64>,
+    median_treatment_over_control_ratio: Option<f64>,
+}
+
+fn source_duration(before: u64, after: u64) -> Result<u64> {
+    after
+        .checked_sub(before)
+        .filter(|n| *n > 0)
+        .ok_or_else(|| Failure::accounting("source duration underflow or zero"))
+}
+
+fn pair_stats(samples: &[SourceReadPair]) -> Result<PairStats> {
+    if samples.len() > MAX_ITERATIONS {
+        return Err(Failure::accounting("paired sample limit exceeded"));
+    }
+    let mut stats = PairStats::default();
+    let mut deltas = Vec::with_capacity(samples.len());
+    for sample in samples {
+        if sample.control_ns == 0 || sample.treatment_ns == 0 {
+            return Err(Failure::accounting("zero paired source duration"));
+        }
+        let delta = i128::from(sample.treatment_ns)
+            .checked_sub(i128::from(sample.control_ns))
+            .ok_or_else(|| Failure::accounting("paired delta overflow"))?;
+        stats.aggregate_treatment_minus_control_ns = stats
+            .aggregate_treatment_minus_control_ns
+            .checked_add(delta)
+            .ok_or_else(|| Failure::accounting("paired aggregate overflow"))?;
+        add(&mut stats.paired_source_read_samples, 1)?;
+        add(&mut stats.paired_control_source_read_ns, sample.control_ns)?;
+        add(
+            &mut stats.paired_treatment_source_read_ns,
+            sample.treatment_ns,
+        )?;
+        add(
+            if delta > 0 {
+                &mut stats.treatment_slower_pairs
+            } else if delta < 0 {
+                &mut stats.treatment_faster_pairs
+            } else {
+                &mut stats.equal_pairs
+            },
+            1,
+        )?;
+        deltas.push(delta);
+    }
+    if stats
+        .treatment_slower_pairs
+        .checked_add(stats.treatment_faster_pairs)
+        .and_then(|n| n.checked_add(stats.equal_pairs))
+        != Some(stats.paired_source_read_samples)
+        || i128::from(stats.paired_treatment_source_read_ns)
+            .checked_sub(i128::from(stats.paired_control_source_read_ns))
+            != Some(stats.aggregate_treatment_minus_control_ns)
+    {
+        return Err(Failure::accounting("paired counters do not reconcile"));
+    }
+    if samples.is_empty() {
+        return Ok(stats);
+    }
+    stats.mean_treatment_minus_control_ns = Some(
+        stats.aggregate_treatment_minus_control_ns as f64 / stats.paired_source_read_samples as f64,
+    );
+    deltas.sort_unstable();
+    let hi = samples.len() / 2;
+    let lo = (samples.len() - 1) / 2;
+    // For odd counts lo==hi; doubling and halving yields the middle value.
+    stats.median_treatment_minus_control_ns = Some(
+        deltas[lo]
+            .checked_add(deltas[hi])
+            .ok_or_else(|| Failure::accounting("paired median overflow"))? as f64
+            / 2.0,
+    );
+    let mut ratios: Vec<_> = samples.iter().collect();
+    ratios.sort_unstable_by(|a, b| {
+        // A product of two u64 values fits u128 exactly, including u64::MAX.
+        (u128::from(a.treatment_ns) * u128::from(b.control_ns))
+            .cmp(&(u128::from(b.treatment_ns) * u128::from(a.control_ns)))
+            // Equal fractions can round differently when large integer operands
+            // convert to f64. Canonicalize their representation before selection.
+            .then_with(|| a.control_ns.cmp(&b.control_ns))
+    });
+    let ratio = |i: usize| ratios[i].treatment_ns as f64 / ratios[i].control_ns as f64;
+    stats.median_treatment_over_control_ratio = Some(ratio(lo) / 2.0 + ratio(hi) / 2.0);
+    Ok(stats)
+}
+
 #[derive(Debug, Serialize)]
 struct Phase {
     name: &'static str,
@@ -418,6 +525,10 @@ struct Phase {
     attempted_expert_id_sequence_sha256: String,
     pairs_attempted: u64,
     pairs_completed: u64,
+    successful_pairs_completed: u64,
+    source_read_pairs: Vec<SourceReadPair>,
+    #[serde(flatten)]
+    paired_source_read_stats: PairStats,
     control: Arm,
     treatment: Arm,
     control_witnesses: Witnesses,
@@ -435,6 +546,9 @@ impl Phase {
             attempted_expert_id_sequence_sha256: sequence_sha(&[]),
             pairs_attempted: 0,
             pairs_completed: 0,
+            successful_pairs_completed: 0,
+            source_read_pairs: Vec::new(),
+            paired_source_read_stats: PairStats::default(),
             control: Arm::default(),
             treatment: Arm::default(),
             control_witnesses: Witnesses::default(),
@@ -508,8 +622,59 @@ impl Phase {
             && c.bare_payload_sha256 == c.gpu_destination_payload_sha256
             && c.bare_payload_sha256 == t.gpu_destination_payload_sha256
     }
+    fn finish_pair(
+        &mut self,
+        pair: usize,
+        id: u32,
+        c: &Outcome,
+        t: &Outcome,
+        control_before: u64,
+        treatment_before: u64,
+    ) -> Result<()> {
+        let mismatches_before = self.mismatch_count;
+        self.compare(pair, id, c, t)?;
+        if matches!((c, t), (Outcome::Verified(_), Outcome::Verified(_)))
+            && self.mismatch_count == mismatches_before
+        {
+            let sample = SourceReadPair {
+                pair,
+                expert_id: id,
+                control_ns: source_duration(
+                    control_before,
+                    self.control.times.source_direct_read_ns,
+                )?,
+                treatment_ns: source_duration(
+                    treatment_before,
+                    self.treatment.times.source_direct_read_ns,
+                )?,
+            };
+            add(&mut self.successful_pairs_completed, 1)?;
+            self.source_read_pairs.push(sample);
+        }
+        add(&mut self.pairs_completed, 1)?;
+        Ok(())
+    }
+    fn pairs_accounted(&self) -> bool {
+        let stats = &self.paired_source_read_stats;
+        pair_stats(&self.source_read_pairs).is_ok_and(|expected| expected == *stats)
+            && stats.paired_source_read_samples == self.successful_pairs_completed
+            && self.successful_pairs_completed <= self.pairs_completed
+            && self.successful_pairs_completed <= self.control.verified_ops
+            && self.successful_pairs_completed <= self.treatment.verified_ops
+            && stats.paired_control_source_read_ns <= self.control.times.source_direct_read_ns
+            && stats.paired_treatment_source_read_ns <= self.treatment.times.source_direct_read_ns
+            && self.source_read_pairs.iter().all(|s| {
+                u64::try_from(s.pair).is_ok_and(|i| i < self.pairs_completed)
+                    && self.ordered_expert_ids.get(s.pair) == Some(&s.expert_id)
+            })
+            && self
+                .source_read_pairs
+                .windows(2)
+                .all(|p| p[0].pair < p[1].pair)
+    }
     fn accounted(&self) -> bool {
-        self.pairs_completed == self.ordered_expert_ids.len() as u64
+        self.pairs_accounted()
+            && self.pairs_completed == self.ordered_expert_ids.len() as u64
             && self.pairs_attempted == self.pairs_completed
             && self.attempted_expert_id_sequence_sha256 == self.expert_id_sequence_sha256
             && self.control.reconcile(false)
@@ -518,6 +683,13 @@ impl Phase {
     fn successful(&self) -> bool {
         let n = self.ordered_expert_ids.len() as u64;
         self.accounted()
+            && self.successful_pairs_completed == n
+            && self.paired_source_read_stats.paired_control_source_read_ns
+                == self.control.times.source_direct_read_ns
+            && self
+                .paired_source_read_stats
+                .paired_treatment_source_read_ns
+                == self.treatment.times.source_direct_read_ns
             && self.control.success(n, false)
             && self.treatment.success(n, true)
             && self.parity()
@@ -526,6 +698,16 @@ impl Phase {
 
 #[derive(Default, Debug, Serialize)]
 struct Authority {
+    control_source_api: &'static str,
+    treatment_source_api: &'static str,
+    same_source_api: bool,
+    control_destination: &'static str,
+    treatment_destination: &'static str,
+    source_timer_excludes_allocation: bool,
+    source_timer_excludes_map_async_device_poll: bool,
+    source_timer_excludes_alignment_setup: bool,
+    source_timer_excludes_hashes_readback_fd_evidence: bool,
+    source_timer_excludes_gpu_copy_unmap: bool,
     linux: bool,
     expected_adapter_name: String,
     adapter_name: Option<String>,
@@ -553,7 +735,7 @@ struct Report {
     args: Args,
     config_sha256: Option<String>,
     complete: bool,
-    feasibility_pass: bool,
+    correctness_pass: bool,
     classification: String,
     failure: Option<String>,
     runtime_failures: u64,
@@ -562,34 +744,58 @@ struct Report {
     warmup: Phase,
     measured: Phase,
     source_throughput_ratio_treatment_over_control: Option<f64>,
-    source_throughput_minimum_ratio: f64,
+    source_read_slowdown_percent_treatment_vs_control: Option<f64>,
+    performance_required_for_correctness: bool,
     total_cycle_superiority_required: bool,
     sequence_contract: &'static str,
     timing_contract: &'static str,
+    paired_timing_contract: &'static str,
+    interpretation_contract: &'static str,
     odirect_evidence_contract: &'static str,
     cpu_copy_accounting_contract: &'static str,
 }
 impl Report {
     fn new(args: Args) -> Self {
         Self { schema: SCHEMA, authority: Authority {
+                control_source_api: SOURCE_API, treatment_source_api: SOURCE_API,
+                same_source_api: true, control_destination: "aligned-host-pool",
+                treatment_destination: "wgpu-map-write",
+                source_timer_excludes_allocation: true,
+                source_timer_excludes_map_async_device_poll: true,
+                source_timer_excludes_alignment_setup: true,
+                source_timer_excludes_hashes_readback_fd_evidence: true,
+                source_timer_excludes_gpu_copy_unmap: true,
                 linux: cfg!(target_os = "linux"), expected_adapter_name: args.expected_adapter_name.clone(),
                 full_source_bytes: FULL, block_alignment: ALIGN, uth_prefix_bytes: PREFIX,
                 bare_payload_bytes: PAYLOAD, physical_slot_bytes: SLOT, upload_capacity_bytes: UPLOAD,
                 ..Authority::default()
-            }, args, config_sha256: None, complete: false, feasibility_pass: false,
+            }, args, config_sha256: None, complete: false, correctness_pass: false,
             classification: "not-completed".into(), failure: None, runtime_failures: 0, accounting_failures: 0,
             warmup: Phase::new("warmup", vec![]), measured: Phase::new("measured", vec![]),
-            source_throughput_ratio_treatment_over_control: None, source_throughput_minimum_ratio: 0.9,
+            source_throughput_ratio_treatment_over_control: None, source_read_slowdown_percent_treatment_vs_control: None,
+            performance_required_for_correctness: false,
             total_cycle_superiority_required: false,
             sequence_contract: "global ID = layer*128+local; span=min(count,6144); ID[i]=floor((i%span)*6143/(span-1)); singleton warmup=3072; SHA256(concatenated u32 LE IDs). Even pair CONTROL,TREATMENT; odd pair TREATMENT,CONTROL; parity hashes concatenate exact source/payload bytes in pair order, without framing. Warmup is separate and excluded.",
-            timing_contract: "nanoseconds, decimal GB/s=bytes/ns. Source timer covers only read_expert/read_expert_into_aligned_slice (cached fd lookup, block_in_place, pread and unchanged retries/breakers). Each arm's total cycle is its wall time minus fd evidence, source/header hashing and GPU readback verification. Each standalone destination is GPU-cleared before its arm, outside transfer timers, to prevent stale paired data from satisfying parity. No verification enters the 90% source-throughput gate. submit/drain includes queued epoch and payload; it is descriptive, not isolated DMA bandwidth.",
+            timing_contract: "nanoseconds, decimal GB/s=bytes/ns. Both source timers cover only read_expert_into_aligned_slice (cached fd lookup, block_in_place, pread and unchanged retries/breakers). Each arm's total cycle is its wall time minus fd evidence, source/header hashing and GPU readback verification. Each standalone destination is GPU-cleared before its arm, outside transfer timers, to prevent stale paired data from satisfying parity. Source timers exclude allocation, map_async/device.poll, alignment setup, hashes/readback/fd evidence, GPU copy and unmap. Performance does not determine correctness. submit/drain includes queued epoch and payload; it is descriptive, not isolated DMA bandwidth.",
+            paired_timing_contract: "Each arm runs exactly once per pair. Take checked deltas of its existing source_direct_read_ns accumulator outside the arm calls; only pairs with two verified, matching outcomes enter source_read_pairs. pairs_completed retains completed negative outcomes; successful_pairs_completed counts matching verified pairs. Warmup statistics are separate. Signed deltas and sums use checked i128 arithmetic, arm totals/counts use checked u64 arithmetic. Mean=sum/count. Odd median=middle; even median=arithmetic mean of the middle two. Ratios are sorted by exact u128 cross products before conversion. Reported floating means/medians/ratios are rounded f64 summaries; raw integer durations and aggregate delta retain exact evidence. Zero durations fail accounting. No performance decision is made here.",
+            interpretation_contract: ">=5% treatment slowdown + median delta >0 + majority slower pairs: strong mapped-substrate evidence. >=3% slowdown + median delta >0 + majority slower pairs: material mapped-substrate evidence. Within +/-1% with median near zero: evidence against singleton substrate penalty; next HMA-1C-B batch test. 1-3%, or aggregate/paired direction disagreement: ambiguous; next HMA-1C-B. Treatment speedup: evidence against raw singleton WGPU backing as cause; next batch/surrounding-helper discriminator. Apply after authoritative FIRST; slowdown is 100*(treatment source ns/control source ns-1), not throughput loss. No near-zero tolerance or FIRST iteration count is selected by this diagnostic.",
             odirect_evidence_contract: "Before each arm: Linux fcntl(F_GETFL) on the actual cached expert fd plus fstat file length. Exclusively owned sequential storage retains that same fd through the read; no packed storage, no fallback reads, no dense tensors or inference.",
             cpu_copy_accounting_contract: "CONTROL counts exact bytes passed to QueueWriteBufferView::copy_from_slice; TREATMENT reads the entire source file directly into BufferViewMut, performs no CPU payload copy, then unmaps and encodes the bare payload GPU copy. Hashing/readback are excluded verification work. gpu_copied_bytes excludes the separately counted 4-byte epoch and readback bytes.",
         }
     }
     fn authoritative(&self) -> bool {
         let a = &self.authority;
-        a.linux
+        a.control_source_api == SOURCE_API
+            && a.treatment_source_api == SOURCE_API
+            && a.same_source_api
+            && a.control_destination == "aligned-host-pool"
+            && a.treatment_destination == "wgpu-map-write"
+            && a.source_timer_excludes_allocation
+            && a.source_timer_excludes_map_async_device_poll
+            && a.source_timer_excludes_alignment_setup
+            && a.source_timer_excludes_hashes_readback_fd_evidence
+            && a.source_timer_excludes_gpu_copy_unmap
+            && a.linux
             && a.expected_adapter_name == "NVIDIA L4"
             && a.adapter_authoritative
             && a.direct_io_requested
@@ -598,7 +804,7 @@ impl Report {
     }
     fn fail(&mut self, failure: Failure) {
         self.complete = failure.complete;
-        self.feasibility_pass = false;
+        self.correctness_pass = false;
         self.classification = failure.classification.into();
         self.failure = Some(failure.detail);
         if !failure.complete {
@@ -614,7 +820,7 @@ impl Report {
         self.measured.control.rates();
         self.measured.treatment.rates();
         self.complete = true;
-        self.feasibility_pass = false;
+        self.correctness_pass = false;
         if !self.authoritative() {
             self.classification = "authority-failed".into();
             return;
@@ -696,16 +902,15 @@ impl Report {
             }
         };
         self.source_throughput_ratio_treatment_over_control = Some(ratio);
-        // Successful arms have identical source bytes, so this is the exact
-        // rational 90% gate, without a floating-point boundary tolerance.
-        self.feasibility_pass = u128::from(c.times.source_direct_read_ns) * 10
-            >= u128::from(t.times.source_direct_read_ns) * 9;
-        self.classification = if self.feasibility_pass {
-            "copy-elision-feasible"
-        } else {
-            "mapped-source-too-slow"
-        }
-        .into();
+        self.source_read_slowdown_percent_treatment_vs_control = Some(
+            self.measured
+                .paired_source_read_stats
+                .aggregate_treatment_minus_control_ns as f64
+                / c.times.source_direct_read_ns as f64
+                * 100.0,
+        );
+        self.correctness_pass = true;
+        self.classification = "mapped-memory-discriminator-complete".into();
     }
 }
 fn mapped_rejection(errno: Option<i32>) -> bool {
@@ -1025,16 +1230,18 @@ async fn control(
         let start = Instant::now();
         let base = buf.as_slice().as_ptr() as usize;
         let offset = aligned_subrange(base, buf.len(), FULL, ALIGN).map_err(Failure::accounting)?;
-        if offset != 0 {
+        if buf.len() != FULL || offset != 0 {
             return Err(Failure::accounting(
-                "CONTROL pool buffer is not page aligned",
+                "CONTROL pool buffer must be exactly FULL bytes and page aligned",
             ));
         }
         arm.pointers.observe(base, 0, buf.len())?;
         timed(&mut arm.times.alignment_setup_ns, start)?;
         add(&mut arm.source_read_attempts, 1)?;
         let start = Instant::now();
-        let read = storage.read_expert(id, buf).await;
+        let read = storage
+            .read_expert_into_aligned_slice(id, buf.as_mut_slice())
+            .await;
         timed(&mut arm.times.source_direct_read_ns, start)?;
         read_result(read, false, arm, id, &mut None)?;
         let start = Instant::now();
@@ -1245,6 +1452,10 @@ async fn run_phase(
             let id = phase.ordered_expert_ids[pair];
             add(&mut phase.pairs_attempted, 1)?;
             attempted_ids.update(id.to_le_bytes());
+            // Each accumulator changes only in its one source call per pair.
+            // Sampling here keeps all new work outside both existing timers.
+            let control_before = phase.control.times.source_direct_read_ns;
+            let treatment_before = phase.treatment.times.source_direct_read_ns;
             let (c, t) = if pair % 2 == 0 {
                 let c = control(
                     gpu,
@@ -1286,8 +1497,7 @@ async fn run_phase(
                 .await?;
                 (c, t)
             };
-            phase.compare(pair, id, &c, &t)?;
-            add(&mut phase.pairs_completed, 1)?;
+            phase.finish_pair(pair, id, &c, &t, control_before, treatment_before)?;
         }
         Ok(())
     }
@@ -1297,6 +1507,7 @@ async fn run_phase(
     phase.attempted_expert_id_sequence_sha256 = finish_sha(&attempted_ids);
     phase.control.rates();
     phase.treatment.rates();
+    phase.paired_source_read_stats = pair_stats(&phase.source_read_pairs)?;
     result
 }
 
@@ -1490,6 +1701,7 @@ no_direct = false
         p.attempted_expert_id_sequence_sha256 = p.expert_id_sequence_sha256.clone();
         p.control = good_arm(n as u64, false);
         p.treatment = good_arm(n as u64, true);
+        set_pair_times(&mut p, &vec![(FULL as u64, FULL as u64); n]);
         p.control_witnesses = Witnesses {
             full_source_sha256: sha(b"source"),
             bare_payload_sha256: sha(b"payload"),
@@ -1501,6 +1713,29 @@ no_direct = false
             gpu_destination_payload_sha256: sha(b"payload"),
         };
         p
+    }
+    fn set_pair_times(p: &mut Phase, times: &[(u64, u64)]) {
+        p.source_read_pairs = times
+            .iter()
+            .enumerate()
+            .map(|(pair, &(control_ns, treatment_ns))| SourceReadPair {
+                pair,
+                expert_id: p.ordered_expert_ids[pair],
+                control_ns,
+                treatment_ns,
+            })
+            .collect();
+        p.paired_source_read_stats = pair_stats(&p.source_read_pairs).unwrap();
+        p.successful_pairs_completed = p.paired_source_read_stats.paired_source_read_samples;
+        p.control.times.source_direct_read_ns =
+            p.paired_source_read_stats.paired_control_source_read_ns;
+        p.treatment.times.source_direct_read_ns =
+            p.paired_source_read_stats.paired_treatment_source_read_ns;
+    }
+    fn clear_pair_times(p: &mut Phase) {
+        p.source_read_pairs.clear();
+        p.paired_source_read_stats = PairStats::default();
+        p.successful_pairs_completed = 0;
     }
     fn good_report() -> Report {
         let mut r = Report::new(args());
@@ -1530,6 +1765,370 @@ no_direct = false
         a.mapped_direct_io_rejections = n;
         a.rejection_errno_counts.insert(errno, n);
         a
+    }
+
+    fn samples(times: &[(u64, u64)]) -> Vec<SourceReadPair> {
+        times
+            .iter()
+            .enumerate()
+            .map(|(pair, &(control_ns, treatment_ns))| SourceReadPair {
+                pair,
+                expert_id: pair as u32,
+                control_ns,
+                treatment_ns,
+            })
+            .collect()
+    }
+    #[test]
+    fn source_to_upload_copy_elision_pair_medians_odd_even_signed_and_equal() {
+        let odd = pair_stats(&samples(&[(10, 15), (10, 5), (10, 10)])).unwrap();
+        assert_eq!(odd.paired_source_read_samples, 3);
+        assert_eq!(
+            (
+                odd.treatment_slower_pairs,
+                odd.treatment_faster_pairs,
+                odd.equal_pairs
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(odd.aggregate_treatment_minus_control_ns, 0);
+        assert_eq!(odd.mean_treatment_minus_control_ns, Some(0.0));
+        assert_eq!(odd.median_treatment_minus_control_ns, Some(0.0));
+        assert_eq!(odd.median_treatment_over_control_ratio, Some(1.0));
+        let input = samples(&[(20, 10), (10, 20), (10, 9), (10, 14)]);
+        let even = pair_stats(&input).unwrap();
+        assert_eq!(even.aggregate_treatment_minus_control_ns, 3);
+        assert_eq!(even.mean_treatment_minus_control_ns, Some(0.75));
+        assert_eq!(even.median_treatment_minus_control_ns, Some(1.5));
+        assert_eq!(even.median_treatment_over_control_ratio, Some(1.15));
+        let reversed: Vec<_> = input.iter().cloned().rev().collect();
+        assert_eq!(pair_stats(&reversed).unwrap(), even);
+        let negative = pair_stats(&samples(&[(10, 8), (10, 9)])).unwrap();
+        assert_eq!(negative.median_treatment_minus_control_ns, Some(-1.5));
+        assert_eq!(negative.mean_treatment_minus_control_ns, Some(-1.5));
+        assert_eq!(pair_stats(&[]).unwrap(), PairStats::default());
+        let single = pair_stats(&samples(&[(4, 7)])).unwrap();
+        assert_eq!(single.median_treatment_minus_control_ns, Some(3.0));
+        assert_eq!(single.median_treatment_over_control_ratio, Some(1.75));
+    }
+    #[test]
+    fn source_to_upload_copy_elision_pair_arithmetic_is_checked() {
+        assert_eq!(source_duration(17, 27).unwrap(), 10);
+        for (before, after) in [(9, 8), (0, 0), (u64::MAX, 0)] {
+            assert_eq!(
+                source_duration(before, after).unwrap_err().classification,
+                "accounting-failed"
+            );
+        }
+        for times in [
+            vec![(0, 1)],
+            vec![(1, 0)],
+            vec![(u64::MAX, 1), (1, 1)],
+            vec![(1, u64::MAX), (1, 1)],
+        ] {
+            assert_eq!(
+                pair_stats(&samples(&times)).unwrap_err().classification,
+                "accounting-failed"
+            );
+        }
+        assert!(pair_stats(&samples(&vec![(1, 1); MAX_ITERATIONS + 1])).is_err());
+        for (c, t) in [(u64::MAX, 1), (1, u64::MAX), (u64::MAX, u64::MAX)] {
+            let stats = pair_stats(&samples(&[(c, t)])).unwrap();
+            assert_eq!(
+                stats.aggregate_treatment_minus_control_ns,
+                i128::from(t) - i128::from(c)
+            );
+            assert!(stats
+                .median_treatment_over_control_ratio
+                .unwrap()
+                .is_finite());
+        }
+        let mut counter = u64::MAX;
+        assert!(add(&mut counter, 1).is_err());
+        assert_eq!(counter, u64::MAX);
+    }
+    #[test]
+    fn source_to_upload_copy_elision_equal_ratio_median_is_order_independent() {
+        // All ratios are exactly 1/3, but the large operands round upward in f64.
+        let k = 9_007_199_254_740_894;
+        assert_ne!(k as f64 / (3 * k) as f64, 1.0 / 3.0);
+        let a = samples(&[(3, 1), (3 * k, k), (6, 2)]);
+        let b = samples(&[(3 * k, k), (3, 1), (6, 2)]);
+        let expected = pair_stats(&a).unwrap();
+        assert_eq!(pair_stats(&b).unwrap(), expected);
+        assert_eq!(
+            expected.median_treatment_over_control_ratio,
+            Some(1.0 / 3.0)
+        );
+    }
+    #[test]
+    fn source_to_upload_copy_elision_pair_accounting_fails_closed() {
+        let mutations: Vec<fn(&mut Phase)> = vec![
+            |p| p.paired_source_read_stats.paired_source_read_samples += 1,
+            |p| p.paired_source_read_stats.treatment_slower_pairs = u64::MAX,
+            |p| p.paired_source_read_stats.treatment_faster_pairs += 1,
+            |p| p.paired_source_read_stats.equal_pairs -= 1,
+            |p| {
+                p.paired_source_read_stats
+                    .aggregate_treatment_minus_control_ns += 1
+            },
+            |p| p.paired_source_read_stats.mean_treatment_minus_control_ns = Some(f64::NAN),
+            |p| p.paired_source_read_stats.median_treatment_minus_control_ns = Some(1.0),
+            |p| {
+                p.paired_source_read_stats
+                    .median_treatment_over_control_ratio = None
+            },
+            |p| p.paired_source_read_stats.paired_control_source_read_ns += 1,
+            |p| p.paired_source_read_stats.paired_treatment_source_read_ns += 1,
+            |p| p.successful_pairs_completed -= 1,
+            |p| p.pairs_completed -= 1,
+            |p| p.source_read_pairs.pop().map(|_| ()).unwrap(),
+            |p| p.source_read_pairs[0].control_ns = 0,
+            |p| p.source_read_pairs[0].expert_id = 99,
+            |p| p.source_read_pairs[1].pair = 0,
+            |p| p.source_read_pairs.swap(0, 1),
+        ];
+        for (i, mutate) in mutations.into_iter().enumerate() {
+            let mut r = good_report();
+            mutate(&mut r.measured);
+            r.classify();
+            assert!(!r.complete && !r.correctness_pass, "mutation {i}");
+            assert_eq!(r.classification, "accounting-failed", "mutation {i}");
+        }
+    }
+    fn verified() -> Outcome {
+        Outcome::Verified(Hashes {
+            source: "s".into(),
+            payload: "p".into(),
+            gpu: "p".into(),
+            epoch: true,
+        })
+    }
+    #[test]
+    fn source_to_upload_copy_elision_samples_only_successful_completed_pairs() {
+        let mut p = good_phase("measured", 2);
+        clear_pair_times(&mut p);
+        p.pairs_completed = 0;
+        p.control.times.source_direct_read_ns = 23;
+        p.treatment.times.source_direct_read_ns = 29;
+        p.finish_pair(0, 0, &verified(), &verified(), 3, 4).unwrap();
+        assert_eq!(
+            (
+                p.source_read_pairs[0].control_ns,
+                p.source_read_pairs[0].treatment_ns
+            ),
+            (20, 25)
+        );
+        p.finish_pair(1, 6143, &verified(), &Outcome::MappedRejected, 23, 29)
+            .unwrap();
+        p.paired_source_read_stats = pair_stats(&p.source_read_pairs).unwrap();
+        assert_eq!((p.pairs_completed, p.successful_pairs_completed), (2, 1));
+        assert_eq!(p.paired_source_read_stats.paired_source_read_samples, 1);
+        assert!(p.accounted());
+        assert!(!p.successful());
+        for bad in [
+            Outcome::AlignmentUnavailable,
+            Outcome::MappedRejected,
+            Outcome::Verified(Hashes {
+                source: "bad".into(),
+                payload: "p".into(),
+                gpu: "p".into(),
+                epoch: true,
+            }),
+        ] {
+            let mut p = Phase::new("measured", vec![0]);
+            p.finish_pair(0, 0, &verified(), &bad, 0, 0).unwrap();
+            assert_eq!(p.pairs_completed, 1);
+            assert_eq!(p.successful_pairs_completed, 0);
+            assert!(p.source_read_pairs.is_empty());
+        }
+        let mut p = Phase::new("measured", vec![0]);
+        assert!(p.finish_pair(0, 0, &verified(), &verified(), 1, 0).is_err());
+        assert_eq!(p.pairs_completed, 0);
+        assert_eq!(p.successful_pairs_completed, 0);
+        assert!(p.source_read_pairs.is_empty());
+    }
+    #[test]
+    fn source_to_upload_copy_elision_warmup_cannot_change_measured_evidence() {
+        let mut r = good_report();
+        set_pair_times(&mut r.measured, &[(100, 106), (100, 110)]);
+        r.classify();
+        let measured = serde_json::to_value(&r.measured).unwrap();
+        let ratio = r.source_throughput_ratio_treatment_over_control;
+        let slowdown = r.source_read_slowdown_percent_treatment_vs_control;
+        r.warmup = good_phase("warmup", 3);
+        set_pair_times(&mut r.warmup, &[(10000, 1), (20000, 1), (30000, 1)]);
+        r.classify();
+        assert!(r.correctness_pass);
+        assert_eq!(serde_json::to_value(&r.measured).unwrap(), measured);
+        assert_eq!(r.source_throughput_ratio_treatment_over_control, ratio);
+        assert_eq!(
+            r.source_read_slowdown_percent_treatment_vs_control,
+            slowdown
+        );
+    }
+    #[test]
+    fn source_to_upload_copy_elision_schema_and_authority_are_explicit() {
+        let mut r = good_report();
+        r.classify();
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            json["schema"],
+            "mer.gpu-native-mapped-memory-odirect-discriminator.v1"
+        );
+        assert!(json.get("feasibility_pass").is_none());
+        assert!(json.get("source_throughput_minimum_ratio").is_none());
+        assert_eq!(json["correctness_pass"], true);
+        assert_eq!(json["performance_required_for_correctness"], false);
+        let a = &json["authority"];
+        assert_eq!(a["control_source_api"], "read_expert_into_aligned_slice");
+        assert_eq!(a["treatment_source_api"], "read_expert_into_aligned_slice");
+        assert_eq!(a["control_destination"], "aligned-host-pool");
+        assert_eq!(a["treatment_destination"], "wgpu-map-write");
+        for key in [
+            "same_source_api",
+            "source_timer_excludes_allocation",
+            "source_timer_excludes_map_async_device_poll",
+            "source_timer_excludes_alignment_setup",
+            "source_timer_excludes_hashes_readback_fd_evidence",
+            "source_timer_excludes_gpu_copy_unmap",
+        ] {
+            assert_eq!(a[key], true, "{key}");
+        }
+        for key in [
+            "paired_source_read_samples",
+            "treatment_slower_pairs",
+            "treatment_faster_pairs",
+            "equal_pairs",
+            "aggregate_treatment_minus_control_ns",
+            "mean_treatment_minus_control_ns",
+            "median_treatment_minus_control_ns",
+            "median_treatment_over_control_ratio",
+        ] {
+            assert!(json["measured"].get(key).is_some(), "{key}");
+        }
+        assert_eq!(json["measured"]["paired_source_read_samples"], 2);
+        assert_eq!(json["warmup"]["paired_source_read_samples"], 0);
+    }
+    #[test]
+    fn source_to_upload_copy_elision_same_helper_and_source_timer_contract() {
+        let source = include_str!("gpu_native_source_to_upload_copy_elision.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let control = source
+            .split("async fn control(")
+            .nth(1)
+            .unwrap()
+            .split("async fn treatment(")
+            .next()
+            .unwrap();
+        let treatment = source
+            .split("async fn treatment(")
+            .nth(1)
+            .unwrap()
+            .split("async fn run_phase(")
+            .next()
+            .unwrap();
+        assert_eq!(
+            source
+                .matches("timed(&mut arm.times.source_direct_read_ns, start)?;")
+                .count(),
+            2
+        );
+        for (arm, destination) in [
+            (control, "buf.as_mut_slice()"),
+            (treatment, "&mutview[offset..offset+FULL]"),
+        ] {
+            let marker = "timed(&mut arm.times.source_direct_read_ns, start)?;";
+            let before = arm.split(marker).next().unwrap();
+            let timed_body = before.rsplit("let start = Instant::now();").next().unwrap();
+            let compact: String = timed_body.split_whitespace().collect();
+            assert_eq!(
+                compact,
+                format!("letread=storage.read_expert_into_aligned_slice(id,{destination}).await;")
+            );
+            assert!(!arm.contains(".read_expert("));
+            assert!(before.contains("fd_evidence(storage, id, arm)?;"));
+            assert!(before.contains("aligned_subrange("));
+            let after = arm.split(marker).nth(1).unwrap();
+            assert!(after.contains("streams.source("));
+            assert!(after.contains("verify(gpu, arm, &mut hashes, streams)?;"));
+        }
+        assert!(control.contains("if buf.len() != FULL || offset != 0"));
+        let before_treatment_timer = treatment.split("let read = storage").next().unwrap();
+        assert!(before_treatment_timer.contains("gpu.map(&gpu.upload, wgpu::MapMode::Write)"));
+        assert!(
+            before_treatment_timer.contains("copy_offsets(offset, PREFIX, PAYLOAD, view.len())")
+        );
+        let after_treatment_timer = treatment
+            .split("timed(&mut arm.times.source_direct_read_ns, start)?;")
+            .nth(1)
+            .unwrap();
+        assert!(after_treatment_timer.contains("gpu.upload.unmap();"));
+        assert!(after_treatment_timer.contains("encoder.copy_buffer_to_buffer("));
+        let execute = source.split("async fn execute(").nth(1).unwrap();
+        assert!(
+            execute.find("BufferPool::new(1, FULL, ALIGN)").unwrap()
+                < execute.find("run_phase(").unwrap()
+        );
+    }
+    #[test]
+    fn source_to_upload_copy_elision_alternating_order_and_identical_id_contract() {
+        let source = include_str!("gpu_native_source_to_upload_copy_elision.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let run = source
+            .split("async fn run_phase(")
+            .nth(1)
+            .unwrap()
+            .split("async fn execute(")
+            .next()
+            .unwrap();
+        assert!(run.contains("let id = phase.ordered_expert_ids[pair];"));
+        let (even, odd) = run
+            .split("let (c, t) = if pair % 2 == 0 {")
+            .nth(1)
+            .unwrap()
+            .split_once("} else {")
+            .unwrap();
+        let odd = odd.split("phase.finish_pair(").next().unwrap();
+        assert!(even.find("let c = control(").unwrap() < even.find("let t = treatment(").unwrap());
+        assert!(odd.find("let t = treatment(").unwrap() < odd.find("let c = control(").unwrap());
+        for arm_order in [even, odd] {
+            let compact: String = arm_order.split_whitespace().collect();
+            assert!(compact.contains(
+                "control(gpu,storage,buf,id,&mutphase.control,&mutcontrol_streams,).await?;"
+            ));
+            assert!(compact.contains("treatment(gpu,storage,id,&mutphase.treatment,&muttreatment_streams,&mutphase.first_mechanism_rejection,).await?;"));
+        }
+        assert!(
+            run.find("let control_before = phase.control.times.source_direct_read_ns;")
+                .unwrap()
+                < run.find("let (c, t)").unwrap()
+        );
+        assert!(
+            run.find("let treatment_before = phase.treatment.times.source_direct_read_ns;")
+                .unwrap()
+                < run.find("let (c, t)").unwrap()
+        );
+        assert!(run.find("phase.finish_pair(").unwrap() > run.rfind("(c, t)").unwrap());
+    }
+    #[tokio::test]
+    async fn source_to_upload_copy_elision_control_pool_has_exact_full_aligned_slice() {
+        let pool = BufferPool::new(1, FULL, ALIGN);
+        let mut buf = pool.try_acquire().unwrap();
+        let ptr = buf.as_slice().as_ptr();
+        assert_eq!(buf.len(), 2_658_304);
+        assert_eq!(ptr as usize % 4096, 0);
+        let slice = buf.as_mut_slice();
+        assert_eq!(slice.len(), 2_658_304);
+        assert_eq!(slice.as_ptr(), ptr);
+        assert_eq!(
+            aligned_subrange(ptr as usize, slice.len(), FULL, ALIGN).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1691,31 +2290,45 @@ no_direct = false
         let mut r = good_report();
         r.measured.treatment.times.transfer_cycle_ns *= 10;
         r.classify();
-        assert!(r.complete && r.feasibility_pass);
-        assert_eq!(r.classification, "copy-elision-feasible");
+        assert!(r.complete && r.correctness_pass);
+        assert_eq!(r.classification, "mapped-memory-discriminator-complete");
         assert!(
             r.measured.treatment.transfer_cycle_payload_gbps
                 < r.measured.control.transfer_cycle_payload_gbps
         );
     }
     #[test]
-    fn source_to_upload_source_only_ninety_percent_boundary() {
-        let mut r = good_report();
-        r.measured.control.times.source_direct_read_ns = 900;
-        r.measured.treatment.times.source_direct_read_ns = 1000;
-        r.measured.treatment.times.verification_readback_ns = u64::MAX / 2;
-        r.classify();
-        assert!(r.feasibility_pass);
-        let mut r = good_report();
-        r.measured.control.times.source_direct_read_ns = 899;
-        r.measured.treatment.times.source_direct_read_ns = 1000;
-        r.classify();
-        assert_eq!(r.classification, "mapped-source-too-slow");
-        assert!(r.complete && !r.feasibility_pass);
+    fn source_to_upload_copy_elision_performance_never_controls_correctness() {
+        for treatment in [10, 97, 99, 100, 101, 103, 105, 1000] {
+            let mut r = good_report();
+            set_pair_times(&mut r.measured, &[(100, treatment), (100, treatment)]);
+            r.measured.treatment.times.verification_readback_ns = u64::MAX / 2;
+            r.classify();
+            assert!(r.complete && r.correctness_pass);
+            assert_eq!(r.classification, "mapped-memory-discriminator-complete");
+            assert_eq!(
+                r.source_read_slowdown_percent_treatment_vs_control,
+                Some((treatment as f64 - 100.0) / 100.0 * 100.0)
+            );
+            assert!(!r.performance_required_for_correctness);
+        }
     }
     #[test]
     fn source_to_upload_gate_fails_closed_on_authority_or_evidence_mutation() {
         let mutations: Vec<fn(&mut Report)> = vec![
+            |r| r.authority.control_source_api = "read_expert",
+            |r| r.authority.treatment_source_api = "read_expert",
+            |r| r.authority.same_source_api = false,
+            |r| r.authority.control_destination = "wrong",
+            |r| r.authority.treatment_destination = "wrong",
+            |r| r.authority.source_timer_excludes_allocation = false,
+            |r| r.authority.source_timer_excludes_map_async_device_poll = false,
+            |r| r.authority.source_timer_excludes_alignment_setup = false,
+            |r| {
+                r.authority
+                    .source_timer_excludes_hashes_readback_fd_evidence = false
+            },
+            |r| r.authority.source_timer_excludes_gpu_copy_unmap = false,
             |r| r.authority.linux = false,
             |r| r.authority.adapter_authoritative = false,
             |r| r.authority.expected_adapter_name = "other".into(),
@@ -1747,7 +2360,7 @@ no_direct = false
             let mut r = good_report();
             mutate(&mut r);
             r.classify();
-            assert!(!r.feasibility_pass, "mutation {i}");
+            assert!(!r.correctness_pass, "mutation {i}");
         }
     }
     #[test]
@@ -1768,9 +2381,10 @@ no_direct = false
         for errno in [libc::EINVAL, libc::EFAULT] {
             let mut r = good_report();
             r.measured.treatment = rejected_arm(2, errno);
+            clear_pair_times(&mut r.measured);
             r.classify();
             assert_eq!(r.classification, "mapped-upload-direct-io-rejected");
-            assert!(r.complete && !r.feasibility_pass);
+            assert!(r.complete && !r.correctness_pass);
         }
         assert!(!mapped_rejection(Some(libc::EIO)));
         assert!(!mapped_rejection(None));
@@ -1779,21 +2393,25 @@ no_direct = false
     fn source_to_upload_negative_rejection_requires_working_control_and_consistency() {
         let mut r = good_report();
         r.measured.treatment = rejected_arm(2, libc::EINVAL);
+        clear_pair_times(&mut r.measured);
         r.measured.control.source_failures = 1;
         r.classify();
-        assert!(!r.complete && !r.feasibility_pass);
+        assert!(!r.complete && !r.correctness_pass);
         let mut r = good_report();
         r.measured.treatment = rejected_arm(2, libc::EIO);
+        clear_pair_times(&mut r.measured);
         r.classify();
-        assert!(!r.complete && !r.feasibility_pass);
+        assert!(!r.complete && !r.correctness_pass);
         let mut r = good_report();
         r.measured.treatment = rejected_arm(2, libc::EINVAL);
+        clear_pair_times(&mut r.measured);
         r.measured.treatment.mapped_direct_io_rejections = 1;
         r.classify();
         assert!(!r.complete);
         let mut r = good_report();
         r.warmup = good_phase("warmup", 1);
         r.measured.treatment = rejected_arm(2, libc::EINVAL);
+        clear_pair_times(&mut r.measured);
         r.classify();
         assert!(!r.complete);
     }
@@ -1809,9 +2427,10 @@ no_direct = false
         t.rejection_errno_counts.clear();
         t.alignment_failures = 2;
         r.measured.treatment = t;
+        clear_pair_times(&mut r.measured);
         r.classify();
         assert_eq!(r.classification, "alignment-contract-unavailable");
-        assert!(r.complete && !r.feasibility_pass);
+        assert!(r.complete && !r.correctness_pass);
     }
     #[test]
     fn source_to_upload_parity_classifications() {
@@ -1824,7 +2443,7 @@ no_direct = false
             r.measured.mismatch(0, 0, kind, "a", "b").unwrap();
             r.classify();
             assert_eq!(r.classification, expected);
-            assert!(r.complete && !r.feasibility_pass);
+            assert!(r.complete && !r.correctness_pass);
         }
     }
     #[test]
@@ -1916,10 +2535,10 @@ no_direct = false
     fn source_to_upload_report_completion_semantics() {
         let mut r = good_report();
         r.fail(Failure::authority("wrong adapter"));
-        assert!(r.complete && !r.feasibility_pass);
+        assert!(r.complete && !r.correctness_pass);
         assert_eq!(r.runtime_failures, 0);
         r.fail(Failure::runtime("gpu-failed", "unexpected failure"));
-        assert!(!r.complete && !r.feasibility_pass);
+        assert!(!r.complete && !r.correctness_pass);
         assert_eq!(r.runtime_failures, 1);
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["schema"], SCHEMA);
@@ -1954,7 +2573,7 @@ no_direct = false
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&a.report_out).unwrap()).unwrap();
         assert_eq!(json["complete"], true);
-        assert_eq!(json["feasibility_pass"], false);
+        assert_eq!(json["correctness_pass"], false);
         assert_eq!(json["classification"], "authority-failed");
         assert!(json["authority"]["adapter_name"].is_null());
         std::fs::remove_dir_all(dir).unwrap();
