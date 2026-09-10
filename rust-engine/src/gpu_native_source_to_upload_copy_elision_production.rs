@@ -86,7 +86,7 @@ fn arena_interval_exact(c: &UploadSnapshot, t: &UploadSnapshot) -> bool {
     [z.arena_map_attempts, z.arena_map_completions, z.arena_unmaps,
      z.arena_remap_attempts, z.arena_remap_completions, z.arena_remap_failures,
      z.arena_map_wait_us, z.arena_high_water, z.source_sets_mapped,
-     z.source_slots_mapped, z.arena_generation_errors].iter().all(|v| *v == 0)
+     z.source_slots_mapped, z.source_sets_opening_two_arenas, z.arena_generation_errors].iter().all(|v| *v == 0)
         && c.arm == Arm::Control && c.ring_capacity == 0
         && t.arm == Arm::Treatment && t.production_owned
         && ring_exact(c, t) && upload_errors_zero(c) && upload_errors_zero(t)
@@ -110,17 +110,22 @@ fn arena_interval_exact(c: &UploadSnapshot, t: &UploadSnapshot) -> bool {
         && m.arena_map_wait_us == m.map_wait_us
         && m.source_slots_mapped == m.direct_source_reads
         && m.source_sets_mapped > 0
-        // One source set uses one arena, or two if wider than eight; it still
-        // issues one storage batch. No per-expert mapping or hidden arena fits.
-        && m.arena_map_completions >= m.source_sets_mapped
-        && m.source_sets_mapped.checked_mul(ARENAS as u64)
+        // v2: successful calls can append without mapping. A call opening both
+        // arenas contributes exactly one extra map above the one-map/call bound.
+        // (A single legal 9..=16-slot call needs two maps.) Errors/rollbacks are
+        // rejected above; these counts therefore cover successful calls only.
+        && m.source_sets_opening_two_arenas <= m.source_sets_mapped
+        && m.source_sets_opening_two_arenas.checked_mul(ARENAS as u64)
+            .is_some_and(|min| min <= m.arena_map_completions)
+        && m.source_sets_mapped.checked_add(m.source_sets_opening_two_arenas)
             .is_some_and(|max| m.arena_map_completions <= max)
         && m.arena_map_completions.checked_mul(ARENA_WIDTH as u64)
             .is_some_and(|max| m.source_slots_mapped <= max)
-        && m.arena_map_completions.checked_sub(m.source_sets_mapped)
-            .and_then(|extra| extra.checked_mul(ARENA_WIDTH as u64))
-            .and_then(|full| full.checked_add(m.source_sets_mapped))
-            .is_some_and(|min| m.source_slots_mapped >= min)
+        && m.source_sets_mapped <= m.source_slots_mapped
+        // Opening two previously available arenas requires at least nine slots.
+        && m.source_sets_opening_two_arenas.checked_mul(ARENA_WIDTH as u64)
+            .and_then(|extra| extra.checked_add(m.source_sets_mapped))
+            .is_some_and(|min| min <= m.source_slots_mapped)
         && m.arena_generation_errors == 0
 }
 fn two_arena_gate(
@@ -133,7 +138,7 @@ fn two_arena_gate(
     let measured_accounting_exact = arena_interval_exact(cm, tm);
     let fd_proof_exact = source_upload_fd_proof_gate(cw, tw, cm, tm).passed;
     TwoArenaGate {
-        diagnostic_version: "hma1b.two-arena.v1",
+        diagnostic_version: "hma1b.two-arena.v2",
         warmup_accounting_exact,
         measured_accounting_exact,
         fd_proof_exact,
@@ -974,8 +979,99 @@ mod tests {
         assert!(two_arena_gate(&c, &t, &c, &t).passed);
         assert_eq!(
             serde_json::to_value(two_arena_gate(&c, &t, &c, &t)).unwrap()["diagnostic_version"],
-            "hma1b.two-arena.v1"
+            "hma1b.two-arena.v2"
         );
+    }
+    fn open_arena_fixture(
+        slots: u64,
+        sets: u64,
+        maps: u64,
+        two: u64,
+    ) -> (UploadSnapshot, UploadSnapshot) {
+        let (c, mut t) = arena_fixture();
+        let m = &mut t.metrics;
+        m.map_attempts = maps;
+        m.map_completions = maps;
+        m.unmaps = maps;
+        m.arena_map_attempts = maps;
+        m.arena_map_completions = maps;
+        m.arena_unmaps = maps;
+        m.arena_high_water = maps.min(2);
+        m.high_water = slots.min(16);
+        m.source_sets_mapped = sets;
+        m.source_sets_opening_two_arenas = two;
+        m.source_slots_mapped = slots;
+        m.direct_source_reads = slots;
+        m.direct_source_bytes = slots * FULL as u64;
+        m.direct_payload_bytes = slots * PAYLOAD as u64;
+        m.odirect_observations = slots;
+        m.acquisition_attempts = slots;
+        m.leases_created = slots;
+        m.leases_consumed = slots;
+        m.leases_released = slots;
+        m.fused_installs = slots;
+        m.fused_gpu_copy_bytes = slots * PAYLOAD as u64;
+        m.copied_experts = slots;
+        m.copied_bytes = slots * PAYLOAD as u64;
+        let p = t.source_upload_fd_proof.as_mut().unwrap();
+        p.source_upload_fd_proof_requests = slots;
+        p.source_upload_fd_proof_misses = slots;
+        (c, t)
+    }
+    #[test]
+    fn source_upload_hma1b1_v2_gate_accepts_accumulation_and_one_wide_source_call() {
+        for (slots, sets, maps, two) in [
+            (16, 16, 2, 0),
+            (16, 3, 2, 0),
+            (16, 4, 2, 0),
+            (16, 2, 2, 0),
+            (16, 1, 2, 1),
+            (9, 1, 2, 1),
+            (2, 2, 1, 0),
+        ] {
+            let (c, t) = open_arena_fixture(slots, sets, maps, two);
+            let gate = two_arena_gate(&c, &t, &c, &t);
+            assert!(gate.passed, "{slots}/{sets}/{maps}/{two}: {gate:?}");
+            assert_eq!(gate.diagnostic_version, "hma1b.two-arena.v2");
+            assert_eq!(
+                source_upload_fd_proof_gate(&c, &t, &c, &t).diagnostic_version,
+                "hma1a.fd-proof.v1"
+            );
+            let mut bad = t.clone();
+            bad.source_upload_fd_proof
+                .as_mut()
+                .unwrap()
+                .source_upload_fd_proof_failures = 1;
+            assert!(!two_arena_gate(&c, &t, &c, &bad).passed);
+        }
+    }
+    #[test]
+    fn source_upload_hma1b1_v2_gate_rejects_coordinated_impossible_bounds() {
+        for (slots, sets, maps, two) in [
+            (16, 1, 2, 0),  // missing extra-map witness
+            (17, 3, 2, 0),  // more sourced slots than two mapped arenas hold
+            (8, 1, 2, 1),   // two fresh arenas cannot be needed for <=8 slots
+            (16, 3, 2, 2),  // two double openings need at least four maps
+            (16, 17, 2, 0), // each successful source call needs >=1 slot
+        ] {
+            let (c, t) = open_arena_fixture(slots, sets, maps, two);
+            assert!(
+                !two_arena_gate(&c, &t, &c, &t).passed,
+                "{slots}/{sets}/{maps}/{two}"
+            );
+        }
+        let (c, mut t) = open_arena_fixture(16, 1, 2, 1);
+        t.metrics.source_sets_opening_two_arenas = u64::MAX;
+        assert!(!two_arena_gate(&c, &t, &c, &t).passed);
+        let source = include_str!("gpu_native_source_to_upload_copy_elision_production.rs");
+        let overall = source
+            .split("let passed = hma1b_two_arena.passed")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        assert!(overall.contains("source_upload_fd_proof.passed"));
     }
     #[test]
     fn source_upload_hma1b_gate_rejects_corrupt_missing_or_control_arena_activity() {
@@ -995,9 +1091,17 @@ mod tests {
             |m| m.arena_high_water = 2,
             |m| m.arena_high_water = 3,
             |m| m.source_sets_mapped = 0,
-            |m| m.source_sets_mapped = 2,
+            |m| m.source_sets_mapped = 3,
             |m| m.source_sets_mapped = u64::MAX,
             |m| m.source_slots_mapped += 1,
+            |m| m.source_sets_opening_two_arenas = 1,
+            |m| m.source_sets_opening_two_arenas = u64::MAX,
+            |m| m.leases_created += 1,
+            |m| m.direct_source_reads += 1,
+            |m| m.map_attempts += 1,
+            |m| m.map_completions += 1,
+            |m| m.unmaps += 1,
+            |m| m.remap_failures = 1,
             |m| m.arena_generation_errors = 1,
             |m| m.accounting_errors = 1,
             |m| m.leases_released -= 1,
@@ -1021,6 +1125,7 @@ mod tests {
             |m| m.arena_high_water = 1,
             |m| m.source_sets_mapped = 1,
             |m| m.source_slots_mapped = 1,
+            |m| m.source_sets_opening_two_arenas = 1,
             |m| m.arena_generation_errors = 1,
         ];
         for mutate in control_mutations {

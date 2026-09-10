@@ -56,6 +56,8 @@ pub(crate) struct Metrics {
     pub(crate) arena_high_water: u64,
     pub(crate) source_sets_mapped: u64,
     pub(crate) source_slots_mapped: u64,
+    /// Successful original source calls that map two new arena generations.
+    pub(crate) source_sets_opening_two_arenas: u64,
     pub(crate) arena_generation_errors: u64,
     pub(crate) alignment_failures: u64,
     pub(crate) leases_created: u64,
@@ -125,37 +127,45 @@ pub(crate) struct Snapshot {
 enum ArenaPhase {
     Available,
     Mapping,
-    Mapped,
+    OpenMapped,
     Ready,
     Poisoned,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LeasePhase {
+    Free,
+    Reserved,
+    Pending,
     Ready,
     Encoded,
     Submitted,
     Released,
 }
 
-/// A generation owns the entire buffer, including unused slots. A released
-/// prefix never makes it available. An uncertain encoded/submission lifetime
-/// poisons the arena permanently; stale tokens cannot mutate a new generation.
+/// One mapping remains live while disjoint source slots accumulate. Reserved
+/// slots pin that mapping through all temporary views and I/O. Sealing is per
+/// arena, under its state lock; a released prefix never enables append/reuse.
 #[derive(Debug)]
 struct ArenaGeneration {
     phase: ArenaPhase,
     generation: u64,
-    width: usize,
     leases: [LeasePhase; ARENA_WIDTH],
+    // BUFFER offset established from the first mapped view, not a host pointer.
+    aligned_base: Option<usize>,
     ever_mapped: bool,
+    map_pending: bool,
+    mapping_live: bool,
 }
 impl Default for ArenaGeneration {
     fn default() -> Self {
         Self {
             phase: ArenaPhase::Available,
             generation: 0,
-            width: 0,
-            leases: [LeasePhase::Released; ARENA_WIDTH],
+            leases: [LeasePhase::Free; ARENA_WIDTH],
+            aligned_base: None,
             ever_mapped: false,
+            map_pending: false,
+            mapping_live: false,
         }
     }
 }
@@ -165,38 +175,88 @@ fn generation_error(m: &mut Metrics) -> String {
     "invalid upload arena generation/lifecycle".into()
 }
 impl ArenaGeneration {
-    fn reserve(&mut self, width: usize, m: &mut Metrics) -> Result<u64, String> {
-        if self.phase != ArenaPhase::Available || width == 0 || width > ARENA_WIDTH {
+    fn free_slots(&self) -> Vec<usize> {
+        if !matches!(self.phase, ArenaPhase::Available | ArenaPhase::OpenMapped)
+            || self.leases.contains(&LeasePhase::Reserved)
+        {
+            return Vec::new();
+        }
+        self.leases
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| (*p == LeasePhase::Free).then_some(i))
+            .collect()
+    }
+    fn reserved_is(&self, r: &SlotReservation) -> bool {
+        self.generation == r.generation
+            && matches!(self.phase, ArenaPhase::Mapping | ArenaPhase::OpenMapped)
+            && !r.slots.is_empty()
+            && r.slots.iter().enumerate().all(|(i, &slot)| {
+                slot < ARENA_WIDTH
+                    && !r.slots[..i].contains(&slot)
+                    && self.leases[slot] == LeasePhase::Reserved
+            })
+    }
+    fn mapped(&mut self, generation: u64, base: usize, m: &mut Metrics) -> Result<(), String> {
+        if self.generation != generation
+            || self.phase != ArenaPhase::Mapping
+            || slot_offset(base, ARENA_WIDTH - 1, UPLOAD_BYTES).is_err()
+        {
             return Err(generation_error(m));
         }
-        let next = self
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| generation_error(m))?;
-        self.generation = next;
-        self.width = width;
-        self.leases = [LeasePhase::Released; ARENA_WIDTH];
-        self.leases[..width].fill(LeasePhase::Ready);
-        self.phase = ArenaPhase::Mapping;
-        Ok(next)
+        self.aligned_base = Some(base);
+        self.ever_mapped = true;
+        self.map_pending = false;
+        self.mapping_live = true;
+        self.phase = ArenaPhase::OpenMapped;
+        Ok(())
     }
-    fn transition(
+    fn populate(&mut self, r: &SlotReservation, m: &mut Metrics) -> Result<(), String> {
+        if !self.reserved_is(r) || self.phase != ArenaPhase::OpenMapped || !self.mapping_live {
+            return Err(generation_error(m));
+        }
+        for &slot in &r.slots {
+            self.leases[slot] = LeasePhase::Pending;
+        }
+        Ok(())
+    }
+    fn seal(
         &mut self,
         generation: u64,
-        expected: ArenaPhase,
-        next: ArenaPhase,
         m: &mut Metrics,
+        unmap: impl FnOnce(),
     ) -> Result<(), String> {
-        if self.generation != generation || self.phase != expected {
+        if self.generation != generation {
             return Err(generation_error(m));
         }
-        self.phase = next;
-        Ok(())
+        match self.phase {
+            ArenaPhase::Ready => Ok(()),
+            ArenaPhase::OpenMapped
+                if !self.leases.contains(&LeasePhase::Reserved)
+                    && self.aligned_base.is_some()
+                    && self.mapping_live =>
+            {
+                // Reserved slots are held until every BufferViewMut is dropped.
+                // The caller holds this arena's lock across the actual unmap.
+                unmap();
+                self.mapping_live = false;
+                m.add(|m| &mut m.unmaps, 1);
+                m.add(|m| &mut m.arena_unmaps, 1);
+                for phase in &mut self.leases {
+                    if *phase == LeasePhase::Pending {
+                        *phase = LeasePhase::Ready;
+                    }
+                }
+                self.phase = ArenaPhase::Ready;
+                Ok(())
+            }
+            _ => Err(generation_error(m)),
+        }
     }
     fn lease_is(&self, generation: u64, slot: usize, phase: LeasePhase) -> bool {
         self.generation == generation
             && self.phase == ArenaPhase::Ready
-            && slot < self.width
+            && slot < ARENA_WIDTH
             && self.leases[slot] == phase
     }
     fn lease_transition(
@@ -207,7 +267,14 @@ impl ArenaGeneration {
         next: LeasePhase,
         m: &mut Metrics,
     ) -> Result<(), String> {
-        if !self.lease_is(generation, slot, expected) {
+        if !self.lease_is(generation, slot, expected)
+            || !matches!(
+                (expected, next),
+                (LeasePhase::Ready, LeasePhase::Encoded)
+                    | (LeasePhase::Encoded, LeasePhase::Submitted)
+                    | (LeasePhase::Encoded, LeasePhase::Ready)
+            )
+        {
             return Err(generation_error(m));
         }
         self.leases[slot] = next;
@@ -216,8 +283,11 @@ impl ArenaGeneration {
     fn release(&mut self, generation: u64, slot: usize, m: &mut Metrics) -> Result<(), String> {
         if self.generation != generation
             || self.phase != ArenaPhase::Ready
-            || slot >= self.width
-            || self.leases[slot] == LeasePhase::Released
+            || slot >= ARENA_WIDTH
+            || !matches!(
+                self.leases[slot],
+                LeasePhase::Ready | LeasePhase::Encoded | LeasePhase::Submitted
+            )
         {
             return Err(generation_error(m));
         }
@@ -231,45 +301,134 @@ impl ArenaGeneration {
         }
         self.leases[slot] = LeasePhase::Released;
         m.add(|m| &mut m.leases_released, 1);
-        if self.leases[..self.width]
-            .iter()
-            .all(|p| *p == LeasePhase::Released)
-        {
-            self.phase = ArenaPhase::Available;
+        if self.active_leases() == 0 {
+            self.make_available();
         }
         Ok(())
     }
-    fn abort_mapping(&mut self, generation: u64, m: &mut Metrics) -> Result<(), String> {
-        if self.generation != generation
-            || !matches!(self.phase, ArenaPhase::Mapping | ArenaPhase::Mapped)
-        {
+    fn make_available(&mut self) {
+        self.phase = ArenaPhase::Available;
+        self.aligned_base = None;
+        self.map_pending = false;
+        self.mapping_live = false;
+        self.leases.fill(LeasePhase::Free);
+    }
+    fn rollback(
+        &mut self,
+        r: &SlotReservation,
+        m: &mut Metrics,
+        unmap: impl FnOnce(),
+    ) -> Result<(), String> {
+        if !self.reserved_is(r) {
             return Err(generation_error(m));
         }
-        m.add(|m| &mut m.leases_dropped_unconsumed, self.width as u64);
-        m.add(|m| &mut m.leases_released, self.width as u64);
-        self.leases.fill(LeasePhase::Released);
-        self.phase = ArenaPhase::Available;
+        for &slot in &r.slots {
+            self.leases[slot] = LeasePhase::Free;
+        }
+        m.add(|m| &mut m.leases_dropped_unconsumed, r.slots.len() as u64);
+        m.add(|m| &mut m.leases_released, r.slots.len() as u64);
+        if self.active_leases() == 0 {
+            // Also cancel any failed/incomplete map_async; count unmap only for
+            // a successful live mapping, exactly as in the original metrics.
+            if self.map_pending || self.mapping_live {
+                unmap();
+            }
+            if self.mapping_live {
+                m.add(|m| &mut m.unmaps, 1);
+                m.add(|m| &mut m.arena_unmaps, 1);
+            }
+            self.make_available();
+        }
         Ok(())
     }
     fn active_leases(&self) -> usize {
-        self.leases[..self.width]
+        self.leases
             .iter()
-            .filter(|p| **p != LeasePhase::Released)
+            .filter(|p| !matches!(p, LeasePhase::Free | LeasePhase::Released))
             .count()
     }
 }
-fn reserve_arena<'a>(
+#[derive(Debug)]
+struct SlotReservation {
+    index: usize,
+    generation: u64,
+    slots: Vec<usize>,
+    new_generation: bool,
+}
+
+/// Preflight the complete set while both short state locks are held. Allocation
+/// prefers one arena with enough unused slots, then splits in arena/slot order
+/// when only the combined free capacity fits. No waiting, whole-generation
+/// allocation, or I/O.
+fn reserve_slots<'a>(
     states: impl Iterator<Item = &'a Mutex<ArenaGeneration>>,
     width: usize,
     m: &mut Metrics,
-) -> Result<(usize, u64), String> {
-    for (i, state) in states.enumerate() {
-        let mut state = state.lock();
-        if state.phase == ArenaPhase::Available {
-            return state.reserve(width, m).map(|generation| (i, generation));
+) -> Result<Vec<SlotReservation>, String> {
+    if width == 0 || width > CAPACITY {
+        return Err(generation_error(m));
+    }
+    let mut states = states.map(Mutex::lock).collect::<Vec<_>>();
+    let mut remaining = width;
+    let mut reservations = Vec::new();
+    let whole = states.iter().position(|a| a.free_slots().len() >= width);
+    for (index, state) in states.iter().enumerate() {
+        if whole.is_some_and(|chosen| chosen != index) {
+            continue;
+        }
+        let slots = state
+            .free_slots()
+            .into_iter()
+            .take(remaining)
+            .collect::<Vec<_>>();
+        if slots.is_empty() {
+            continue;
+        }
+        let new_generation = state.phase == ArenaPhase::Available;
+        let generation = if new_generation {
+            state
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| generation_error(m))?
+        } else {
+            state.generation
+        };
+        remaining -= slots.len();
+        reservations.push(SlotReservation {
+            index,
+            generation,
+            slots,
+            new_generation,
+        });
+        if remaining == 0 {
+            break;
         }
     }
-    Err(generation_error(m))
+    if remaining != 0 {
+        // True bounded capacity/busy mapping pressure is not a stale generation.
+        return Err("upload expert-slot capacity unavailable".into());
+    }
+    for r in &reservations {
+        let state = &mut states[r.index];
+        if r.new_generation {
+            state.generation = r.generation;
+            state.phase = ArenaPhase::Mapping;
+        }
+        for &slot in &r.slots {
+            state.leases[slot] = LeasePhase::Reserved;
+        }
+    }
+    m.add(|m| &mut m.leases_created, width as u64);
+    m.high_water = m
+        .high_water
+        .max(states.iter().map(|a| a.active_leases() as u64).sum());
+    m.arena_high_water = m.arena_high_water.max(
+        states
+            .iter()
+            .filter(|a| a.phase != ArenaPhase::Available)
+            .count() as u64,
+    );
+    Ok(reservations)
 }
 struct Arena {
     buffer: wgpu::Buffer,
@@ -280,81 +439,108 @@ struct Ring {
     arenas: [Arena; ARENAS],
 }
 
-/// Sole mapping owner, declared before every view. Drop therefore cancels only
-/// after all mapped borrows are destroyed, including async cancellation/errors.
-struct ArenaMapping {
+/// Declared before temporary views. Error/cancellation drops those views before
+/// rolling back only this operation's Reserved slots, preserving older Pending
+/// slots and their still-live mapping. No Lease escapes a partial source read.
+struct SourceReservation {
     state: Arc<State>,
-    index: usize,
-    generation: u64,
-    width: usize,
-    mapped: bool,
+    slots: Vec<SlotReservation>,
     armed: bool,
 }
-impl ArenaMapping {
-    fn arena(&self) -> &Arena {
-        &self.state.ring.as_ref().expect("treatment ring").arenas[self.index]
+impl SourceReservation {
+    fn arena(&self, r: &SlotReservation) -> &Arena {
+        &self.state.ring.as_ref().expect("treatment ring").arenas[r.index]
     }
-    fn into_leases(mut self, ids: &[u32], aligned_base: usize) -> Result<Vec<Lease>, String> {
-        if ids.len() != self.width {
-            return Err(generation_error(&mut self.state.metrics.lock()));
-        }
-        let offsets = (0..self.width)
-            .map(|slot| slot_offset(aligned_base, slot, UPLOAD_BYTES))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                self.state.add(|m| &mut m.alignment_failures, 1);
-                e
-            })?;
-        let mut generation = self.arena().state.lock();
-        if generation.generation != self.generation || generation.phase != ArenaPhase::Mapped {
-            return Err(generation_error(&mut self.state.metrics.lock()));
-        }
-        self.arena().buffer.unmap();
-        generation.transition(
-            self.generation,
-            ArenaPhase::Mapped,
-            ArenaPhase::Ready,
-            &mut self.state.metrics.lock(),
-        )?;
-        drop(generation);
-        self.mapped = false;
-        self.state.record_unmap();
-        self.armed = false;
-        Ok(ids
+    fn commit(mut self, ids: &[u32], payloads: &[Arc<[u8]>]) -> Result<Vec<Lease>, String> {
+        let mut states = self
+            .slots
             .iter()
-            .zip(offsets)
-            .enumerate()
-            .map(|(slot, (&id, offset))| Lease {
-                state: self.state.clone(),
-                index: self.index,
-                generation: self.generation,
-                slot,
-                id,
-                offset,
-                payload: None,
+            .map(|r| self.arena(r).state.lock())
+            .collect::<Vec<_>>();
+        if ids.len() != self.slots.iter().map(|r| r.slots.len()).sum::<usize>()
+            || ids.len() != payloads.len()
+            || states.iter().zip(&self.slots).any(|(a, r)| {
+                !a.reserved_is(r)
+                    || a.phase != ArenaPhase::OpenMapped
+                    || !a.mapping_live
+                    || a.aligned_base.is_none()
             })
-            .collect())
+        {
+            return Err(generation_error(&mut self.state.metrics.lock()));
+        }
+        let offsets = states
+            .iter()
+            .zip(&self.slots)
+            .flat_map(|(a, r)| {
+                r.slots
+                    .iter()
+                    .map(|&slot| slot_offset(a.aligned_base.unwrap(), slot, UPLOAD_BYTES))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (a, r) in states.iter_mut().zip(&self.slots) {
+            a.populate(r, &mut self.state.metrics.lock())?;
+        }
+        let mut leases = Vec::with_capacity(ids.len());
+        for r in &self.slots {
+            for &slot in &r.slots {
+                let i = leases.len();
+                leases.push(Lease {
+                    state: self.state.clone(),
+                    index: r.index,
+                    generation: r.generation,
+                    slot,
+                    id: ids[i],
+                    offset: offsets[i],
+                    payload: Some(payloads[i].clone()),
+                });
+            }
+        }
+        drop(states);
+        self.armed = false;
+        self.state.add(|m| &mut m.source_sets_mapped, 1);
+        self.state
+            .add(|m| &mut m.source_slots_mapped, ids.len() as u64);
+        if self.slots.iter().filter(|r| r.new_generation).count() == ARENAS {
+            self.state.add(|m| &mut m.source_sets_opening_two_arenas, 1);
+        }
+        Ok(leases)
     }
 }
-impl Drop for ArenaMapping {
+impl Drop for SourceReservation {
     fn drop(&mut self) {
         if self.armed {
-            let mut generation = self.arena().state.lock();
-            if generation.generation != self.generation
-                || !matches!(generation.phase, ArenaPhase::Mapping | ArenaPhase::Mapped)
-            {
-                let _ = generation_error(&mut self.state.metrics.lock());
-                return;
+            for r in &self.slots {
+                let arena = self.arena(r);
+                let _ = arena
+                    .state
+                    .lock()
+                    .rollback(r, &mut self.state.metrics.lock(), || arena.buffer.unmap());
             }
-            // No logical lease escapes until the successful unmap transition.
-            // Mapping failure still cancels map_async, but is not a successful unmap.
-            self.arena().buffer.unmap();
-            if self.mapped {
-                self.state.record_unmap();
-            }
-            let _ = generation.abort_mapping(self.generation, &mut self.state.metrics.lock());
         }
     }
+}
+
+/// Safe disjoint slicing shared with the portable source-order regressions.
+/// Reservation slot indices are ascending, but may contain rollback holes.
+fn source_destinations<'a>(
+    view: &'a mut [u8],
+    base: usize,
+    slots: &[usize],
+) -> Result<Vec<&'a mut [u8]>, String> {
+    let capacity = view.len();
+    let mut tail = view;
+    let mut end = 0;
+    let mut destinations = Vec::with_capacity(slots.len());
+    for &slot in slots {
+        let start = slot_offset(base, slot, capacity)?;
+        let skip = start.checked_sub(end).ok_or("overlapping source slots")?;
+        let (_, rest) = tail.split_at_mut(skip);
+        let (full, rest) = rest.split_at_mut(FULL);
+        destinations.push(full);
+        tail = rest;
+        end = start + FULL;
+    }
+    Ok(destinations)
 }
 
 pub(crate) struct State {
@@ -534,8 +720,16 @@ impl State {
                 .sum()
         })
     }
+    fn arenas_idle(&self) -> bool {
+        self.ring.as_ref().is_none_or(|r| {
+            r.arenas
+                .iter()
+                .all(|a| a.state.lock().phase == ArenaPhase::Available)
+        })
+    }
     pub(crate) fn reset(&self) -> Result<(), String> {
-        if self.active_leases() != 0
+        if !self.arenas_idle()
+            || self.active_leases() != 0
             || !self.pending.lock().is_empty()
             || (self.production_owned && self.production_demand_gate.available_permits() != 1)
         {
@@ -566,57 +760,52 @@ impl State {
         self.add(|m| &mut m.logical_admissions, new_ids.len() as u64);
         self.add(|m| &mut m.logical_generation_observations, ids.len() as u64);
     }
-    fn record_unmap(&self) {
-        let mut m = self.metrics.lock();
-        m.add(|m| &mut m.unmaps, 1);
-        m.add(|m| &mut m.arena_unmaps, 1);
-    }
-    fn acquire(self: &Arc<Self>, width: usize) -> Result<ArenaMapping, String> {
+    fn acquire(self: &Arc<Self>, width: usize) -> Result<SourceReservation, String> {
         self.add(|m| &mut m.acquisition_attempts, width as u64);
         let ring = self
             .ring
             .as_ref()
             .ok_or("control cannot acquire an upload arena")?;
-        // Never hold the metrics lock while acquiring an arena lock. Merge
-        // reservation errors after releasing the arena lock.
+        // Reserve under arena locks before taking metrics, preserving lock order.
         let mut reservation_metrics = Metrics::default();
-        let reserved = reserve_arena(
+        let reserved = reserve_slots(
             ring.arenas.iter().map(|a| &a.state),
             width,
             &mut reservation_metrics,
         );
-        self.add(
-            |m| &mut m.arena_generation_errors,
-            reservation_metrics.arena_generation_errors,
-        );
-        self.add(
-            |m| &mut m.accounting_errors,
-            reservation_metrics.accounting_errors,
-        );
-        let (index, generation) = reserved?;
-        let mut mapping = ArenaMapping {
-            state: self.clone(),
-            index,
-            generation,
-            width,
-            mapped: false,
-            armed: true,
-        };
-        self.add(|m| &mut m.leases_created, width as u64);
-        let active = self.active_leases() as u64;
-        let arenas = ring
-            .arenas
-            .iter()
-            .filter(|a| a.state.lock().phase != ArenaPhase::Available)
-            .count() as u64;
         {
             let mut m = self.metrics.lock();
-            m.high_water = m.high_water.max(active);
-            m.arena_high_water = m.arena_high_water.max(arenas);
+            m.add(
+                |m| &mut m.arena_generation_errors,
+                reservation_metrics.arena_generation_errors,
+            );
+            m.add(
+                |m| &mut m.accounting_errors,
+                reservation_metrics.accounting_errors,
+            );
+            m.add(
+                |m| &mut m.leases_created,
+                reservation_metrics.leases_created,
+            );
+            m.high_water = m.high_water.max(reservation_metrics.high_water);
+            m.arena_high_water = m.arena_high_water.max(reservation_metrics.arena_high_water);
         }
-        let arena = &ring.arenas[index];
+        let reservation = SourceReservation {
+            state: self.clone(),
+            slots: reserved?,
+            armed: true,
+        };
+        for r in &reservation.slots {
+            if r.new_generation {
+                self.map_generation(r)?;
+            }
+        }
+        Ok(reservation)
+    }
+    fn map_generation(&self, r: &SlotReservation) -> Result<(), String> {
+        let ring = self.ring.as_ref().expect("treatment ring");
+        let arena = &ring.arenas[r.index];
         let remap = arena.state.lock().ever_mapped;
-        // Resolve the GPU before starting a mapping that could be abandoned.
         let gpu = ring
             .executor
             .authoritative_gpu()
@@ -629,6 +818,7 @@ impl State {
         }
         let start = Instant::now();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        arena.state.lock().map_pending = true;
         arena
             .buffer
             .slice(..)
@@ -654,21 +844,30 @@ impl State {
             self.add(|m| &mut m.copy_failures, 1);
             return Err(error);
         }
-        mapping.mapped = true;
-        arena.state.lock().transition(
-            generation,
-            ArenaPhase::Mapping,
-            ArenaPhase::Mapped,
-            &mut self.metrics.lock(),
-        )?;
+        {
+            let mut state = arena.state.lock();
+            state.map_pending = false;
+            state.mapping_live = true;
+            state.ever_mapped = true;
+        }
         self.add(|m| &mut m.map_completions, 1);
         self.add(|m| &mut m.arena_map_completions, 1);
         if remap {
             self.add(|m| &mut m.remap_completions, 1);
             self.add(|m| &mut m.arena_remap_completions, 1);
         }
-        arena.state.lock().ever_mapped = true;
-        Ok(mapping)
+        let view = arena.buffer.slice(..).get_mapped_range_mut();
+        let base = aligned_offset(view.as_ptr() as usize, view.len());
+        drop(view);
+        let base = base.map_err(|e| {
+            self.add(|m| &mut m.alignment_failures, 1);
+            e
+        })?;
+        arena
+            .state
+            .lock()
+            .mapped(r.generation, base, &mut self.metrics.lock())?;
+        Ok(())
     }
     pub(crate) async fn read_source(
         self: &Arc<Self>,
@@ -703,30 +902,30 @@ impl State {
                 return Err("non-shared logical admission prevents source fusion".into());
             }
         }
-        // Keep original ID order and a single storage batch even for a source
-        // set wider than eight: its two arena views supply one destination list.
-        let mappings = ids
-            .chunks(ARENA_WIDTH)
-            .map(|chunk| self.acquire(chunk.len()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut views = mappings
+        // Each original source call owns one transaction and one storage batch.
+        // The reservation is declared before every mapped borrow for safe Drop.
+        let reservation = self.acquire(ids.len())?;
+        let mut views = reservation
+            .slots
             .iter()
-            .map(|a| a.arena().buffer.slice(..).get_mapped_range_mut())
+            .map(|r| reservation.arena(r).buffer.slice(..).get_mapped_range_mut())
             .collect::<Vec<_>>();
-        let offsets = views
+        let bases = reservation
+            .slots
             .iter()
-            .map(|v| aligned_offset(v.as_ptr() as usize, v.len()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                self.add(|m| &mut m.alignment_failures, 1);
-                e
-            })?;
+            .map(|r| {
+                reservation
+                    .arena(r)
+                    .state
+                    .lock()
+                    .aligned_base
+                    .ok_or("missing mapped alignment")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut destinations = Vec::with_capacity(ids.len());
-        for ((view, &offset), mapping) in views.iter_mut().zip(&offsets).zip(&mappings) {
-            destinations.extend(view[offset..offset + mapping.width * FULL].chunks_exact_mut(FULL));
+        for ((view, &base), r) in views.iter_mut().zip(&bases).zip(&reservation.slots) {
+            destinations.extend(source_destinations(view, base, &r.slots)?);
         }
-        self.add(|m| &mut m.source_sets_mapped, 1);
-        self.add(|m| &mut m.source_slots_mapped, ids.len() as u64);
         let started = Instant::now();
         let result = storage
             .read_experts_batch_into_aligned_slices(ids, &mut destinations)
@@ -750,33 +949,37 @@ impl State {
             (ids.len() * PAYLOAD) as u64,
         );
         let mut shared = Vec::with_capacity(ids.len());
-        for (i, &id) in ids.iter().enumerate() {
-            let view = &views[i / ARENA_WIDTH];
-            let offset = slot_offset(offsets[i / ARENA_WIDTH], i % ARENA_WIDTH, view.len())?;
-            let payload = checked_payload(&view[offset..offset + FULL])?;
-            let bytes = self.materialize_source_payload(id, payload, logical)?;
-            shared.push(bytes);
+        for ((view, &base), r) in views.iter().zip(&bases).zip(&reservation.slots) {
+            for &slot in &r.slots {
+                let offset = slot_offset(base, slot, view.len())?;
+                let payload = checked_payload(&view[offset..offset + FULL])?;
+                shared.push(self.materialize_source_payload(
+                    ids[shared.len()],
+                    payload,
+                    logical,
+                )?);
+            }
         }
-        // Views/slices precede unmap even on error or future cancellation.
+        // Reservation pins outlive all mapped borrows. Successful source calls
+        // leave their generation mapped; only physical lease consumption seals.
         drop(views);
-        let mut leases = Vec::with_capacity(ids.len());
-        for ((mapping, chunk), offset) in mappings
-            .into_iter()
-            .zip(ids.chunks(ARENA_WIDTH))
-            .zip(offsets)
-        {
-            leases.extend(mapping.into_leases(chunk, offset)?);
-        }
-        let mut residents = Vec::with_capacity(ids.len());
-        for ((lease, payload), capacity_lease) in leases.iter_mut().zip(shared).zip(buffers) {
-            lease.payload = Some(payload.clone());
-            residents.push(Arc::new(ExpertResident::new_qualification_shared(
-                lease.id,
-                capacity_lease,
-                payload,
-            )));
-        }
+        let residents = ids
+            .iter()
+            .zip(&shared)
+            .zip(buffers)
+            .map(|((&id, payload), capacity_lease)| {
+                Arc::new(ExpertResident::new_qualification_shared(
+                    id,
+                    capacity_lease,
+                    payload.clone(),
+                ))
+            })
+            .collect();
         let mut pending = self.pending.lock();
+        if ids.iter().any(|id| pending.contains_key(id)) {
+            return Err(generation_error(&mut self.metrics.lock()));
+        }
+        let leases = reservation.commit(ids, &shared)?;
         for lease in leases {
             pending.insert(lease.id, lease);
         }
@@ -821,19 +1024,24 @@ impl State {
         let lease = self.pending.lock().remove(&id);
         if let Some(lease) = &lease {
             if self.arm != Arm::Treatment
+                || !std::ptr::eq(self, lease.state.as_ref())
                 || lease.id != resident.id
                 || !resident
                     .qualification_shared_payload()
                     .zip(lease.payload.as_ref())
                     .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
-                || !lease.arena().state.lock().lease_is(
-                    lease.generation,
-                    lease.slot,
-                    LeasePhase::Ready,
-                )
             {
                 self.add(|m| &mut m.accounting_errors, 1);
-                return Err("source/upload resident identity or unmap mismatch".into());
+                return Err("source/upload resident identity mismatch".into());
+            }
+            lease.seal()?;
+            if !lease
+                .arena()
+                .state
+                .lock()
+                .lease_is(lease.generation, lease.slot, LeasePhase::Ready)
+            {
+                return Err(generation_error(&mut self.metrics.lock()));
             }
         }
         Ok(lease)
@@ -842,15 +1050,19 @@ impl State {
         self.pending.lock().contains_key(&id)
     }
     pub(crate) fn finish_request(&self) -> Result<(), String> {
-        if !self.pending.lock().is_empty() || self.active_leases() != 0 {
+        if !self.arenas_idle() || !self.pending.lock().is_empty() || self.active_leases() != 0 {
             self.add(|m| &mut m.accounting_errors, 1);
-            self.pending.lock().clear();
+            self.abandon_pending();
             return Err("unconsumed upload lease at demand completion".into());
         }
         Ok(())
     }
     pub(crate) fn abandon_pending(&self) {
-        self.pending.lock().clear();
+        // Drain before dropping: each Lease seals under its own arena lock,
+        // then releases normally. Normal open-mapping abandonment is not an
+        // uncertain GPU submission; encoded generations still poison in Drop.
+        let pending = std::mem::take(&mut *self.pending.lock());
+        drop(pending);
     }
 }
 
@@ -971,6 +1183,15 @@ impl Drop for CopySet<'_> {
     }
 }
 impl Lease {
+    fn seal(&self) -> Result<(), String> {
+        let arena = self.arena();
+        arena
+            .state
+            .lock()
+            .seal(self.generation, &mut self.state.metrics.lock(), || {
+                arena.buffer.unmap()
+            })
+    }
     fn arena(&self) -> &Arena {
         &self.state.ring.as_ref().expect("treatment ring").arenas[self.index]
     }
@@ -982,9 +1203,8 @@ impl Lease {
         if !arena.lease_is(self.generation, self.slot, LeasePhase::Ready) {
             return Err(generation_error(&mut self.state.metrics.lock()));
         }
-        let base = self
-            .offset
-            .checked_sub(self.slot * FULL)
+        let base = arena
+            .aligned_base
             .ok_or_else(|| generation_error(&mut self.state.metrics.lock()))?;
         if slot_offset(base, self.slot, UPLOAD_BYTES)? != self.offset {
             return Err(generation_error(&mut self.state.metrics.lock()));
@@ -1011,6 +1231,9 @@ impl Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
+        if self.seal().is_err() {
+            return;
+        }
         let _ = self.arena().state.lock().release(
             self.generation,
             self.slot,
@@ -1192,15 +1415,6 @@ mod tests {
         assert!(aligned_offset(0x1001, UPLOAD_BYTES).is_err());
         assert!(aligned_offset(0x1000, FULL - 1).is_err());
     }
-    fn ready_generation(width: usize, m: &mut Metrics) -> (ArenaGeneration, u64) {
-        let mut a = ArenaGeneration::default();
-        let generation = a.reserve(width, m).unwrap();
-        a.transition(generation, ArenaPhase::Mapping, ArenaPhase::Mapped, m)
-            .unwrap();
-        a.transition(generation, ArenaPhase::Mapped, ArenaPhase::Ready, m)
-            .unwrap();
-        (a, generation)
-    }
     #[test]
     fn source_upload_hma1b_geometry_alignment_and_all_copy_ranges() {
         assert_eq!((ARENAS, ARENA_WIDTH, CAPACITY), (2, 8, 16));
@@ -1225,28 +1439,366 @@ mod tests {
         assert!(slot_offset(4096, 0, UPLOAD_BYTES).is_err());
         assert!(slot_offset(8, 7, 8 * FULL).is_err());
     }
+    fn test_arenas() -> [Mutex<ArenaGeneration>; ARENAS] {
+        std::array::from_fn(|_| Mutex::new(ArenaGeneration::default()))
+    }
+    fn source_slots(
+        arenas: &[Mutex<ArenaGeneration>],
+        width: usize,
+        m: &mut Metrics,
+    ) -> Vec<SlotReservation> {
+        let slots = reserve_slots(arenas.iter(), width, m).unwrap();
+        for r in &slots {
+            let mut a = arenas[r.index].lock();
+            if r.new_generation {
+                // Portable stand-in for the first mapping's address; all actual
+                // state transitions/allocation/slicing use the production code.
+                a.mapped(r.generation, ALIGN - 8, m).unwrap();
+            }
+            a.populate(r, m).unwrap();
+        }
+        slots
+    }
+    fn ready_generation(width: usize, m: &mut Metrics) -> (ArenaGeneration, u64) {
+        let arenas = test_arenas();
+        let slots = source_slots(&arenas, width, m);
+        let r = &slots[0];
+        let mut a = arenas[0].lock();
+        a.seal(r.generation, m, || {}).unwrap();
+        (std::mem::take(&mut *a), r.generation)
+    }
+    #[test]
+    fn source_upload_hma1b1_sixteen_singletons_before_consumption_then_true_capacity() {
+        let arenas = test_arenas();
+        let mut m = Metrics::default();
+        for n in 1..=16 {
+            source_slots(&arenas, 1, &mut m);
+            assert_eq!(
+                arenas
+                    .iter()
+                    .map(|a| a.lock().active_leases())
+                    .sum::<usize>(),
+                n
+            );
+            assert_eq!(
+                arenas
+                    .iter()
+                    .map(|a| a
+                        .lock()
+                        .leases
+                        .iter()
+                        .filter(|p| **p == LeasePhase::Pending)
+                        .count())
+                    .sum::<usize>(),
+                n
+            );
+        }
+        assert_eq!((m.high_water, m.arena_high_water), (16, 2));
+        assert_eq!(m.leases_created, 16);
+        assert!(reserve_slots(arenas.iter(), 1, &mut m)
+            .unwrap_err()
+            .contains("capacity"));
+        assert_eq!(m.arena_generation_errors, 0);
+        assert_eq!(m.leases_created, 16);
+        for a in &arenas {
+            let a = a.lock();
+            assert_eq!(a.generation, 1);
+            assert_eq!(a.phase, ArenaPhase::OpenMapped);
+        }
+    }
+    #[test]
+    fn source_upload_hma1b1_width_sequences_do_not_fragment() {
+        for widths in [&[5, 5, 6][..], &[8, 8], &[3, 7, 2, 4], &[16]] {
+            let arenas = test_arenas();
+            let mut m = Metrics::default();
+            for &width in widths {
+                source_slots(&arenas, width, &mut m);
+            }
+            assert_eq!(m.high_water, 16, "{widths:?}");
+            assert_eq!(m.arena_high_water, 2);
+            assert!(reserve_slots(arenas.iter(), 1, &mut m).is_err());
+            assert_eq!(m.arena_generation_errors, 0);
+        }
+    }
+    #[test]
+    fn source_upload_hma1b1_every_composition_of_sixteen_fits() {
+        // Every ordered partition of 16: includes singleton, mixed-width and
+        // single wide-call cases rather than only the motivating examples.
+        for cuts in 0u32..(1 << 15) {
+            let arenas = test_arenas();
+            let mut m = Metrics::default();
+            let mut width = 1;
+            for position in 0..16 {
+                if position == 15 || cuts & (1 << position) != 0 {
+                    source_slots(&arenas, width, &mut m);
+                    width = 1;
+                } else {
+                    width += 1;
+                }
+            }
+            assert_eq!(m.high_water, 16);
+            assert_eq!(m.arena_generation_errors, 0);
+        }
+    }
+    #[test]
+    fn source_upload_hma1b1_split_source_keeps_ids_destinations_and_one_batch() {
+        let arenas = test_arenas();
+        let mut m = Metrics::default();
+        source_slots(&arenas, 5, &mut m);
+        source_slots(&arenas, 5, &mut m);
+        let reserved = reserve_slots(arenas.iter(), 6, &mut m).unwrap();
+        assert_eq!(
+            reserved
+                .iter()
+                .map(|r| (r.index, r.slots.clone()))
+                .collect::<Vec<_>>(),
+            vec![(0, vec![5, 6, 7]), (1, vec![5, 6, 7])]
+        );
+        let mut views: [Vec<u8>; ARENAS] = std::array::from_fn(|_| vec![0x55; UPLOAD_BYTES]);
+        let bases = views
+            .iter()
+            .map(|v| aligned_offset(v.as_ptr() as usize, v.len()).unwrap())
+            .collect::<Vec<_>>();
+        let ids = [91u32, 3, 44, 18, 7, 62];
+        let mut destinations = Vec::new();
+        for ((view, &base), r) in views.iter_mut().zip(&bases).zip(&reserved) {
+            destinations.extend(source_destinations(view, base, &r.slots).unwrap());
+        }
+        let mut batch_calls = 0;
+        let mut batch = |ordered_ids: &[u32], dst: &mut [&mut [u8]]| {
+            batch_calls += 1;
+            assert_eq!(ordered_ids, ids);
+            assert_eq!(dst.len(), ordered_ids.len());
+            for (&id, slot) in ordered_ids.iter().zip(dst) {
+                assert_eq!(slot.len(), FULL);
+                assert_eq!(slot.as_ptr() as usize % ALIGN, 0);
+                slot[..4].copy_from_slice(&id.to_le_bytes());
+                slot[FULL - 1] = id as u8;
+            }
+        };
+        batch(&ids, &mut destinations);
+        assert_eq!(batch_calls, 1);
+        drop(destinations);
+        for (i, &id) in ids.iter().enumerate() {
+            let arena = i / 3;
+            let offset = slot_offset(bases[arena], 5 + i % 3, UPLOAD_BYTES).unwrap();
+            assert_eq!(&views[arena][offset..offset + 4], &id.to_le_bytes());
+            assert_eq!(views[arena][offset + FULL - 1], id as u8);
+        }
+        for (view, &base) in views.iter().zip(&bases) {
+            assert!(view[base..base + 5 * FULL].iter().all(|b| *b == 0x55));
+        }
+    }
+    #[test]
+    fn source_upload_hma1b1_append_preserves_one_base_and_disjoint_full_ranges() {
+        let arenas = test_arenas();
+        let mut m = Metrics::default();
+        let mut view = vec![0u8; UPLOAD_BYTES];
+        let base = aligned_offset(view.as_ptr() as usize, view.len()).unwrap();
+        let mut offsets = Vec::new();
+        for id in 1u8..=8 {
+            let r = reserve_slots(arenas.iter(), 1, &mut m).unwrap().remove(0);
+            let mut a = arenas[0].lock();
+            if r.new_generation {
+                a.mapped(r.generation, base, &mut m).unwrap();
+            }
+            assert_eq!(a.aligned_base, Some(base));
+            let offset = slot_offset(a.aligned_base.unwrap(), r.slots[0], UPLOAD_BYTES).unwrap();
+            offsets.push(offset);
+            let mut dst =
+                source_destinations(&mut view, a.aligned_base.unwrap(), &r.slots).unwrap();
+            dst[0].fill(id);
+            drop(dst);
+            a.populate(&r, &mut m).unwrap();
+        }
+        assert!(offsets.windows(2).all(|w| w[0] + FULL == w[1]));
+        for (i, offset) in offsets.into_iter().enumerate() {
+            assert!(view[offset..offset + FULL]
+                .iter()
+                .all(|b| *b == (i + 1) as u8));
+        }
+    }
+    #[test]
+    fn source_upload_hma1b1_concurrent_first_consumers_seal_once_and_forbid_append() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let arenas = test_arenas();
+        let mut m = Metrics::default();
+        let first = source_slots(&arenas, 1, &mut m);
+        source_slots(&arenas, 1, &mut m);
+        let gen = first[0].generation;
+        let unmaps = AtomicUsize::new(0);
+        let metrics = Mutex::new(m);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for slot in 0..2 {
+                let (arenas, metrics, barrier, unmaps) = (&arenas, &metrics, &barrier, &unmaps);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let mut a = arenas[0].lock();
+                    a.seal(gen, &mut metrics.lock(), || {
+                        unmaps.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .unwrap();
+                    a.lease_transition(
+                        gen,
+                        slot,
+                        LeasePhase::Ready,
+                        LeasePhase::Encoded,
+                        &mut metrics.lock(),
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(unmaps.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.lock().arena_unmaps, 1);
+        assert!(arenas[0].lock().free_slots().is_empty());
+        assert_eq!(
+            reserve_slots(arenas.iter(), 1, &mut metrics.lock()).unwrap()[0].index,
+            1
+        );
+        assert!(reserve_slots(arenas.iter().take(1), 1, &mut metrics.lock()).is_err());
+    }
+    #[test]
+    fn source_upload_hma1b1_reserved_slots_pin_views_against_seal() {
+        let arenas = test_arenas();
+        let mut m = Metrics::default();
+        let first = source_slots(&arenas, 1, &mut m);
+        let append = reserve_slots(arenas.iter(), 2, &mut m).unwrap();
+        let mut a = arenas[0].lock();
+        assert!(a
+            .seal(first[0].generation, &mut m, || panic!(
+                "unmap with source views"
+            ))
+            .is_err());
+        a.rollback(&append[0], &mut m, || panic!("prior slots still mapped"))
+            .unwrap();
+        a.seal(first[0].generation, &mut m, || {}).unwrap();
+        assert_eq!(m.unmaps, 1);
+    }
+    #[test]
+    fn source_upload_hma1b1_rollback_preserves_committed_slots_and_reuses_holes() {
+        let arenas = test_arenas();
+        let mut m = Metrics::default();
+        let first = source_slots(&arenas, 3, &mut m);
+        let failed = reserve_slots(arenas.iter(), 5, &mut m).unwrap();
+        let base = arenas[0].lock().aligned_base;
+        arenas[0]
+            .lock()
+            .rollback(&failed[0], &mut m, || panic!("unmap prior data"))
+            .unwrap();
+        {
+            let a = arenas[0].lock();
+            assert_eq!(a.phase, ArenaPhase::OpenMapped);
+            assert_eq!(a.aligned_base, base);
+            assert_eq!(a.generation, first[0].generation);
+            assert_eq!(&a.leases[..3], &[LeasePhase::Pending; 3]);
+            assert_eq!(a.active_leases(), 3);
+        }
+        let retry = source_slots(&arenas, 5, &mut m);
+        assert_eq!(retry[0].slots, failed[0].slots);
+        assert!(!retry[0].new_generation);
+        assert_eq!(m.unmaps, 0);
+        assert_eq!(m.arena_generation_errors, 0);
+        assert_eq!(m.leases_released, 5);
+    }
+    #[test]
+    fn source_upload_hma1b1_split_rollback_and_mapping_cancellation_are_transactional() {
+        for mapped in [false, true] {
+            let arenas = test_arenas();
+            let mut m = Metrics::default();
+            source_slots(&arenas, 5, &mut m);
+            let failed = reserve_slots(arenas.iter(), 11, &mut m).unwrap();
+            assert_eq!(
+                failed.iter().map(|r| r.slots.len()).collect::<Vec<_>>(),
+                vec![3, 8]
+            );
+            let mut unmaps = 0;
+            for r in &failed {
+                let mut a = arenas[r.index].lock();
+                if r.new_generation {
+                    a.map_pending = true;
+                    if mapped {
+                        a.mapped(r.generation, 0, &mut m).unwrap();
+                    }
+                }
+                a.rollback(r, &mut m, || {
+                    unmaps += 1;
+                })
+                .unwrap();
+            }
+            assert_eq!(unmaps, 1);
+            assert_eq!(m.unmaps, u64::from(mapped));
+            assert_eq!(arenas[0].lock().active_leases(), 5);
+            assert_eq!(arenas[1].lock().phase, ArenaPhase::Available);
+            assert_eq!(arenas[1].lock().aligned_base, None);
+            source_slots(&arenas, 11, &mut m);
+            assert_eq!(m.high_water, 16);
+            assert_eq!(m.arena_generation_errors, 0);
+        }
+    }
+    #[test]
+    fn source_upload_hma1b1_early_and_alignment_error_mapping_cleanup_is_exact() {
+        for completed_map in [false, true] {
+            let arenas = test_arenas();
+            let mut m = Metrics::default();
+            let r = reserve_slots(arenas.iter(), 1, &mut m).unwrap().remove(0);
+            let mut a = arenas[0].lock();
+            // Failure before map_async, or after callback success but before
+            // aligned_offset validation can establish OpenMapped.
+            a.mapping_live = completed_map;
+            a.ever_mapped = completed_map;
+            let mut unmaps = 0;
+            a.rollback(&r, &mut m, || {
+                unmaps += 1;
+            })
+            .unwrap();
+            assert_eq!(unmaps, usize::from(completed_map));
+            assert_eq!(m.unmaps, u64::from(completed_map));
+            assert_eq!(a.phase, ArenaPhase::Available);
+            assert!(!a.mapping_live);
+            assert_eq!(a.active_leases(), 0);
+            assert_eq!(m.arena_generation_errors, 0);
+        }
+    }
+    #[test]
+    fn source_upload_hma1b1_abandon_open_mapping_unmaps_once_without_poison() {
+        let arenas = test_arenas();
+        let mut m = Metrics::default();
+        let slots = source_slots(&arenas, 3, &mut m);
+        let mut a = arenas[0].lock();
+        for slot in 0..3 {
+            // Exact Lease::drop order used by abandon_pending and both guards.
+            a.seal(slots[0].generation, &mut m, || {}).unwrap();
+            a.release(slots[0].generation, slot, &mut m).unwrap();
+            assert_eq!(a.phase == ArenaPhase::Available, slot == 2);
+        }
+        assert_eq!(m.unmaps, 1);
+        assert_eq!(m.leases_dropped_unconsumed, 3);
+        assert_eq!(m.leases_created, m.leases_released);
+        assert_eq!(m.arena_generation_errors, 0);
+        drop(a);
+        let fresh = reserve_slots(arenas.iter(), 1, &mut m).unwrap();
+        assert_eq!(fresh[0].generation, 2);
+        // New virtual mapping => a new buffer alignment, never old pointer reuse.
+        arenas[0].lock().mapped(2, 0, &mut m).unwrap();
+        assert_eq!(arenas[0].lock().aligned_base, Some(0));
+    }
     #[test]
     fn source_upload_hma1b_complete_generations_submit_release_and_remap() {
+        let arenas = test_arenas();
         let mut m = Metrics::default();
-        let mut a = ArenaGeneration::default();
         for expected in 1..=3 {
-            let generation = a.reserve(8, &mut m).unwrap();
-            assert_eq!(generation, expected);
-            a.transition(generation, ArenaPhase::Mapping, ArenaPhase::Mapped, &mut m)
-                .unwrap();
-            a.transition(generation, ArenaPhase::Mapped, ArenaPhase::Ready, &mut m)
-                .unwrap();
+            let slots = source_slots(&arenas, 8, &mut m);
+            let gen = slots[0].generation;
+            assert_eq!(gen, expected);
+            let mut a = arenas[0].lock();
+            a.seal(gen, &mut m, || {}).unwrap();
             for slot in 0..8 {
+                a.lease_transition(gen, slot, LeasePhase::Ready, LeasePhase::Encoded, &mut m)
+                    .unwrap();
                 a.lease_transition(
-                    generation,
-                    slot,
-                    LeasePhase::Ready,
-                    LeasePhase::Encoded,
-                    &mut m,
-                )
-                .unwrap();
-                a.lease_transition(
-                    generation,
+                    gen,
                     slot,
                     LeasePhase::Encoded,
                     LeasePhase::Submitted,
@@ -1254,48 +1806,18 @@ mod tests {
                 )
                 .unwrap();
             }
+            assert!(a.free_slots().is_empty());
             for (released, slot) in [3, 7, 0, 5, 1, 6, 4, 2].into_iter().enumerate() {
-                a.release(generation, slot, &mut m).unwrap();
+                a.release(gen, slot, &mut m).unwrap();
                 assert_eq!(a.active_leases(), 7 - released);
                 assert_eq!(a.phase == ArenaPhase::Available, released == 7);
+                if released != 7 {
+                    assert!(a.free_slots().is_empty());
+                }
             }
         }
         assert_eq!(m.leases_released, 24);
         assert_eq!(m.leases_dropped_unconsumed, 0);
-        assert_eq!(m.arena_generation_errors, 0);
-    }
-    #[test]
-    fn source_upload_hma1b_generation_waits_for_last_partial_or_abandoned_lease() {
-        let mut m = Metrics::default();
-        let (mut a, generation) = ready_generation(8, &mut m);
-        for slot in 0..4 {
-            a.lease_transition(
-                generation,
-                slot,
-                LeasePhase::Ready,
-                LeasePhase::Encoded,
-                &mut m,
-            )
-            .unwrap();
-            a.lease_transition(
-                generation,
-                slot,
-                LeasePhase::Encoded,
-                LeasePhase::Submitted,
-                &mut m,
-            )
-            .unwrap();
-            a.release(generation, slot, &mut m).unwrap();
-            assert_eq!(a.phase, ArenaPhase::Ready);
-        }
-        // Unconsumed pending leases may be abandoned, but only the final one
-        // releases the buffer shared with the already-submitted prefix.
-        for slot in 4..8 {
-            a.release(generation, slot, &mut m).unwrap();
-            assert_eq!(a.phase == ArenaPhase::Available, slot == 7);
-        }
-        assert_eq!(m.leases_released, 8);
-        assert_eq!(m.leases_dropped_unconsumed, 4);
         assert_eq!(m.arena_generation_errors, 0);
     }
     #[test]
@@ -1311,82 +1833,62 @@ mod tests {
             .is_err());
         a.release(old, 0, &mut m).unwrap();
         assert!(a.release(old, 0, &mut m).is_err());
-        let new = a.reserve(2, &mut m).unwrap();
-        assert_ne!(old, new);
+        let arenas = [Mutex::new(a)];
+        let new = reserve_slots(arenas.iter(), 2, &mut m).unwrap().remove(0);
+        let mut a = arenas[0].lock();
+        assert_ne!(old, new.generation);
         assert!(a.release(old, 0, &mut m).is_err());
-        assert!(a.abort_mapping(old, &mut m).is_err());
+        assert!(a.seal(old, &mut m, || panic!("stale unmap")).is_err());
         assert!(a
             .lease_transition(old, 0, LeasePhase::Ready, LeasePhase::Encoded, &mut m)
             .is_err());
-        assert_eq!(a.generation, new);
-        assert_eq!(a.phase, ArenaPhase::Mapping);
+        let stale = SlotReservation {
+            generation: old,
+            ..new
+        };
+        assert!(a
+            .rollback(&stale, &mut m, || panic!("stale rollback"))
+            .is_err());
         assert_eq!(a.active_leases(), 2);
-        assert_eq!(m.arena_generation_errors, 5);
-        assert_eq!(m.accounting_errors, 5);
-    }
-    #[test]
-    fn source_upload_hma1b_two_arenas_are_independent_and_third_fails() {
-        let mut m = Metrics::default();
-        let arenas: [_; ARENAS] = std::array::from_fn(|_| Mutex::new(ArenaGeneration::default()));
-        let (first, gen) = reserve_arena(arenas.iter(), 8, &mut m).unwrap();
-        let mut a = arenas[first].lock();
-        a.transition(gen, ArenaPhase::Mapping, ArenaPhase::Mapped, &mut m)
-            .unwrap();
-        a.transition(gen, ArenaPhase::Mapped, ArenaPhase::Ready, &mut m)
-            .unwrap();
-        a.lease_transition(gen, 0, LeasePhase::Ready, LeasePhase::Encoded, &mut m)
-            .unwrap();
-        a.lease_transition(gen, 0, LeasePhase::Encoded, LeasePhase::Submitted, &mut m)
-            .unwrap();
-        drop(a);
-        let (second, other) = reserve_arena(arenas.iter(), 8, &mut m).unwrap();
-        assert_ne!(first, second);
-        assert!(reserve_arena(arenas.iter(), 1, &mut m).is_err());
-        arenas[first].lock().release(gen, 0, &mut m).unwrap();
-        assert!(reserve_arena(arenas.iter(), 1, &mut m).is_err());
-        arenas[second].lock().abort_mapping(other, &mut m).unwrap();
-        assert_eq!(reserve_arena(arenas.iter(), 1, &mut m).unwrap().0, second);
-        assert_eq!(m.arena_generation_errors, 2);
+        assert_eq!(a.phase, ArenaPhase::Mapping);
+        assert_eq!(m.arena_generation_errors, 6);
+        assert_eq!(m.accounting_errors, 6);
     }
     #[test]
     fn source_upload_hma1b_mapping_unwind_and_submission_uncertainty() {
         let mut m = Metrics::default();
-        for phase in [ArenaPhase::Mapping, ArenaPhase::Mapped] {
-            let mut a = ArenaGeneration::default();
-            let gen = a.reserve(3, &mut m).unwrap();
-            a.phase = phase;
-            assert!(a
-                .lease_transition(gen, 0, LeasePhase::Ready, LeasePhase::Encoded, &mut m)
-                .is_err());
-            a.abort_mapping(gen, &mut m).unwrap();
-            assert_eq!(a.phase, ArenaPhase::Available);
-            assert_eq!(a.active_leases(), 0);
-        }
         let (mut a, gen) = ready_generation(2, &mut m);
         a.lease_transition(gen, 0, LeasePhase::Ready, LeasePhase::Encoded, &mut m)
             .unwrap();
-        // Unsubmitted encoder is destroyed; only then can the copy owner cancel.
+        // Destroy unsubmitted commands before cancelling encoded leases.
         a.lease_transition(gen, 0, LeasePhase::Encoded, LeasePhase::Ready, &mut m)
             .unwrap();
         a.release(gen, 0, &mut m).unwrap();
-        assert_eq!(a.phase, ArenaPhase::Ready);
         a.lease_transition(gen, 1, LeasePhase::Ready, LeasePhase::Encoded, &mut m)
             .unwrap();
         assert!(a.release(gen, 1, &mut m).is_err());
         assert_eq!(a.phase, ArenaPhase::Poisoned);
-        assert!(a.reserve(1, &mut m).is_err());
-        assert!(a.abort_mapping(gen, &mut m).is_err());
-        assert!(m.arena_generation_errors > 0);
+        let arenas = [Mutex::new(a)];
+        assert!(reserve_slots(arenas.iter(), 1, &mut m).is_err());
+        assert!(arenas[0]
+            .lock()
+            .seal(gen, &mut m, || panic!("poison reuse"))
+            .is_err());
+        assert_eq!(arenas[0].lock().active_leases(), 1);
     }
     #[test]
     fn source_upload_hma1b_generation_overflow_and_invalid_width_fail_closed() {
+        let arenas = test_arenas();
         let mut m = Metrics::default();
-        let mut a = ArenaGeneration::default();
-        assert!(a.reserve(0, &mut m).is_err());
-        assert!(a.reserve(9, &mut m).is_err());
-        a.generation = u64::MAX;
-        assert!(a.reserve(1, &mut m).is_err());
-        assert_eq!(a.phase, ArenaPhase::Available);
+        assert!(reserve_slots(arenas.iter(), 0, &mut m).is_err());
+        assert!(reserve_slots(arenas.iter(), 17, &mut m).is_err());
+        arenas[1].lock().generation = u64::MAX;
+        assert!(reserve_slots(arenas.iter(), 16, &mut m).is_err());
+        // Preflight failure must not reserve even the valid first arena.
+        assert_eq!(arenas[0].lock().generation, 0);
+        assert_eq!(arenas[0].lock().phase, ArenaPhase::Available);
+        assert_eq!(arenas[0].lock().active_leases(), 0);
+        assert_eq!(m.leases_created, 0);
         assert_eq!(m.arena_generation_errors, 3);
     }
     #[test]
@@ -1444,6 +1946,49 @@ mod tests {
         );
     }
     #[test]
+    fn source_upload_hma1b1_production_sequential_source_fallback_is_frozen() {
+        let engine = include_str!("engine.rs");
+        let start = engine
+            .find("    async fn gpu_native_demand_source(")
+            .unwrap();
+        let end = engine
+            .find("    async fn ensure_gpu_native_logical_demand_set(")
+            .unwrap();
+        // f6cd2ff5: demand source, dispatcher, complete sequential fallback and
+        // production scheduler, including all fallback decisions and commits.
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&engine.as_bytes()[start..end])),
+            "e2ae64bc9a1f3126f631855ac007d037695c904214fc17ee4d4e3624219596a3"
+        );
+        let source = include_str!("gpu_native_source_upload.rs");
+        let abandon = source
+            .split("pub(crate) fn abandon_pending(&self)")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) struct Lease")
+            .next()
+            .unwrap();
+        assert!(abandon.contains("std::mem::take"));
+        assert!(abandon.contains("drop(pending)"));
+        let lease_drop = source
+            .split("impl Drop for Lease")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn elapsed")
+            .next()
+            .unwrap();
+        assert!(lease_drop.find("self.seal()").unwrap() < lease_drop.find(".release(").unwrap());
+        let take = source
+            .split("pub(crate) fn take_lease(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn has_pending")
+            .next()
+            .unwrap();
+        assert!(take.contains("Arc::ptr_eq"));
+        assert!(take.contains("lease.seal()?"));
+    }
+    #[test]
     fn source_upload_source_owns_the_only_read_and_drops_views_before_unmap() {
         let source = include_str!("gpu_native_source_upload.rs");
         let body = source
@@ -1459,14 +2004,14 @@ mod tests {
             1
         );
         assert!(
-            body.find("self.acquire(chunk.len())").unwrap()
+            body.find("self.acquire(ids.len())").unwrap()
                 < body
                     .find(".read_experts_batch_into_aligned_slices(")
                     .unwrap()
         );
         assert!(
             body.find("drop(views)").unwrap()
-                < body.find("mapping.into_leases(chunk, offset)").unwrap()
+                < body.find("reservation.commit(ids, &shared)").unwrap()
         );
         for forbidden in [
             ".read_expert(",
@@ -1474,6 +2019,8 @@ mod tests {
             ".to_vec()",
             "vec![0",
             "Vec::<u8>",
+            ".unmap()",
+            "aligned_offset(",
         ] {
             assert!(!body.contains(forbidden));
         }
