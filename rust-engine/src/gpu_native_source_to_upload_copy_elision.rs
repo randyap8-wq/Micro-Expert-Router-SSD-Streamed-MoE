@@ -1578,7 +1578,7 @@ async fn execute(report: &mut Report) -> Result<()> {
 }
 
 pub(crate) async fn run_command(args: Args) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    hma1c_b::run_command(args).await
+    hma1c_b::hma1c_c::run_command(args).await
 }
 
 // A's schema and runner remain version-separated test evidence. The CLI runs B.
@@ -4317,6 +4317,2511 @@ mod hma1c_b {
             assert!(run_command(a.clone()).await.is_err());
             assert_eq!(std::fs::read(&a.report_out).unwrap(), bytes);
             std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    /// HMA-1C-C is nested only to reuse B's private, frozen schedule/geometry.
+    /// A and B runners, evidence contracts and tests remain version-separated.
+    pub(super) mod hma1c_c {
+        use super::*;
+        use std::cmp::Ordering;
+
+        const C_SCHEMA: &str = "mer.gpu-native-mapped-memory-odirect-concurrency-interaction.v1";
+        const SERIAL_API: &str = "read_experts_serial_into_aligned_slices";
+        const MEASURED_B_COUNT: usize = 128;
+        const WARMUP_B_COUNT: usize = 32;
+        const C_SCHEDULE_CONTRACT: &str = "Exactly B schedule(128) filtered K>=2 measured; B schedule(32) filtered K>=2 warmup. Original B p, round and ordered IDs retained. Williams class = zero-based occurrence within width modulo 4; A=HS B=HC C=MS D=MC: ABDC, BCAD, CDBA, DACB. Source IDs/width hashes use B encoding. Execution SHA256 per set: p, round, K, width occurrence, class as u64 LE, then four cell codes as u8 (HS=0 HC=1 MS=2 MC=3). Complete schedule SHA256 per set: same five u64 LE fields, K IDs as u32 LE, then four u8 cell codes. Cross-run C-vs-B timings are descriptive only.";
+        const C_TIMER_CONTRACT: &str = "Each cell times ONLY one awaited source helper call. HS/MS: read_experts_serial_into_aligned_slices; HC/MC: unchanged read_experts_batch_into_aligned_slices. Dispatch, counters, allocation, map_async, device.poll, mapped-view acquisition, checked alignment/slices, fd preproof/evidence, hashing, GPU copy/readback/verification and unmap are outside the source timer. Normal fd resolution, proof hits, retries and breaker behavior remain inside the helper.";
+        const C_INTERPRETATION: &str = "Primary=sum((MC-HC)-(MS-HS)); normalize by sum(HC)*100. STRONG requires >=5%, median exact interaction>0, majority positive sets, >=5/7 positive widths and all four positive Williams classes. MATERIAL uses the same conditions at >=3%. AGAINST requires abs(interaction)<=1%, exact median multiplicative ratio-of-ratios in [0.99,1.01], and fewer than five positive widths. <=-3% with analogous negative consistency means concurrency REDUCES the mapped penalty. Other results are AMBIGUOUS, including >1% but <3%, aggregate/median/majority disagreement, insufficient width support or any order-class reversal. No rounding or threshold adjustment after hardware. MC>HC alone is not interaction evidence.";
+        const C_SECONDARY: &str = "Serial and concurrent mapped-vs-host are secondary: report aggregate slowdown, exact median delta/ratio, majority, per-width and Williams order evidence. Weak serial + material concurrent + material positive interaction supports concurrency-specific amplification; material serial and concurrent + weak interaction supports raw destination main effect; neither coherent gives evidence against mapped backing/concurrency as dominant source-gap cause; mixed consistency remains ambiguous / inspect next surrounding helper.";
+        const C_RETRY: &str = "Performance authority additionally requires zero exact occurrences of 'transient I/O error; retrying' in the complete external FIRST log. The report cannot prove zero internal transient retries. One or more occurrences means RETRY_CONTAMINATED / INCONCLUSIVE for performance. No diagnostic retry or fallback. Interpretation fields are conditional on the external zero-occurrence audit.";
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+        enum Cell {
+            HS,
+            HC,
+            MS,
+            MC,
+        }
+        impl Cell {
+            const ALL: [Self; 4] = [Self::HS, Self::HC, Self::MS, Self::MC];
+            fn index(self) -> usize {
+                self as usize
+            }
+            fn mapped(self) -> bool {
+                matches!(self, Self::MS | Self::MC)
+            }
+            fn serial(self) -> bool {
+                matches!(self, Self::HS | Self::MS)
+            }
+            fn api(self) -> &'static str {
+                if self.serial() {
+                    SERIAL_API
+                } else {
+                    B_API
+                }
+            }
+        }
+        const WILLIAMS: [[Cell; 4]; 4] = [
+            [Cell::HS, Cell::HC, Cell::MC, Cell::MS],
+            [Cell::HC, Cell::MS, Cell::HS, Cell::MC],
+            [Cell::MS, Cell::MC, Cell::HC, Cell::HS],
+            [Cell::MC, Cell::HS, Cell::MS, Cell::HC],
+        ];
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+        struct CSet {
+            set_index: usize,
+            round: usize,
+            width: usize,
+            ordered_expert_ids: Vec<u32>,
+            width_occurrence: usize,
+            williams_order_class: usize,
+            execution_sequence: [Cell; 4],
+        }
+        impl CSet {
+            fn b_set(&self) -> SourceSet {
+                SourceSet {
+                    set_index: self.set_index,
+                    round: self.round,
+                    width: self.width,
+                    ordered_expert_ids: self.ordered_expert_ids.clone(),
+                    execution_order: if self.round % 2 == 0 {
+                        ExecutionOrder::ControlFirst
+                    } else {
+                        ExecutionOrder::TreatmentFirst
+                    },
+                }
+            }
+        }
+        fn c_schedule(b_count: usize) -> Result<Vec<CSet>> {
+            if ![0, WARMUP_B_COUNT, MEASURED_B_COUNT].contains(&b_count) {
+                return Err(Failure::accounting(
+                    "C requires frozen B schedule counts 32/128",
+                ));
+            }
+            let mut occurrences = [0usize; MAX_WIDTH + 1];
+            schedule(b_count)?
+                .into_iter()
+                .filter(|s| s.width >= 2)
+                .map(|s| {
+                    let r = occurrences[s.width];
+                    occurrences[s.width] = r
+                        .checked_add(1)
+                        .ok_or_else(|| Failure::accounting("width occurrence overflow"))?;
+                    Ok(CSet {
+                        set_index: s.set_index,
+                        round: s.round,
+                        width: s.width,
+                        ordered_expert_ids: s.ordered_expert_ids,
+                        width_occurrence: r,
+                        williams_order_class: r % 4,
+                        execution_sequence: WILLIAMS[r % 4],
+                    })
+                })
+                .collect()
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+        struct CPlan {
+            #[serde(flatten)]
+            source: ScheduleEvidence,
+            execution_order_sha256: String,
+            complete_schedule_sha256: String,
+        }
+        fn plan(sets: &[CSet]) -> Result<CPlan> {
+            let mut order = Sha256::new();
+            let mut complete = Sha256::new();
+            let mut occurrences = [0usize; MAX_WIDTH + 1];
+            for s in sets {
+                if !(2..=MAX_WIDTH).contains(&s.width)
+                    || s.width_occurrence != occurrences[s.width]
+                    || s.williams_order_class != s.width_occurrence % 4
+                    || s.execution_sequence != WILLIAMS[s.williams_order_class]
+                {
+                    return Err(Failure::accounting("invalid Williams source set"));
+                }
+                occurrences[s.width] = occurrences[s.width]
+                    .checked_add(1)
+                    .ok_or_else(|| Failure::accounting("order count overflow"))?;
+                for value in [
+                    s.set_index,
+                    s.round,
+                    s.width,
+                    s.width_occurrence,
+                    s.williams_order_class,
+                ] {
+                    let bytes = u64::try_from(value)
+                        .map_err(Failure::accounting)?
+                        .to_le_bytes();
+                    order.update(bytes);
+                    complete.update(bytes);
+                }
+                for id in &s.ordered_expert_ids {
+                    complete.update(id.to_le_bytes());
+                }
+                for cell in s.execution_sequence {
+                    order.update([cell as u8]);
+                    complete.update([cell as u8]);
+                }
+            }
+            Ok(CPlan {
+                source: schedule_evidence(&sets.iter().map(CSet::b_set).collect::<Vec<_>>())?,
+                execution_order_sha256: finish_sha(&order),
+                complete_schedule_sha256: finish_sha(&complete),
+            })
+        }
+        fn signed_add(a: i128, b: i128) -> Result<i128> {
+            a.checked_add(b)
+                .ok_or_else(|| Failure::accounting("signed sum overflow"))
+        }
+        fn signed_sub(a: i128, b: i128) -> Result<i128> {
+            a.checked_sub(b)
+                .ok_or_else(|| Failure::accounting("signed delta overflow"))
+        }
+        fn product(a: u128, b: u128) -> Result<u128> {
+            a.checked_mul(b)
+                .ok_or_else(|| Failure::accounting("interaction product overflow"))
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+        struct CSample {
+            #[serde(flatten)]
+            source_set: CSet,
+            hs_ns: u64,
+            ms_ns: u64,
+            hc_ns: u64,
+            mc_ns: u64,
+            serial_destination_delta_ns: i128,
+            concurrent_destination_delta_ns: i128,
+            interaction_delta_ns: i128,
+            mc_times_hs: u128,
+            hc_times_ms: u128,
+            multiplicative_interaction_direction: i8,
+        }
+        impl CSample {
+            fn new(
+                source_set: CSet,
+                hs_ns: u64,
+                ms_ns: u64,
+                hc_ns: u64,
+                mc_ns: u64,
+            ) -> Result<Self> {
+                if [hs_ns, ms_ns, hc_ns, mc_ns].contains(&0) {
+                    return Err(Failure::accounting("zero C source duration"));
+                }
+                let serial_destination_delta_ns = signed_sub(ms_ns.into(), hs_ns.into())?;
+                let concurrent_destination_delta_ns = signed_sub(mc_ns.into(), hc_ns.into())?;
+                let interaction_delta_ns =
+                    signed_sub(concurrent_destination_delta_ns, serial_destination_delta_ns)?;
+                let mc_times_hs = product(mc_ns.into(), hs_ns.into())?;
+                let hc_times_ms = product(hc_ns.into(), ms_ns.into())?;
+                let multiplicative_interaction_direction = match mc_times_hs.cmp(&hc_times_ms) {
+                    Ordering::Less => -1,
+                    Ordering::Equal => 0,
+                    Ordering::Greater => 1,
+                };
+                Ok(Self {
+                    source_set,
+                    hs_ns,
+                    ms_ns,
+                    hc_ns,
+                    mc_ns,
+                    serial_destination_delta_ns,
+                    concurrent_destination_delta_ns,
+                    interaction_delta_ns,
+                    mc_times_hs,
+                    hc_times_ms,
+                    multiplicative_interaction_direction,
+                })
+            }
+            fn valid(&self) -> bool {
+                Self::new(
+                    self.source_set.clone(),
+                    self.hs_ns,
+                    self.ms_ns,
+                    self.hc_ns,
+                    self.mc_ns,
+                )
+                .is_ok_and(|s| s == *self)
+            }
+            fn times(&self) -> [u64; 4] {
+                [self.hs_ns, self.hc_ns, self.ms_ns, self.mc_ns]
+            }
+            fn ratio(&self) -> Ratio {
+                Ratio {
+                    numerator: self.mc_times_hs,
+                    denominator: self.hc_times_ms,
+                }
+            }
+        }
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+        struct Ratio {
+            numerator: u128,
+            denominator: u128,
+        }
+        impl Ratio {
+            // Euclidean comparison of positive rationals: no overflowing cross
+            // products and no floating-point ordering, even near u128::MAX.
+            fn compare(self, other: Self) -> Ordering {
+                let (mut a, mut b, mut c, mut d) = (
+                    self.numerator,
+                    self.denominator,
+                    other.numerator,
+                    other.denominator,
+                );
+                let mut reversed = false;
+                loop {
+                    let cmp = (a / b).cmp(&(c / d));
+                    if cmp != Ordering::Equal {
+                        return if reversed { cmp.reverse() } else { cmp };
+                    }
+                    let (r, s) = (a % b, c % d);
+                    if r == 0 || s == 0 {
+                        let cmp = r.cmp(&s);
+                        return if reversed { cmp.reverse() } else { cmp };
+                    }
+                    (a, b, c, d) = (b, r, d, s);
+                    reversed = !reversed;
+                }
+            }
+            fn descriptive(self) -> f64 {
+                self.numerator as f64 / self.denominator as f64
+            }
+        }
+        // Five limbs retain exact 128x128 products scaled by the small integer
+        // threshold, including the sum needed for an even-sample median.
+        fn scaled_wide_product(a: u128, b: u128, scale: u64) -> Result<[u64; 5]> {
+            let mut out = [0u64; 5];
+            for (i, x) in [a as u64, (a >> 64) as u64].into_iter().enumerate() {
+                let mut carry = 0u128;
+                for (j, y) in [b as u64, (b >> 64) as u64].into_iter().enumerate() {
+                    let n = u128::from(x)
+                        .checked_mul(y.into())
+                        .and_then(|n| n.checked_add(out[i + j].into()))
+                        .and_then(|n| n.checked_add(carry))
+                        .ok_or_else(|| Failure::accounting("wide product overflow"))?;
+                    out[i + j] = n as u64;
+                    carry = n >> 64;
+                }
+                out[i + 2] = u64::try_from(carry).map_err(Failure::accounting)?;
+            }
+            let mut carry = 0u128;
+            for limb in &mut out {
+                let n = u128::from(*limb)
+                    .checked_mul(scale.into())
+                    .and_then(|n| n.checked_add(carry))
+                    .ok_or_else(|| Failure::accounting("wide scale overflow"))?;
+                *limb = n as u64;
+                carry = n >> 64;
+            }
+            if carry != 0 {
+                return Err(Failure::accounting("wide capacity overflow"));
+            }
+            Ok(out)
+        }
+        fn wide_add(a: [u64; 5], b: [u64; 5]) -> Result<[u64; 5]> {
+            let mut out = [0u64; 5];
+            let mut carry = 0u128;
+            for i in 0..5 {
+                let n = u128::from(a[i])
+                    .checked_add(b[i].into())
+                    .and_then(|n| n.checked_add(carry))
+                    .ok_or_else(|| Failure::accounting("wide addition overflow"))?;
+                out[i] = n as u64;
+                carry = n >> 64;
+            }
+            if carry != 0 {
+                return Err(Failure::accounting("wide sum overflow"));
+            }
+            Ok(out)
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+        struct RatioMedian {
+            lower: Ratio,
+            upper: Ratio,
+        }
+        impl RatioMedian {
+            fn new(mut ratios: Vec<(usize, Ratio)>) -> Option<Self> {
+                if ratios.is_empty() {
+                    return None;
+                }
+                ratios.sort_by(|a, b| a.1.compare(b.1).then(a.0.cmp(&b.0)));
+                Some(Self {
+                    lower: ratios[(ratios.len() - 1) / 2].1,
+                    upper: ratios[ratios.len() / 2].1,
+                })
+            }
+            fn compare_hundredths(&self, threshold: u64) -> Result<Ordering> {
+                // (lo+hi)/2 ? threshold/100, exactly, without reducing ratios.
+                let lhs = wide_add(
+                    scaled_wide_product(self.lower.numerator, self.upper.denominator, 100)?,
+                    scaled_wide_product(self.upper.numerator, self.lower.denominator, 100)?,
+                )?;
+                let rhs = scaled_wide_product(
+                    self.lower.denominator,
+                    self.upper.denominator,
+                    threshold
+                        .checked_mul(2)
+                        .ok_or_else(|| Failure::accounting("median threshold overflow"))?,
+                )?;
+                Ok(lhs.iter().rev().cmp(rhs.iter().rev()))
+            }
+            fn descriptive(&self) -> f64 {
+                self.lower.descriptive() / 2.0 + self.upper.descriptive() / 2.0
+            }
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+        struct SignedFraction {
+            numerator: i128,
+            denominator: u64,
+        }
+        fn median_signed(mut values: Vec<i128>) -> Result<Option<SignedFraction>> {
+            if values.is_empty() {
+                return Ok(None);
+            }
+            values.sort();
+            let (lo, hi) = (values[(values.len() - 1) / 2], values[values.len() / 2]);
+            if values.len() % 2 == 1 {
+                Ok(Some(SignedFraction {
+                    numerator: hi,
+                    denominator: 1,
+                }))
+            } else {
+                Ok(Some(SignedFraction {
+                    numerator: signed_add(lo, hi)?,
+                    denominator: 2,
+                }))
+            }
+        }
+        #[derive(Clone, Default, Debug, PartialEq, Eq, Serialize)]
+        struct Directions {
+            positive: u64,
+            negative: u64,
+            equal: u64,
+        }
+        impl Directions {
+            fn observe(&mut self, delta: i128) -> Result<()> {
+                add(
+                    if delta > 0 {
+                        &mut self.positive
+                    } else if delta < 0 {
+                        &mut self.negative
+                    } else {
+                        &mut self.equal
+                    },
+                    1,
+                )
+            }
+            fn count(&self) -> Result<u64> {
+                self.positive
+                    .checked_add(self.negative)
+                    .and_then(|n| n.checked_add(self.equal))
+                    .ok_or_else(|| Failure::accounting("direction count overflow"))
+            }
+        }
+        #[derive(Clone, Default, Debug, PartialEq, Eq, Serialize)]
+        struct Totals {
+            samples: u64,
+            hs_ns: u64,
+            ms_ns: u64,
+            hc_ns: u64,
+            mc_ns: u64,
+            serial_destination_delta_ns: i128,
+            concurrent_destination_delta_ns: i128,
+            interaction_delta_ns: i128,
+            interaction_samples: Directions,
+            serial_destination_samples: Directions,
+            concurrent_destination_samples: Directions,
+            multiplicative_interaction_samples: Directions,
+        }
+        impl Totals {
+            fn observe(&mut self, s: &CSample) -> Result<()> {
+                if !s.valid() {
+                    return Err(Failure::accounting("C raw arithmetic does not reconcile"));
+                }
+                add(&mut self.samples, 1)?;
+                add(&mut self.hs_ns, s.hs_ns)?;
+                add(&mut self.ms_ns, s.ms_ns)?;
+                add(&mut self.hc_ns, s.hc_ns)?;
+                add(&mut self.mc_ns, s.mc_ns)?;
+                self.serial_destination_delta_ns = signed_add(
+                    self.serial_destination_delta_ns,
+                    s.serial_destination_delta_ns,
+                )?;
+                self.concurrent_destination_delta_ns = signed_add(
+                    self.concurrent_destination_delta_ns,
+                    s.concurrent_destination_delta_ns,
+                )?;
+                self.interaction_delta_ns =
+                    signed_add(self.interaction_delta_ns, s.interaction_delta_ns)?;
+                self.interaction_samples.observe(s.interaction_delta_ns)?;
+                self.serial_destination_samples
+                    .observe(s.serial_destination_delta_ns)?;
+                self.concurrent_destination_samples
+                    .observe(s.concurrent_destination_delta_ns)?;
+                self.multiplicative_interaction_samples
+                    .observe(s.multiplicative_interaction_direction.into())?;
+                self.reconcile()
+            }
+            fn reconcile(&self) -> Result<()> {
+                if self.serial_destination_delta_ns
+                    != signed_sub(self.ms_ns.into(), self.hs_ns.into())?
+                    || self.concurrent_destination_delta_ns
+                        != signed_sub(self.mc_ns.into(), self.hc_ns.into())?
+                    || self.interaction_delta_ns
+                        != signed_sub(
+                            self.concurrent_destination_delta_ns,
+                            self.serial_destination_delta_ns,
+                        )?
+                    || [
+                        &self.interaction_samples,
+                        &self.serial_destination_samples,
+                        &self.concurrent_destination_samples,
+                        &self.multiplicative_interaction_samples,
+                    ]
+                    .into_iter()
+                    .any(|d| d.count().ok() != Some(self.samples))
+                {
+                    return Err(Failure::accounting("C totals do not reconcile"));
+                }
+                Ok(())
+            }
+            fn times(&self) -> [u64; 4] {
+                [self.hs_ns, self.hc_ns, self.ms_ns, self.mc_ns]
+            }
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+        struct ExactStats {
+            #[serde(flatten)]
+            totals: Totals,
+            mean_signed_interaction_delta_ns: Option<SignedFraction>,
+            median_signed_interaction_delta_ns: Option<SignedFraction>,
+            median_ratio_of_ratios_exact: Option<RatioMedian>,
+            serial_median_delta_ns: Option<SignedFraction>,
+            concurrent_median_delta_ns: Option<SignedFraction>,
+            serial_median_mapped_over_host_ratio_exact: Option<RatioMedian>,
+            concurrent_median_mapped_over_host_ratio_exact: Option<RatioMedian>,
+        }
+        fn exact_stats(samples: &[CSample]) -> Result<ExactStats> {
+            let mut totals = Totals::default();
+            for s in samples {
+                totals.observe(s)?;
+            }
+            let median = |f: fn(&CSample) -> i128| median_signed(samples.iter().map(f).collect());
+            let ratios = |f: fn(&CSample) -> Ratio| {
+                RatioMedian::new(
+                    samples
+                        .iter()
+                        .map(|s| (s.source_set.set_index, f(s)))
+                        .collect(),
+                )
+            };
+            Ok(ExactStats {
+                mean_signed_interaction_delta_ns: (totals.samples != 0).then(|| SignedFraction {
+                    numerator: totals.interaction_delta_ns,
+                    denominator: totals.samples,
+                }),
+                median_signed_interaction_delta_ns: median(|s| s.interaction_delta_ns)?,
+                median_ratio_of_ratios_exact: ratios(CSample::ratio),
+                serial_median_delta_ns: median(|s| s.serial_destination_delta_ns)?,
+                concurrent_median_delta_ns: median(|s| s.concurrent_destination_delta_ns)?,
+                serial_median_mapped_over_host_ratio_exact: ratios(|s| Ratio {
+                    numerator: s.ms_ns.into(),
+                    denominator: s.hs_ns.into(),
+                }),
+                concurrent_median_mapped_over_host_ratio_exact: ratios(|s| Ratio {
+                    numerator: s.mc_ns.into(),
+                    denominator: s.hc_ns.into(),
+                }),
+                totals,
+            })
+        }
+        #[derive(Debug, Serialize)]
+        struct DescriptiveStats {
+            interaction_percent_of_hc: Option<f64>,
+            serial_mapped_slowdown_percent: Option<f64>,
+            concurrent_mapped_slowdown_percent: Option<f64>,
+            slowdown_percentage_point_difference: Option<f64>,
+            mean_signed_interaction_delta_ns: Option<f64>,
+            median_signed_interaction_delta_ns: Option<f64>,
+            median_ratio_of_ratios: Option<f64>,
+            serial_median_delta_ns: Option<f64>,
+            concurrent_median_delta_ns: Option<f64>,
+            serial_median_mapped_over_host_ratio: Option<f64>,
+            concurrent_median_mapped_over_host_ratio: Option<f64>,
+        }
+        fn descriptive(e: &ExactStats) -> DescriptiveStats {
+            let t = &e.totals;
+            let pct = |d: i128, n: u64| (n != 0).then(|| d as f64 / n as f64 * 100.0);
+            let frac = |f: &Option<SignedFraction>| {
+                f.as_ref()
+                    .map(|f| f.numerator as f64 / f.denominator as f64)
+            };
+            let serial = pct(t.serial_destination_delta_ns, t.hs_ns);
+            let concurrent = pct(t.concurrent_destination_delta_ns, t.hc_ns);
+            DescriptiveStats {
+                interaction_percent_of_hc: pct(t.interaction_delta_ns, t.hc_ns),
+                serial_mapped_slowdown_percent: serial,
+                concurrent_mapped_slowdown_percent: concurrent,
+                slowdown_percentage_point_difference: concurrent.zip(serial).map(|(c, s)| c - s),
+                mean_signed_interaction_delta_ns: frac(&e.mean_signed_interaction_delta_ns),
+                median_signed_interaction_delta_ns: frac(&e.median_signed_interaction_delta_ns),
+                median_ratio_of_ratios: e
+                    .median_ratio_of_ratios_exact
+                    .as_ref()
+                    .map(RatioMedian::descriptive),
+                serial_median_delta_ns: frac(&e.serial_median_delta_ns),
+                concurrent_median_delta_ns: frac(&e.concurrent_median_delta_ns),
+                serial_median_mapped_over_host_ratio: e
+                    .serial_median_mapped_over_host_ratio_exact
+                    .as_ref()
+                    .map(RatioMedian::descriptive),
+                concurrent_median_mapped_over_host_ratio: e
+                    .concurrent_median_mapped_over_host_ratio_exact
+                    .as_ref()
+                    .map(RatioMedian::descriptive),
+            }
+        }
+        #[derive(Debug, Serialize)]
+        struct CStats {
+            exact: ExactStats,
+            descriptive: DescriptiveStats,
+        }
+        impl CStats {
+            fn new(samples: &[CSample]) -> Result<Self> {
+                let exact = exact_stats(samples)?;
+                Ok(Self {
+                    descriptive: descriptive(&exact),
+                    exact,
+                })
+            }
+        }
+        #[derive(Debug, Serialize)]
+        struct WidthStats {
+            #[serde(flatten)]
+            aggregate: CStats,
+            williams_order_classes: BTreeMap<usize, CStats>,
+        }
+        #[derive(Debug, Serialize)]
+        struct CStatistics {
+            primary_k2_through_k8: CStats,
+            per_width: BTreeMap<usize, WidthStats>,
+            williams_order_classes: BTreeMap<usize, CStats>,
+            interaction_widths: Directions,
+            serial_destination_widths: Directions,
+            concurrent_destination_widths: Directions,
+        }
+        fn reconcile_partitions<'a>(
+            parts: impl Iterator<Item = &'a ExactStats>,
+            primary: &ExactStats,
+        ) -> Result<()> {
+            let mut totals = Totals::default();
+            for e in parts {
+                let t = &e.totals;
+                add(&mut totals.samples, t.samples)?;
+                add(&mut totals.hs_ns, t.hs_ns)?;
+                add(&mut totals.ms_ns, t.ms_ns)?;
+                add(&mut totals.hc_ns, t.hc_ns)?;
+                add(&mut totals.mc_ns, t.mc_ns)?;
+                totals.serial_destination_delta_ns = signed_add(
+                    totals.serial_destination_delta_ns,
+                    t.serial_destination_delta_ns,
+                )?;
+                totals.concurrent_destination_delta_ns = signed_add(
+                    totals.concurrent_destination_delta_ns,
+                    t.concurrent_destination_delta_ns,
+                )?;
+                totals.interaction_delta_ns =
+                    signed_add(totals.interaction_delta_ns, t.interaction_delta_ns)?;
+                for (a, b) in [
+                    (&mut totals.interaction_samples, &t.interaction_samples),
+                    (
+                        &mut totals.serial_destination_samples,
+                        &t.serial_destination_samples,
+                    ),
+                    (
+                        &mut totals.concurrent_destination_samples,
+                        &t.concurrent_destination_samples,
+                    ),
+                    (
+                        &mut totals.multiplicative_interaction_samples,
+                        &t.multiplicative_interaction_samples,
+                    ),
+                ] {
+                    add(&mut a.positive, b.positive)?;
+                    add(&mut a.negative, b.negative)?;
+                    add(&mut a.equal, b.equal)?;
+                }
+            }
+            totals.reconcile()?;
+            if totals != primary.totals {
+                return Err(Failure::accounting("width/order partition mismatch"));
+            }
+            Ok(())
+        }
+        fn c_statistics(samples: &[CSample]) -> Result<CStatistics> {
+            if samples.iter().any(|s| {
+                !(2..=8).contains(&s.source_set.width) || s.source_set.williams_order_class >= 4
+            }) {
+                return Err(Failure::accounting("invalid C statistical stratum"));
+            }
+            let mut out = CStatistics {
+                primary_k2_through_k8: CStats::new(samples)?,
+                per_width: BTreeMap::new(),
+                williams_order_classes: BTreeMap::new(),
+                interaction_widths: Directions::default(),
+                serial_destination_widths: Directions::default(),
+                concurrent_destination_widths: Directions::default(),
+            };
+            let order_stats = |subset: &[CSample]| -> Result<BTreeMap<usize, CStats>> {
+                (0..4)
+                    .map(|class| {
+                        Ok((
+                            class,
+                            CStats::new(
+                                &subset
+                                    .iter()
+                                    .filter(|s| s.source_set.williams_order_class == class)
+                                    .cloned()
+                                    .collect::<Vec<_>>(),
+                            )?,
+                        ))
+                    })
+                    .collect()
+            };
+            for k in 2..=8 {
+                let subset: Vec<_> = samples
+                    .iter()
+                    .filter(|s| s.source_set.width == k)
+                    .cloned()
+                    .collect();
+                let aggregate = CStats::new(&subset)?;
+                let williams_order_classes = order_stats(&subset)?;
+                reconcile_partitions(
+                    williams_order_classes.values().map(|s| &s.exact),
+                    &aggregate.exact,
+                )?;
+                if aggregate.exact.totals.samples > 0 {
+                    out.interaction_widths
+                        .observe(aggregate.exact.totals.interaction_delta_ns)?;
+                    out.serial_destination_widths
+                        .observe(aggregate.exact.totals.serial_destination_delta_ns)?;
+                    out.concurrent_destination_widths
+                        .observe(aggregate.exact.totals.concurrent_destination_delta_ns)?;
+                }
+                out.per_width.insert(
+                    k,
+                    WidthStats {
+                        aggregate,
+                        williams_order_classes,
+                    },
+                );
+            }
+            out.williams_order_classes = order_stats(samples)?;
+            reconcile_partitions(
+                out.per_width.values().map(|s| &s.aggregate.exact),
+                &out.primary_k2_through_k8.exact,
+            )?;
+            reconcile_partitions(
+                out.williams_order_classes.values().map(|s| &s.exact),
+                &out.primary_k2_through_k8.exact,
+            )?;
+            Ok(out)
+        }
+        impl CStatistics {
+            // Deliberately compare only exact fields. Descriptive f64 values
+            // never participate in correctness, authority or interpretation.
+            fn exact_matches(&self, other: &Self) -> bool {
+                self.primary_k2_through_k8.exact == other.primary_k2_through_k8.exact
+                    && self.interaction_widths == other.interaction_widths
+                    && self.serial_destination_widths == other.serial_destination_widths
+                    && self.concurrent_destination_widths == other.concurrent_destination_widths
+                    && self.per_width.keys().eq(other.per_width.keys())
+                    && self
+                        .williams_order_classes
+                        .keys()
+                        .eq(other.williams_order_classes.keys())
+                    && self.per_width.iter().all(|(k, w)| {
+                        let o = &other.per_width[k];
+                        w.aggregate.exact == o.aggregate.exact
+                            && w.williams_order_classes
+                                .keys()
+                                .eq(o.williams_order_classes.keys())
+                            && w.williams_order_classes
+                                .iter()
+                                .all(|(c, s)| s.exact == o.williams_order_classes[c].exact)
+                    })
+                    && self
+                        .williams_order_classes
+                        .iter()
+                        .all(|(c, s)| s.exact == other.williams_order_classes[c].exact)
+            }
+        }
+        fn interaction_interpretation(s: &CStatistics) -> Result<&'static str> {
+            let e = &s.primary_k2_through_k8.exact;
+            let t = &e.totals;
+            if t.samples != 112 || t.hc_ns == 0 {
+                return Ok("INCONCLUSIVE");
+            }
+            let scaled = t
+                .interaction_delta_ns
+                .checked_mul(100)
+                .ok_or_else(|| Failure::accounting("threshold overflow"))?;
+            let threshold = |percent: i128| {
+                i128::from(t.hc_ns)
+                    .checked_mul(percent)
+                    .ok_or_else(|| Failure::accounting("threshold product overflow"))
+            };
+            let median = e
+                .median_signed_interaction_delta_ns
+                .as_ref()
+                .ok_or_else(|| Failure::accounting("missing median"))?
+                .numerator;
+            let positive = median > 0
+                && t.interaction_samples.positive > t.samples / 2
+                && s.interaction_widths.positive >= 5
+                && s.williams_order_classes
+                    .values()
+                    .all(|c| c.exact.totals.interaction_delta_ns > 0);
+            let negative = median < 0
+                && t.interaction_samples.negative > t.samples / 2
+                && s.interaction_widths.negative >= 5
+                && s.williams_order_classes
+                    .values()
+                    .all(|c| c.exact.totals.interaction_delta_ns < 0);
+            if positive && scaled >= threshold(5)? {
+                return Ok("STRONG_AMPLIFICATION");
+            }
+            if positive && scaled >= threshold(3)? {
+                return Ok("MATERIAL_AMPLIFICATION");
+            }
+            if negative && scaled <= threshold(-3)? {
+                return Ok("CONCURRENCY_REDUCES_MAPPED_PENALTY");
+            }
+            let direction = t.interaction_delta_ns.signum();
+            let majority_disagrees = if direction > 0 {
+                t.interaction_samples.positive <= t.samples / 2
+            } else if direction < 0 {
+                t.interaction_samples.negative <= t.samples / 2
+            } else {
+                t.interaction_samples.positive > t.samples / 2
+                    || t.interaction_samples.negative > t.samples / 2
+            };
+            if median.signum() != direction
+                || majority_disagrees
+                || (direction > 0
+                    && s.williams_order_classes
+                        .values()
+                        .any(|c| c.exact.totals.interaction_delta_ns < 0))
+            {
+                return Ok("AMBIGUOUS");
+            }
+            let ratio = e
+                .median_ratio_of_ratios_exact
+                .as_ref()
+                .ok_or_else(|| Failure::accounting("missing multiplicative median"))?;
+            if scaled
+                .checked_abs()
+                .ok_or_else(|| Failure::accounting("absolute interaction overflow"))?
+                <= threshold(1)?
+                && ratio.compare_hundredths(99)? != Ordering::Less
+                && ratio.compare_hundredths(101)? != Ordering::Greater
+                && s.interaction_widths.positive < 5
+            {
+                return Ok("AGAINST_MATERIAL_INTERACTION");
+            }
+            Ok("AMBIGUOUS")
+        }
+        #[derive(Debug, Serialize)]
+        struct CellArm {
+            #[serde(flatten)]
+            evidence: Arm,
+            source_sets_attempted: u64,
+            serial_helper_calls: u64,
+            concurrent_helper_calls: u64,
+            cell: Cell,
+            completed_source_sets: Vec<SourceSet>,
+            source_schedule: ScheduleEvidence,
+        }
+        impl CellArm {
+            fn new(cell: Cell) -> Result<Self> {
+                Ok(Self {
+                    evidence: Arm::default(),
+                    source_sets_attempted: 0,
+                    serial_helper_calls: 0,
+                    concurrent_helper_calls: 0,
+                    cell,
+                    completed_source_sets: Vec::new(),
+                    source_schedule: schedule_evidence(&[])?,
+                })
+            }
+            fn successful(&self, expected: &ScheduleEvidence, treatment: bool) -> bool {
+                let a = &self.evidence;
+                let n = expected.expert_slot_count;
+                let sets = expected.source_set_count;
+                self.source_schedule == *expected
+                    && schedule_evidence(&self.completed_source_sets).is_ok_and(|e| e == *expected)
+                    && self.source_sets_attempted == sets
+                    && self.serial_helper_calls == if self.cell.serial() { sets } else { 0 }
+                    && self.concurrent_helper_calls == if self.cell.serial() { 0 } else { sets }
+                    && self.cell.mapped() == treatment
+                    && a.reconcile(treatment)
+                    && a.ops_attempted == n
+                    && a.source_read_attempts == n
+                    && a.source_read_ops == n
+                    && a.full_source_bytes == expected.source_bytes
+                    && a.payload_ops == n
+                    && a.upload_ops == n
+                    && a.gpu_completed_ops == n
+                    && a.verified_ops == n
+                    && a.fd_evidence.checks == n
+                    && a.fd_evidence.direct_observed == n
+                    && a.fd_evidence.full_file_length_observed == n
+                    && a.fd_evidence.failures == 0
+                    && a.pointers.observations == n
+                    && a.verification_destination_reset_ops == n
+                    && a.source_failures == 0
+                    && a.gpu_failures == 0
+                    && a.map_failures == 0
+                    && a.alignment_failures == 0
+                    && a.mapped_direct_io_rejections == 0
+                    && a.rejection_errno_counts.is_empty()
+                    && a.pointers.gpu_offset_failures == 0
+                    && if treatment {
+                        a.map_attempts == sets
+                            && a.maps_completed == sets
+                            && a.unmaps == sets
+                            && a.pointers.gpu_offset_checks == n
+                    } else {
+                        a.map_attempts == 0 && a.maps_completed == 0 && a.unmaps == 0
+                    }
+            }
+        }
+        fn begin_set(storage: &NvmeStorage, set: &SourceSet, arm: &mut CellArm) -> Result<()> {
+            add(&mut arm.source_sets_attempted, 1)?;
+            add(&mut arm.evidence.ops_attempted, set.width as u64)?;
+            for &id in &set.ordered_expert_ids {
+                fd_evidence(storage, id, &mut arm.evidence)?;
+            }
+            Ok(())
+        }
+        fn observe_slices(
+            arm: &mut CellArm,
+            base: usize,
+            offset: usize,
+            width: usize,
+            treatment: bool,
+        ) -> Result<()> {
+            for j in 0..width {
+                let slot = offset
+                    .checked_add(
+                        j.checked_mul(FULL)
+                            .ok_or_else(|| Failure::accounting("pointer slot overflow"))?,
+                    )
+                    .ok_or_else(|| Failure::accounting("pointer offset overflow"))?;
+                arm.evidence.pointers.observe(base, slot, FULL)?;
+                if treatment {
+                    add(&mut arm.evidence.pointers.gpu_offset_checks, 1)?;
+                }
+            }
+            Ok(())
+        }
+        /// Each cell reaches its selected source helper exactly once per set. All caller
+        /// setup precedes entry; all accounting and verification follow the timer.
+        async fn cell_source(
+            storage: &NvmeStorage,
+            set: &SourceSet,
+            destinations: &mut [&mut [u8]],
+            arm: &mut CellArm,
+            treatment: bool,
+        ) -> Result<u64> {
+            add(
+                if arm.cell.serial() {
+                    &mut arm.serial_helper_calls
+                } else {
+                    &mut arm.concurrent_helper_calls
+                },
+                1,
+            )?;
+            add(&mut arm.evidence.source_read_attempts, set.width as u64)?;
+            let ids = set.ordered_expert_ids.as_slice();
+            let (read, ns) = if arm.cell.serial() {
+                let start = Instant::now();
+                let read = storage
+                    .read_experts_serial_into_aligned_slices(ids, destinations)
+                    .await;
+                let ns = elapsed(start)?;
+                (read, ns)
+            } else {
+                let start = Instant::now();
+                let read = storage
+                    .read_experts_batch_into_aligned_slices(ids, destinations)
+                    .await;
+                let ns = elapsed(start)?;
+                (read, ns)
+            };
+            add(&mut arm.evidence.times.source_direct_read_ns, ns)?;
+            let expected = source_bytes(set.width as u64)?;
+            match read {
+                Ok(n) if u64::try_from(n).ok() == Some(expected) => {
+                    add(&mut arm.evidence.source_read_ops, set.width as u64)?;
+                    add(&mut arm.evidence.full_source_bytes, expected)?;
+                    arm.completed_source_sets.push(set.clone());
+                }
+                Ok(n) => {
+                    add(&mut arm.evidence.exact_read_length_failures, 1)?;
+                    return Err(Failure::accounting(format!(
+                        "set {}: batch returned {n} bytes, expected {expected}",
+                        set.set_index
+                    )));
+                }
+                Err(e) => {
+                    add(&mut arm.evidence.source_failures, 1)?;
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        add(&mut arm.evidence.exact_read_length_failures, 1)?;
+                    }
+                    let rejected = treatment && mapped_rejection(e.raw_os_error());
+                    if rejected {
+                        add(&mut arm.evidence.mapped_direct_io_rejections, 1)?;
+                        add(
+                            arm.evidence
+                                .rejection_errno_counts
+                                .entry(e.raw_os_error().unwrap())
+                                .or_default(),
+                            1,
+                        )?;
+                    }
+                    return Err(Failure::runtime(
+                        if rejected {
+                            "mapped-upload-direct-io-rejected"
+                        } else {
+                            "source-failed"
+                        },
+                        format!(
+                            "set {} {:?}: {e}; errno={:?}; no fallback or diagnostic retry",
+                            set.set_index,
+                            ids,
+                            e.raw_os_error()
+                        ),
+                    ));
+                }
+            }
+            if ns == 0 {
+                return Err(Failure::accounting("zero source timer"));
+            }
+            Ok(ns)
+        }
+        async fn host_cell(
+            gpu: &Gpu,
+            storage: &NvmeStorage,
+            host: &mut AlignedBuffer,
+            set: &SourceSet,
+            arm: &mut CellArm,
+            streams: &mut Streams,
+        ) -> Result<(u64, Vec<Hashes>)> {
+            begin_set(storage, set, arm)?;
+            let base = host.as_slice().as_ptr() as usize;
+            let slices = arena_slices(host.as_mut_slice(), set.width, false);
+            if slices.is_err() {
+                add(&mut arm.evidence.alignment_failures, 1)?;
+            }
+            let (offset, mut destinations) = slices?;
+            observe_slices(arm, base, offset, set.width, false)?;
+            let ns = cell_source(storage, set, &mut destinations, arm, false).await?;
+            let mut hashes = Vec::with_capacity(set.width);
+            for source in destinations {
+                let (_, mut h) = streams.source(source).map_err(Failure::authority)?;
+                note_payload(&mut arm.evidence)?;
+                prepare_destination(gpu, &mut arm.evidence)?;
+                gpu.queue
+                    .write_buffer(&gpu.destination, 0, &EPOCH.to_le_bytes());
+                let mut view = gpu
+                    .queue
+                    .write_buffer_with(
+                        &gpu.destination,
+                        EPOCH_OFFSET as u64,
+                        NonZeroU64::new(PAYLOAD as u64).unwrap(),
+                    )
+                    .ok_or_else(|| {
+                        Failure::runtime(
+                            "gpu-failed",
+                            "CONTROL verification staging view unavailable",
+                        )
+                    })?;
+                view.copy_from_slice(&source[PREFIX..]);
+                add(&mut arm.evidence.cpu_payload_copy_bytes, PAYLOAD as u64)?;
+                drop(view);
+                note_upload(&mut arm.evidence, false)?;
+                gpu.drain(None)?;
+                add(&mut arm.evidence.gpu_completed_ops, 1)?;
+                verify(gpu, &mut arm.evidence, &mut h, streams)?;
+                hashes.push(h);
+            }
+            gpu.check()?;
+            Ok((ns, hashes))
+        }
+        async fn mapped_cell(
+            gpu: &Gpu,
+            storage: &NvmeStorage,
+            set: &SourceSet,
+            arm: &mut CellArm,
+            streams: &mut Streams,
+        ) -> Result<(u64, Vec<Hashes>)> {
+            begin_set(storage, set, arm)?;
+            add(&mut arm.evidence.map_attempts, 1)?;
+            let start = Instant::now();
+            let mapped = gpu.map(&gpu.upload, wgpu::MapMode::Write);
+            timed(&mut arm.evidence.times.map_wait_ns, start)?;
+            if mapped.is_err() {
+                add(&mut arm.evidence.map_failures, 1)?;
+            }
+            mapped?;
+            add(&mut arm.evidence.maps_completed, 1)?;
+            // Catch only to guarantee unmap after the view future is dropped. A
+            // panic is then propagated to the report boundary, never retried.
+            let mapped_source = std::panic::AssertUnwindSafe(async {
+                let mut view = gpu.upload.slice(..).get_mapped_range_mut();
+                let base = view.as_ptr() as usize;
+                let capacity = view.len();
+                let slices = arena_slices(&mut view, set.width, true);
+                if slices.is_err() {
+                    add(&mut arm.evidence.alignment_failures, 1)?;
+                }
+                let (offset, mut destinations) = slices?;
+                observe_slices(arm, base, offset, set.width, true)?;
+                let ns = cell_source(storage, set, &mut destinations, arm, true).await?;
+                let mut payloads = Vec::with_capacity(set.width);
+                for (j, source) in destinations.into_iter().enumerate() {
+                    let (prefix, h) = streams.source(source).map_err(Failure::authority)?;
+                    note_payload(&mut arm.evidence)?;
+                    let source_offset = offset
+                        .checked_add(
+                            j.checked_mul(FULL)
+                                .ok_or_else(|| Failure::accounting("copy slot overflow"))?,
+                        )
+                        .ok_or_else(|| Failure::accounting("copy base overflow"))?;
+                    let gpu_offset = copy_offsets(source_offset, prefix, PAYLOAD, capacity)
+                        .map_err(Failure::accounting)?;
+                    payloads.push((gpu_offset, h));
+                }
+                Ok::<_, Failure>((ns, payloads))
+            })
+            .catch_unwind()
+            .await;
+            let start = Instant::now();
+            gpu.upload.unmap();
+            timed(&mut arm.evidence.times.treatment_unmap_ns, start)?;
+            add(&mut arm.evidence.unmaps, 1)?;
+            let source = match mapped_source {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
+            let (ns, payloads) = source?;
+            gpu.check()?;
+            let mut hashes = Vec::with_capacity(set.width);
+            for (gpu_offset, mut h) in payloads {
+                prepare_destination(gpu, &mut arm.evidence)?;
+                gpu.queue
+                    .write_buffer(&gpu.destination, 0, &EPOCH.to_le_bytes());
+                let mut encoder =
+                    gpu.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("batch-source-verification-copy"),
+                        });
+                encoder.copy_buffer_to_buffer(
+                    &gpu.upload,
+                    gpu_offset,
+                    &gpu.destination,
+                    EPOCH_OFFSET as u64,
+                    PAYLOAD as u64,
+                );
+                note_upload(&mut arm.evidence, true)?;
+                gpu.drain(Some(encoder.finish()))?;
+                add(&mut arm.evidence.gpu_completed_ops, 1)?;
+                verify(gpu, &mut arm.evidence, &mut h, streams)?;
+                hashes.push(h);
+            }
+            gpu.check()?;
+            Ok((ns, hashes))
+        }
+        fn note_arm_error(arm: &mut CellArm, failure: &Failure) -> Result<()> {
+            if failure.classification == "gpu-failed" && arm.evidence.gpu_failures == 0 {
+                add(&mut arm.evidence.gpu_failures, 1)?;
+            }
+            if failure.classification == "accounting-failed"
+                && arm.evidence.accounting_failures == 0
+            {
+                add(&mut arm.evidence.accounting_failures, 1)?;
+            }
+            Ok(())
+        }
+        fn c_proof_hits_only(proof: &SourceUploadFdProofSnapshot, slots: u64) -> bool {
+            slots.checked_mul(4).is_some_and(|n| {
+                proof.source_upload_fd_proof_requests == n
+                    && proof.source_upload_fd_proof_hits == n
+                    && proof.source_upload_fd_proof_misses == 0
+                    && proof.source_upload_fd_proof_failures == 0
+            })
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+        struct ExecutedCell {
+            set_index: usize,
+            ordinal: usize,
+            cell: Cell,
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+        struct CellHash {
+            source: String,
+            payload: String,
+            gpu: String,
+            epoch: bool,
+        }
+        impl From<Hashes> for CellHash {
+            fn from(h: Hashes) -> Self {
+                Self {
+                    source: h.source,
+                    payload: h.payload,
+                    gpu: h.gpu,
+                    epoch: h.epoch,
+                }
+            }
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+        struct VerificationSet {
+            source_set: CSet,
+            cells: BTreeMap<Cell, Vec<CellHash>>,
+        }
+        impl VerificationSet {
+            fn valid(&self) -> bool {
+                self.cells.len() == 4
+                    && Cell::ALL.into_iter().all(|cell| {
+                        self.cells.get(&cell).is_some_and(|hashes| {
+                            hashes.len() == self.source_set.width
+                                && hashes.iter().enumerate().all(|(j, h)| {
+                                    h.epoch
+                                        && h.source.len() == 64
+                                        && h.payload.len() == 64
+                                        && h.payload == h.gpu
+                                        && self
+                                            .cells
+                                            .get(&Cell::HS)
+                                            .and_then(|v| v.get(j))
+                                            .is_some_and(|host| {
+                                                h.source == host.source
+                                                    && h.payload == host.payload
+                                                    && h.gpu == host.gpu
+                                            })
+                                })
+                        })
+                    })
+            }
+        }
+        #[derive(Debug, Serialize)]
+        struct CPhase {
+            name: &'static str,
+            b_schedule_count: usize,
+            schedule: Vec<CSet>,
+            expected: CPlan,
+            execution_trace: Vec<ExecutedCell>,
+            raw_samples: Vec<CSample>,
+            raw_verification: Vec<VerificationSet>,
+            statistics: CStatistics,
+            cells: BTreeMap<Cell, CellArm>,
+            witnesses: BTreeMap<Cell, Witnesses>,
+            fd_proof: SourceUploadFdProofSnapshot,
+            fd_proof_hits_only: bool,
+            mismatch_count: u64,
+        }
+        impl CPhase {
+            fn new(name: &'static str, b_schedule_count: usize) -> Result<Self> {
+                let schedule = c_schedule(b_schedule_count)?;
+                Ok(Self {
+                    name,
+                    b_schedule_count,
+                    expected: plan(&schedule)?,
+                    schedule,
+                    execution_trace: Vec::new(),
+                    raw_samples: Vec::new(),
+                    raw_verification: Vec::new(),
+                    statistics: c_statistics(&[])?,
+                    cells: Cell::ALL
+                        .into_iter()
+                        .map(|c| Ok((c, CellArm::new(c)?)))
+                        .collect::<Result<_>>()?,
+                    witnesses: Cell::ALL
+                        .into_iter()
+                        .map(|c| (c, Witnesses::default()))
+                        .collect(),
+                    fd_proof: SourceUploadFdProofSnapshot::default(),
+                    fd_proof_hits_only: false,
+                    mismatch_count: 0,
+                })
+            }
+            fn successful(&self) -> bool {
+                let Some(host) = self.witnesses.get(&Cell::HS) else {
+                    return false;
+                };
+                let expected_trace: Vec<_> = self
+                    .schedule
+                    .iter()
+                    .flat_map(|s| {
+                        s.execution_sequence
+                            .iter()
+                            .enumerate()
+                            .map(|(ordinal, &cell)| ExecutedCell {
+                                set_index: s.set_index,
+                                ordinal,
+                                cell,
+                            })
+                    })
+                    .collect();
+                let b_sets: Vec<_> = self.schedule.iter().map(CSet::b_set).collect();
+                self.fd_proof_hits_only
+                    && c_proof_hits_only(&self.fd_proof, self.expected.source.expert_slot_count)
+                    && c_schedule(self.b_schedule_count).is_ok_and(|s| s == self.schedule)
+                    && plan(&self.schedule).is_ok_and(|e| e == self.expected)
+                    && self.execution_trace == expected_trace
+                    && self.cells.len() == 4
+                    && self.witnesses.len() == 4
+                    && self.raw_samples.len() == self.schedule.len()
+                    && self.raw_verification.len() == self.schedule.len()
+                    && self
+                        .raw_samples
+                        .iter()
+                        .zip(&self.schedule)
+                        .all(|(s, set)| s.source_set == *set && s.valid())
+                    && self
+                        .raw_verification
+                        .iter()
+                        .zip(&self.schedule)
+                        .all(|(s, set)| s.source_set == *set && s.valid())
+                    && c_statistics(&self.raw_samples)
+                        .is_ok_and(|s| s.exact_matches(&self.statistics))
+                    && self.mismatch_count == 0
+                    && Cell::ALL.into_iter().all(|cell| {
+                        self.cells.get(&cell).is_some_and(|arm| {
+                            arm.cell == cell
+                                && arm.completed_source_sets == b_sets
+                                && arm.successful(&self.expected.source, cell.mapped())
+                                && arm.evidence.times.source_direct_read_ns
+                                    == self.statistics.primary_k2_through_k8.exact.totals.times()
+                                        [cell.index()]
+                        }) && self.witnesses.get(&cell).is_some_and(|w| {
+                            w.full_source_sha256 == host.full_source_sha256
+                                && w.bare_payload_sha256 == host.bare_payload_sha256
+                                && w.bare_payload_sha256 == w.gpu_destination_payload_sha256
+                                && w.full_source_sha256.len() == 64
+                                && w.bare_payload_sha256.len() == 64
+                        })
+                    })
+            }
+        }
+        async fn c_phase(
+            p: &mut CPhase,
+            gpu: &Gpu,
+            storage: &NvmeStorage,
+            host: &mut AlignedBuffer,
+        ) -> Result<()> {
+            let mut streams: [Streams; 4] = std::array::from_fn(|_| Streams::default());
+            let result=async {
+                for set in p.schedule.clone() {
+                    let b_set=set.b_set(); let mut times=[0u64;4];
+                    let mut verification=VerificationSet{source_set:set.clone(),cells:BTreeMap::new()};
+                    for (ordinal,cell) in set.execution_sequence.into_iter().enumerate() {
+                        p.execution_trace.push(ExecutedCell{set_index:set.set_index,ordinal,cell});
+                        let arm=p.cells.get_mut(&cell).ok_or_else(||Failure::accounting("missing cell"))?;
+                        let result=if cell.mapped() {
+                            mapped_cell(gpu,storage,&b_set,arm,&mut streams[cell.index()]).await
+                        } else {
+                            host_cell(gpu,storage,host,&b_set,arm,&mut streams[cell.index()]).await
+                        };
+                        if let Err(e)=&result {note_arm_error(arm,e)?;}
+                        let (ns,hashes)=result?; times[cell.index()]=ns;
+                        verification.cells.insert(cell,hashes.into_iter().map(CellHash::from).collect());
+                    }
+                    p.raw_samples.push(CSample::new(set,times[Cell::HS.index()],times[Cell::MS.index()],times[Cell::HC.index()],times[Cell::MC.index()])?);
+                    let valid=verification.valid(); p.raw_verification.push(verification);
+                    if !valid { add(&mut p.mismatch_count,1)?; return Err(Failure::runtime("hash-parity-failed","four-cell source/payload/GPU/epoch mismatch; raw verification retained")); }
+                }
+                Ok(())
+            }.await;
+            // Both helpers return only after every attempted read has finished.
+            p.fd_proof = storage.source_upload_fd_proof_snapshot();
+            p.fd_proof_hits_only =
+                c_proof_hits_only(&p.fd_proof, p.expected.source.expert_slot_count);
+            for cell in Cell::ALL {
+                let arm = p
+                    .cells
+                    .get_mut(&cell)
+                    .ok_or_else(|| Failure::accounting("missing cell"))?;
+                arm.source_schedule = schedule_evidence(&arm.completed_source_sets)?;
+                arm.evidence.rates();
+                p.witnesses.insert(cell, streams[cell.index()].snapshot());
+            }
+            p.statistics = c_statistics(&p.raw_samples)?;
+            result?;
+            if !p.fd_proof_hits_only {
+                return Err(Failure::authority(format!(
+                    "{} expected only proof hits: {:?}",
+                    p.name, p.fd_proof
+                )));
+            }
+            Ok(())
+        }
+        #[derive(Debug, Serialize)]
+        struct CAuthority {
+            // Common hardware/geometry fields retain their existing meaning;
+            // control/treatment denote the concurrent HC/MC contrast here.
+            #[serde(flatten)]
+            base: Authority,
+            cell_source_apis: BTreeMap<Cell, &'static str>,
+            host_arena_capacity_bytes: usize,
+            max_width: usize,
+            fd_preproof_completed: bool,
+            fd_cache_capacity: usize,
+            preproof_universe_size: usize,
+            preproof_ordered_expert_ids: Vec<u32>,
+            preproof: SourceUploadFdProofSnapshot,
+            after_preproof_telemetry_reset: SourceUploadFdProofSnapshot,
+            after_warmup_telemetry_reset: SourceUploadFdProofSnapshot,
+        }
+        #[derive(Debug, Serialize)]
+        struct CReport {
+            schema: &'static str,
+            args: Args,
+            config_sha256: Option<String>,
+            complete: bool,
+            correctness_pass: bool,
+            authoritative: bool,
+            classification: String,
+            failure: Option<String>,
+            authority: CAuthority,
+            warmup: CPhase,
+            measured: CPhase,
+            performance_required_for_correctness: bool,
+            performance_authority: &'static str,
+            interaction_interpretation_conditional_on_zero_retry_log: &'static str,
+            primary_endpoint: &'static str,
+            schedule_contract: &'static str,
+            timing_contract: &'static str,
+            interpretation_contract: &'static str,
+            secondary_destination_endpoints: &'static str,
+            retry_evidence_contract: &'static str,
+            source_byte_evidence_contract: &'static str,
+        }
+        impl CReport {
+            fn new(args: Args) -> Result<Self> {
+                let mut base = Report::new(args.clone()).authority;
+                base.control_source_api = B_API;
+                base.treatment_source_api = B_API;
+                base.control_destination = "aligned-host-arena";
+                base.treatment_destination = "wgpu-map-write-arena";
+                base.upload_capacity_bytes = MAPPED_ARENA;
+                Ok(Self{schema:C_SCHEMA,args,config_sha256:None,complete:false,correctness_pass:false,authoritative:false,classification:"not-run".into(),failure:None,
+                    authority:CAuthority{base,cell_source_apis:Cell::ALL.into_iter().map(|c|(c,c.api())).collect(),host_arena_capacity_bytes:HOST_ARENA,max_width:MAX_WIDTH,
+                        fd_preproof_completed:false,fd_cache_capacity:0,preproof_universe_size:UNIVERSE_SIZE,
+                        preproof_ordered_expert_ids:expert_sequence(UNIVERSE_SIZE,NAMESPACE).map_err(Failure::accounting)?,preproof:SourceUploadFdProofSnapshot::default(),after_preproof_telemetry_reset:SourceUploadFdProofSnapshot::default(),after_warmup_telemetry_reset:SourceUploadFdProofSnapshot::default()},
+                    warmup:CPhase::new("warmup",WARMUP_B_COUNT)?,measured:CPhase::new("measured",MEASURED_B_COUNT)?,performance_required_for_correctness:false,
+                    performance_authority:"PENDING_EXTERNAL_RETRY_LOG_AUDIT",interaction_interpretation_conditional_on_zero_retry_log:"INCONCLUSIVE",
+                    primary_endpoint:"112 K=2..8 sets: sum((MC-HC)-(MS-HS)); percent denominator=sum(HC)",schedule_contract:C_SCHEDULE_CONTRACT,timing_contract:C_TIMER_CONTRACT,
+                    interpretation_contract:C_INTERPRETATION,secondary_destination_endpoints:C_SECONDARY,retry_evidence_contract:C_RETRY,
+                    source_byte_evidence_contract:"Each successful helper must return exactly K*FULL bytes. Failed-helper partial physical I/O is unavailable, never inferred as zero. Each cell retains ordered per-set full-source/payload/verified-GPU hashes and concatenated byte-stream witnesses. Verification/reset/copy/readback are outside source timers."})
+            }
+            fn authority_valid(&self) -> bool {
+                let a = &self.authority;
+                let b = &a.base;
+                self.schema == C_SCHEMA
+                    && !self.performance_required_for_correctness
+                    && self.args.iterations == MEASURED_B_COUNT
+                    && self.args.warmup_iterations == WARMUP_B_COUNT
+                    && self.warmup.b_schedule_count == WARMUP_B_COUNT
+                    && self.measured.b_schedule_count == MEASURED_B_COUNT
+                    && a.cell_source_apis == Cell::ALL.into_iter().map(|c| (c, c.api())).collect()
+                    && a.host_arena_capacity_bytes == HOST_ARENA
+                    && a.max_width == MAX_WIDTH
+                    && b.same_source_api
+                    && b.control_source_api == B_API
+                    && b.treatment_source_api == B_API
+                    && b.control_destination == "aligned-host-arena"
+                    && b.treatment_destination == "wgpu-map-write-arena"
+                    && b.upload_capacity_bytes == MAPPED_ARENA
+                    && b.full_source_bytes == FULL
+                    && b.block_alignment == ALIGN
+                    && b.uth_prefix_bytes == PREFIX
+                    && b.bare_payload_bytes == PAYLOAD
+                    && b.physical_slot_bytes == SLOT
+                    && b.source_timer_excludes_allocation
+                    && b.source_timer_excludes_map_async_device_poll
+                    && b.source_timer_excludes_alignment_setup
+                    && b.source_timer_excludes_hashes_readback_fd_evidence
+                    && b.source_timer_excludes_gpu_copy_unmap
+                    && b.linux
+                    && b.expected_adapter_name == "NVIDIA L4"
+                    && self.args.expected_adapter_name == "NVIDIA L4"
+                    && b.adapter_authoritative
+                    && b.direct_io_requested
+                    && b.packed_storage == Some(false)
+                    && b.exact_geometry
+                    && a.fd_preproof_completed
+                    && a.fd_cache_capacity >= 128
+                    && a.preproof_universe_size == 128
+                    && expert_sequence(128, NAMESPACE)
+                        .is_ok_and(|ids| ids == a.preproof_ordered_expert_ids)
+                    && a.preproof
+                        == SourceUploadFdProofSnapshot {
+                            source_upload_fd_proof_requests: 128,
+                            source_upload_fd_proof_misses: 128,
+                            ..SourceUploadFdProofSnapshot::default()
+                        }
+                    && a.after_preproof_telemetry_reset == SourceUploadFdProofSnapshot::default()
+                    && a.after_warmup_telemetry_reset == SourceUploadFdProofSnapshot::default()
+                    && c_proof_hits_only(&self.warmup.fd_proof, 140)
+                    && c_proof_hits_only(&self.measured.fd_proof, 560)
+            }
+            fn classify(&mut self) -> Result<()> {
+                self.complete = true;
+                self.correctness_pass = false;
+                self.authoritative = false;
+                self.interaction_interpretation_conditional_on_zero_retry_log = "INCONCLUSIVE";
+                if !self.authority_valid() {
+                    self.classification = "authority-failed".into();
+                } else if !self.warmup.successful() || !self.measured.successful() {
+                    self.classification = "evidence-reconciliation-failed".into();
+                } else {
+                    self.correctness_pass = true;
+                    self.authoritative = true;
+                    self.classification = "destination-concurrency-interaction-complete".into();
+                    self.interaction_interpretation_conditional_on_zero_retry_log =
+                        interaction_interpretation(&self.measured.statistics)?;
+                }
+                Ok(())
+            }
+            fn fail(&mut self, failure: Failure) {
+                self.complete = failure.complete;
+                self.correctness_pass = false;
+                self.authoritative = false;
+                self.classification = failure.classification.into();
+                self.failure = Some(failure.detail);
+                self.interaction_interpretation_conditional_on_zero_retry_log = "INCONCLUSIVE";
+            }
+        }
+        async fn execute(report: &mut CReport) -> Result<()> {
+            if report.args.iterations != MEASURED_B_COUNT
+                || report.args.warmup_iterations != WARMUP_B_COUNT
+            {
+                return Err(Failure::runtime("invalid-arguments", "C requires --iterations 128 --warmup-iterations 32 as B schedule inputs; actual filtered counts are 112 measured and 28 warmup source sets"));
+            }
+            let bytes = std::fs::read(&report.args.config)
+                .map_err(|e| Failure::runtime("config-failed", e))?;
+            report.config_sha256 = Some(sha(&bytes));
+            let text =
+                std::str::from_utf8(&bytes).map_err(|e| Failure::runtime("config-failed", e))?;
+            let config: Config =
+                toml::from_str(text).map_err(|e| Failure::runtime("config-failed", e))?;
+            config.validate().map_err(Failure::authority)?;
+            let a = &mut report.authority;
+            a.base.direct_io_requested = !config.storage.no_direct;
+            a.base.packed_storage = Some(
+                config.storage.packed_blob.is_some() || config.storage.packed_manifest.is_some(),
+            );
+            a.base.source_data_dir = Some(config.model.data_dir.clone());
+            validate_geometry(&config)?;
+            a.base.exact_geometry = true;
+            if !a.base.linux
+                || report.args.expected_adapter_name != "NVIDIA L4"
+                || !a.base.direct_io_requested
+                || a.base.packed_storage != Some(false)
+            {
+                return Err(Failure::authority("requires Linux, exact NVIDIA L4 Vulkan, O_DIRECT, unpacked full-file Qwen geometry"));
+            }
+            let storage = NvmeStorage::new(StorageConfig {
+                base_path: config.model.data_dir,
+                expert_size: FULL,
+                block_align: ALIGN,
+                use_direct_io: true,
+                num_experts_per_layer: Some(128),
+            })
+            .map_err(|e| Failure::runtime("source-failed", e))?;
+            if storage.is_packed() {
+                return Err(Failure::authority("packed storage forbidden"));
+            }
+            a.fd_cache_capacity = storage.max_open_files();
+            if a.fd_cache_capacity < a.preproof_universe_size {
+                return Err(Failure::authority(
+                    "fd cache cannot retain the complete deterministic universe",
+                ));
+            }
+            let preproof = storage.preprove_source_upload_fds(&a.preproof_ordered_expert_ids);
+            a.preproof = storage.source_upload_fd_proof_snapshot();
+            preproof.map_err(|e| Failure::authority(format!("fd preproof: {e}")))?;
+            if a.preproof.source_upload_fd_proof_requests != a.preproof_universe_size as u64
+                || a.preproof.source_upload_fd_proof_misses != a.preproof_universe_size as u64
+                || a.preproof.source_upload_fd_proof_hits != 0
+                || a.preproof.source_upload_fd_proof_failures != 0
+            {
+                return Err(Failure::authority(
+                    "fresh universe preproof counters do not reconcile",
+                ));
+            }
+            a.fd_preproof_completed = true;
+            storage.reset_source_upload_fd_proof_telemetry();
+            a.after_preproof_telemetry_reset = storage.source_upload_fd_proof_snapshot();
+            if a.after_preproof_telemetry_reset != SourceUploadFdProofSnapshot::default() {
+                return Err(Failure::authority("preproof telemetry reset failed"));
+            }
+            let gpu = Gpu::with_upload_capacity(&mut a.base, MAPPED_ARENA).await?;
+            let mut host = AlignedBuffer::new(HOST_ARENA, ALIGN);
+            c_phase(&mut report.warmup, &gpu, &storage, &mut host).await?;
+            if !report.warmup.successful() {
+                return Err(Failure::authority("warmup evidence did not reconcile"));
+            }
+            storage.reset_source_upload_fd_proof_telemetry();
+            report.authority.after_warmup_telemetry_reset =
+                storage.source_upload_fd_proof_snapshot();
+            if report.authority.after_warmup_telemetry_reset
+                != SourceUploadFdProofSnapshot::default()
+            {
+                return Err(Failure::authority("warmup telemetry reset failed"));
+            }
+            c_phase(&mut report.measured, &gpu, &storage, &mut host).await?;
+            gpu.check()?;
+            report.classify()?;
+            Ok(())
+        }
+        pub(crate) async fn run_command(
+            args: Args,
+        ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&args.report_out)?;
+            let mut report = CReport::new(args).map_err(|e| io::Error::other(e.detail))?;
+            match std::panic::AssertUnwindSafe(execute(&mut report))
+                .catch_unwind()
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => report.fail(e),
+                Err(p) => {
+                    let detail = p
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "non-string panic".into());
+                    report.fail(Failure::runtime(
+                        "runtime-failed",
+                        format!("C diagnostic panic: {detail}"),
+                    ));
+                }
+            }
+            serde_json::to_writer_pretty(&mut output, &report)?;
+            output.write_all(b"\n")?;
+            output.sync_all()?;
+            if report.complete {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "{}: {}",
+                    report.classification,
+                    report.failure.as_deref().unwrap_or("incomplete")
+                ))
+                .into())
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            fn args() -> Args {
+                Args {
+                    config: "unused.toml".into(),
+                    expected_adapter_name: "NVIDIA L4".into(),
+                    warmup_iterations: 32,
+                    iterations: 128,
+                    report_out: "unused.json".into(),
+                }
+            }
+            fn samples(times: [u64; 4]) -> Vec<CSample> {
+                c_schedule(128)
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| CSample::new(s, times[0], times[2], times[1], times[3]).unwrap())
+                    .collect()
+            }
+            fn fixture_phase(name: &'static str, count: usize, times: [u64; 4]) -> CPhase {
+                let mut p = CPhase::new(name, count).unwrap();
+                let n = p.expected.source.expert_slot_count;
+                let sets = p.expected.source.source_set_count;
+                p.raw_samples = p
+                    .schedule
+                    .iter()
+                    .cloned()
+                    .map(|s| CSample::new(s, times[0], times[2], times[1], times[3]).unwrap())
+                    .collect();
+                p.statistics = c_statistics(&p.raw_samples).unwrap();
+                p.execution_trace = p
+                    .schedule
+                    .iter()
+                    .flat_map(|s| {
+                        s.execution_sequence
+                            .iter()
+                            .enumerate()
+                            .map(|(ordinal, &cell)| ExecutedCell {
+                                set_index: s.set_index,
+                                ordinal,
+                                cell,
+                            })
+                    })
+                    .collect();
+                p.raw_verification = p
+                    .schedule
+                    .iter()
+                    .map(|s| VerificationSet {
+                        source_set: s.clone(),
+                        cells: Cell::ALL
+                            .into_iter()
+                            .map(|c| {
+                                (
+                                    c,
+                                    (0..s.width)
+                                        .map(|_| CellHash {
+                                            source: sha(b"source"),
+                                            payload: sha(b"payload"),
+                                            gpu: sha(b"payload"),
+                                            epoch: true,
+                                        })
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                for cell in Cell::ALL {
+                    let arm = p.cells.get_mut(&cell).unwrap();
+                    arm.source_sets_attempted = sets;
+                    arm.serial_helper_calls = if cell.serial() { sets } else { 0 };
+                    arm.concurrent_helper_calls = if cell.serial() { 0 } else { sets };
+                    arm.completed_source_sets = p.schedule.iter().map(CSet::b_set).collect();
+                    arm.source_schedule = p.expected.source.clone();
+                    let a = &mut arm.evidence;
+                    a.ops_attempted = n;
+                    a.source_read_attempts = n;
+                    a.source_read_ops = n;
+                    a.full_source_bytes = n * FULL as u64;
+                    a.payload_ops = n;
+                    a.payload_bytes = n * PAYLOAD as u64;
+                    a.upload_ops = n;
+                    a.gpu_copied_bytes = n * PAYLOAD as u64;
+                    a.epoch_bytes = n * 4;
+                    a.gpu_completed_ops = n;
+                    a.verified_ops = n;
+                    a.verification_readback_bytes = n * SLOT as u64;
+                    a.verification_destination_reset_ops = n;
+                    a.verification_destination_reset_bytes = n * SLOT as u64;
+                    a.pointers.observations = n;
+                    a.pointers.aligned = n;
+                    a.fd_evidence = FdEvidence {
+                        checks: n,
+                        direct_observed: n,
+                        full_file_length_observed: n,
+                        ..FdEvidence::default()
+                    };
+                    a.times.source_direct_read_ns = sets * times[cell.index()];
+                    if cell.mapped() {
+                        a.map_attempts = sets;
+                        a.maps_completed = sets;
+                        a.unmaps = sets;
+                        a.pointers.gpu_offset_checks = n;
+                        a.explicit_copy_buffer_bytes = n * PAYLOAD as u64;
+                    } else {
+                        a.cpu_payload_copy_bytes = n * PAYLOAD as u64;
+                    }
+                    p.witnesses.insert(
+                        cell,
+                        Witnesses {
+                            full_source_sha256: sha(b"source"),
+                            bare_payload_sha256: sha(b"payload"),
+                            gpu_destination_payload_sha256: sha(b"payload"),
+                        },
+                    );
+                }
+                p.fd_proof = SourceUploadFdProofSnapshot {
+                    source_upload_fd_proof_requests: n * 4,
+                    source_upload_fd_proof_hits: n * 4,
+                    ..SourceUploadFdProofSnapshot::default()
+                };
+                p.fd_proof_hits_only = true;
+                assert!(p.successful());
+                p
+            }
+            fn fixture(times: [u64; 4]) -> CReport {
+                let mut r = CReport::new(args()).unwrap();
+                let a = &mut r.authority;
+                a.base.linux = true;
+                a.base.adapter_authoritative = true;
+                a.base.direct_io_requested = true;
+                a.base.packed_storage = Some(false);
+                a.base.exact_geometry = true;
+                a.fd_cache_capacity = 128;
+                a.fd_preproof_completed = true;
+                a.preproof = SourceUploadFdProofSnapshot {
+                    source_upload_fd_proof_requests: 128,
+                    source_upload_fd_proof_misses: 128,
+                    ..SourceUploadFdProofSnapshot::default()
+                };
+                r.warmup = fixture_phase("warmup", 32, times);
+                r.measured = fixture_phase("measured", 128, times);
+                r
+            }
+            #[test]
+            fn source_to_upload_copy_elision_c_keeps_b_implementation_and_tests_byte_identical() {
+                let whole = include_str!("gpu_native_source_to_upload_copy_elision.rs");
+                let b = whole
+                    .split_once("mod hma1c_b {")
+                    .unwrap()
+                    .1
+                    .split_once("    /// HMA-1C-C is nested only to reuse B")
+                    .unwrap()
+                    .0;
+                assert_eq!(
+                    sha(format!("mod hma1c_b {{{b}").as_bytes()),
+                    "f5730a13c2e3788072782f1cddc875be83e956b32c8f7de8bf012a72a6b0a5b3"
+                );
+            }
+            #[test]
+            fn source_to_upload_copy_elision_c_b_schedule_and_order_hashes_pinned() {
+                let pins = [
+                    (
+                        32,
+                        28,
+                        140,
+                        "92f6d734fbf5f2060259a9886498ff27abbce48f961997eac8015fd3ab555fd9",
+                        "a69c3ddcb54774564b07945b1b685079c3936c2adaee0b97a2a03936f826df3b",
+                        "38ae77cc897e75ed247db0b940c42f9a58a897457ca851dd07ac83c7d792adee",
+                        "c649854776be748e6eda77f33c2a89ebf491c3524a6e20a89bb9081fd1787b35",
+                    ),
+                    (
+                        128,
+                        112,
+                        560,
+                        "58ceb173ba4bb64fecac985b67dd326e5f11995c8a3dd8a5c55f77850faf522b",
+                        "a66e722e5f7375fbb1a3283383b9cb46e2395f10a71a8bad59e5210ecdfdfe36",
+                        "51ab91a5058224956c5f3e9080f690abc4ecb3a8228f4463edb262b81ff84049",
+                        "d0e2777bcf22bcb6a065cb70a079b2567204543cd73c3a78aaa87a6e3de5de8d",
+                    ),
+                ];
+                for (count, sets, slots, ids, widths, order, complete) in pins {
+                    let s = c_schedule(count).unwrap();
+                    let e = plan(&s).unwrap();
+                    assert_eq!(
+                        s.iter().map(CSet::b_set).collect::<Vec<_>>(),
+                        schedule(count)
+                            .unwrap()
+                            .into_iter()
+                            .filter(|s| s.width >= 2)
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        (
+                            e.source.source_set_count,
+                            e.source.expert_slot_count,
+                            e.source.source_bytes
+                        ),
+                        (sets, slots, slots * FULL as u64)
+                    );
+                    assert_eq!(e.source.ordered_source_set_ids_sha256, ids);
+                    assert_eq!(e.source.ordered_width_sha256, widths);
+                    assert_eq!(e.execution_order_sha256, order);
+                    assert_eq!(e.complete_schedule_sha256, complete);
+                    assert_eq!(s[0].set_index, 1);
+                    assert_eq!(s[0].ordered_expert_ids, vec![822, 1451]);
+                }
+                assert!(c_schedule(112).is_err());
+                assert!(c_schedule(28).is_err());
+                let mut bad = c_schedule(128).unwrap();
+                bad[0].execution_sequence.swap(0, 1);
+                assert!(plan(&bad).is_err());
+                let mut bad = c_schedule(128).unwrap();
+                bad[0].width_occurrence = 4;
+                assert!(plan(&bad).is_err());
+                let mut bad = c_schedule(128).unwrap();
+                bad[0].williams_order_class = usize::MAX;
+                assert!(plan(&bad).is_err());
+            }
+            #[test]
+            fn source_to_upload_copy_elision_c_williams_width_position_predecessor_balance() {
+                for (count, repetitions) in [(32, 1usize), (128, 4usize)] {
+                    let schedule = c_schedule(count).unwrap();
+                    for width in 2..=8 {
+                        let sets: Vec<_> = schedule.iter().filter(|s| s.width == width).collect();
+                        assert_eq!(sets.len(), 4 * repetitions);
+                        let mut classes = [0; 4];
+                        let mut positions = [[0; 4]; 4];
+                        let mut predecessor = [[0; 4]; 4];
+                        for (r, s) in sets.iter().enumerate() {
+                            assert_eq!(s.width_occurrence, r);
+                            assert_eq!(s.williams_order_class, r % 4);
+                            classes[s.williams_order_class] += 1;
+                            for (position, cell) in s.execution_sequence.iter().enumerate() {
+                                positions[cell.index()][position] += 1;
+                            }
+                            for pair in s.execution_sequence.windows(2) {
+                                predecessor[pair[0].index()][pair[1].index()] += 1;
+                            }
+                        }
+                        assert_eq!(classes, [repetitions; 4]);
+                        assert_eq!(positions, [[repetitions; 4]; 4]);
+                        for (a, row) in predecessor.iter().enumerate() {
+                            for (b, &n) in row.iter().enumerate() {
+                                assert_eq!(n, if a == b { 0 } else { repetitions });
+                            }
+                        }
+                    }
+                }
+            }
+            #[test]
+            fn source_to_upload_copy_elision_c_exact_deltas_products_medians_and_ratios() {
+                let set = c_schedule(128).unwrap().remove(0);
+                let s = CSample::new(set.clone(), 100, 103, 50, 60).unwrap();
+                assert_eq!(
+                    (
+                        s.serial_destination_delta_ns,
+                        s.concurrent_destination_delta_ns,
+                        s.interaction_delta_ns
+                    ),
+                    (3, 10, 7)
+                );
+                assert_eq!(
+                    (
+                        s.mc_times_hs,
+                        s.hc_times_ms,
+                        s.multiplicative_interaction_direction
+                    ),
+                    (6000, 5150, 1)
+                );
+                let negative = CSample::new(set.clone(), 100, 130, 50, 60).unwrap();
+                assert_eq!(negative.interaction_delta_ns, -20);
+                assert_eq!(negative.multiplicative_interaction_direction, -1);
+                // Additive and multiplicative interaction directions can differ.
+                let disagreement = CSample::new(set, 100, 110, 1000, 1015).unwrap();
+                assert_eq!(disagreement.interaction_delta_ns, 5);
+                assert_eq!(disagreement.multiplicative_interaction_direction, -1);
+                assert_eq!(
+                    median_signed(vec![-3, 2]).unwrap(),
+                    Some(SignedFraction {
+                        numerator: -1,
+                        denominator: 2
+                    })
+                );
+                assert_eq!(
+                    median_signed(vec![7, 1, 3]).unwrap(),
+                    Some(SignedFraction {
+                        numerator: 3,
+                        denominator: 1
+                    })
+                );
+                let m = u128::MAX;
+                let lo = Ratio {
+                    numerator: m - 1,
+                    denominator: m,
+                };
+                let hi = Ratio {
+                    numerator: m,
+                    denominator: m - 1,
+                };
+                assert_eq!(lo.descriptive(), hi.descriptive());
+                assert_eq!(lo.compare(hi), Ordering::Less);
+                let med = RatioMedian::new(vec![(2, hi), (1, lo)]).unwrap();
+                assert_eq!(med.lower, lo);
+                assert_eq!(med.upper, hi);
+                assert_eq!(med.compare_hundredths(99).unwrap(), Ordering::Greater);
+                assert_eq!(med.compare_hundredths(101).unwrap(), Ordering::Less);
+                for n in 1..30u128 {
+                    for d in 1..30u128 {
+                        for c in 1..10u128 {
+                            let a = Ratio {
+                                numerator: n,
+                                denominator: d,
+                            };
+                            let b = Ratio {
+                                numerator: c,
+                                denominator: 7,
+                            };
+                            assert_eq!(a.compare(b), (n * 7).cmp(&(c * d)));
+                            let med = RatioMedian { lower: a, upper: b };
+                            for threshold in [99, 100, 101] {
+                                assert_eq!(
+                                    med.compare_hundredths(threshold).unwrap(),
+                                    ((n * 7 + c * d) * 100).cmp(&(d * 7 * 2 * threshold as u128))
+                                );
+                            }
+                        }
+                    }
+                }
+                let same = Ratio {
+                    numerator: m,
+                    denominator: m,
+                };
+                assert_eq!(
+                    RatioMedian {
+                        lower: same,
+                        upper: same
+                    }
+                    .compare_hundredths(100)
+                    .unwrap(),
+                    Ordering::Equal
+                );
+            }
+            #[test]
+            fn source_to_upload_copy_elision_c_statistics_width_order_and_primary_reconcile() {
+                let raw: Vec<_> = c_schedule(128)
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| {
+                        let d = (s.width * s.width_occurrence) as u64;
+                        CSample::new(s, 1000 + d, 1010 + d, 800 + d, 850 + d).unwrap()
+                    })
+                    .collect();
+                let s = c_statistics(&raw).unwrap();
+                let p = &s.primary_k2_through_k8.exact;
+                assert_eq!(p.totals.samples, 112);
+                assert_eq!(p.totals.interaction_delta_ns, 40 * 112);
+                assert_eq!(
+                    s.interaction_widths,
+                    Directions {
+                        positive: 7,
+                        negative: 0,
+                        equal: 0
+                    }
+                );
+                assert_eq!(
+                    p.median_signed_interaction_delta_ns,
+                    Some(SignedFraction {
+                        numerator: 80,
+                        denominator: 2
+                    })
+                );
+                assert_eq!(
+                    p.mean_signed_interaction_delta_ns,
+                    Some(SignedFraction {
+                        numerator: 4480,
+                        denominator: 112
+                    })
+                );
+                for w in s.per_width.values() {
+                    assert_eq!(w.aggregate.exact.totals.samples, 16);
+                    for c in w.williams_order_classes.values() {
+                        assert_eq!(c.exact.totals.samples, 4);
+                    }
+                }
+                for c in s.williams_order_classes.values() {
+                    assert_eq!(c.exact.totals.samples, 28);
+                }
+                reconcile_partitions(s.per_width.values().map(|w| &w.aggregate.exact), p).unwrap();
+                reconcile_partitions(s.williams_order_classes.values().map(|c| &c.exact), p)
+                    .unwrap();
+                let mut reversed = raw;
+                reversed.reverse();
+                assert!(s.exact_matches(&c_statistics(&reversed).unwrap()));
+                let mut bad = p.clone();
+                bad.totals.interaction_delta_ns += 1;
+                assert!(reconcile_partitions(
+                    s.per_width.values().map(|w| &w.aggregate.exact),
+                    &bad
+                )
+                .is_err());
+                let d = &s.primary_k2_through_k8.descriptive;
+                assert_eq!(
+                    d.interaction_percent_of_hc,
+                    Some(4480.0 / p.totals.hc_ns as f64 * 100.0)
+                );
+                assert_eq!(
+                    d.slowdown_percentage_point_difference,
+                    Some(
+                        d.concurrent_mapped_slowdown_percent.unwrap()
+                            - d.serial_mapped_slowdown_percent.unwrap()
+                    )
+                );
+                assert_eq!(p.serial_median_delta_ns.as_ref().unwrap().numerator, 20);
+                assert_eq!(
+                    p.concurrent_median_delta_ns.as_ref().unwrap().numerator,
+                    100
+                );
+            }
+            #[test]
+            fn source_to_upload_copy_elision_c_frozen_exact_interpretation_thresholds() {
+                for (mc, expected) in [
+                    (1050, "STRONG_AMPLIFICATION"),
+                    (1049, "MATERIAL_AMPLIFICATION"),
+                    (1030, "MATERIAL_AMPLIFICATION"),
+                    (1029, "AMBIGUOUS"),
+                    (1011, "AMBIGUOUS"),
+                    (1000, "AGAINST_MATERIAL_INTERACTION"),
+                    (990, "AGAINST_MATERIAL_INTERACTION"),
+                    (970, "CONCURRENCY_REDUCES_MAPPED_PENALTY"),
+                ] {
+                    assert_eq!(
+                        interaction_interpretation(
+                            &c_statistics(&samples([1000, 1000, 1000, mc])).unwrap()
+                        )
+                        .unwrap(),
+                        expected
+                    );
+                }
+                // Exact sub-three threshold far below f64 precision at u64 scale.
+                let h = 1_000_000_000_000_000u64;
+                assert_eq!(
+                    interaction_interpretation(
+                        &c_statistics(&samples([h, h, h, h + h / 100 * 3 - 1])).unwrap()
+                    )
+                    .unwrap(),
+                    "AMBIGUOUS"
+                );
+                let base = samples([1000, 1000, 1000, 1100]);
+                for mode in 0..3 {
+                    let raw: Vec<_> = base
+                        .iter()
+                        .map(|s| {
+                            let reverse = match mode {
+                                0 => s.source_set.williams_order_class == 0,
+                                1 => s.source_set.width < 5,
+                                _ => s.source_set.set_index < 70,
+                            };
+                            CSample::new(
+                                s.source_set.clone(),
+                                1000,
+                                1000,
+                                1000,
+                                if reverse { 999 } else { 1300 },
+                            )
+                            .unwrap()
+                        })
+                        .collect();
+                    assert_eq!(
+                        interaction_interpretation(&c_statistics(&raw).unwrap()).unwrap(),
+                        "AMBIGUOUS"
+                    );
+                }
+                let mixed: Vec<_> = c_schedule(128)
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| {
+                        let mc = if s.width <= 4 { 1003 } else { 998 };
+                        CSample::new(s, 1000, 1000, 1000, mc).unwrap()
+                    })
+                    .collect();
+                assert_eq!(
+                    interaction_interpretation(&c_statistics(&mixed).unwrap()).unwrap(),
+                    "AMBIGUOUS"
+                );
+                // A raw destination main effect with no interaction is not a win.
+                assert_eq!(
+                    interaction_interpretation(
+                        &c_statistics(&samples([1000, 1000, 1100, 1100])).unwrap()
+                    )
+                    .unwrap(),
+                    "AGAINST_MATERIAL_INTERACTION"
+                );
+            }
+            #[test]
+            fn source_to_upload_copy_elision_c_schema_and_correctness_independent_of_performance() {
+                for times in [
+                    [1000, 1000, 1000, 1],
+                    [1000, 1000, 1000, 970],
+                    [1000; 4],
+                    [1000, 1000, 1000, 1029],
+                    [1000, 1000, 1000, 1050],
+                    [1000, 1000, 1100, 1100],
+                ] {
+                    let mut r = fixture(times);
+                    r.classify().unwrap();
+                    assert!(r.complete && r.correctness_pass && r.authoritative);
+                    let j = serde_json::to_value(&r).unwrap();
+                    assert_eq!(
+                        j["schema"],
+                        "mer.gpu-native-mapped-memory-odirect-concurrency-interaction.v1"
+                    );
+                    assert_ne!(C_SCHEMA, B_SCHEMA);
+                    assert_ne!(C_SCHEMA, SCHEMA);
+                    assert_eq!(j["performance_required_for_correctness"], false);
+                    assert_eq!(
+                        j["performance_authority"],
+                        "PENDING_EXTERNAL_RETRY_LOG_AUDIT"
+                    );
+                    for field in [
+                        "set_index",
+                        "round",
+                        "width",
+                        "ordered_expert_ids",
+                        "width_occurrence",
+                        "williams_order_class",
+                        "execution_sequence",
+                        "hs_ns",
+                        "ms_ns",
+                        "hc_ns",
+                        "mc_ns",
+                        "serial_destination_delta_ns",
+                        "concurrent_destination_delta_ns",
+                        "interaction_delta_ns",
+                        "mc_times_hs",
+                        "hc_times_ms",
+                        "multiplicative_interaction_direction",
+                    ] {
+                        assert!(
+                            j["measured"]["raw_samples"][0].get(field).is_some(),
+                            "{field}"
+                        );
+                    }
+                    for cell in Cell::ALL {
+                        assert_eq!(r.authority.cell_source_apis[&cell], cell.api());
+                    }
+                    assert!(r
+                        .retry_evidence_contract
+                        .contains("RETRY_CONTAMINATED / INCONCLUSIVE"));
+                    // Deliberately corrupt every descriptive value; exact evidence
+                    // alone determines correctness and the frozen interpretation.
+                    let before = r.interaction_interpretation_conditional_on_zero_retry_log;
+                    r.measured
+                        .statistics
+                        .primary_k2_through_k8
+                        .descriptive
+                        .interaction_percent_of_hc = Some(-999.0);
+                    r.classify().unwrap();
+                    assert!(r.correctness_pass);
+                    assert_eq!(
+                        r.interaction_interpretation_conditional_on_zero_retry_log,
+                        before
+                    );
+                }
+            }
+            #[test]
+            fn source_to_upload_copy_elision_c_four_cell_parity_and_fail_closed_counters() {
+                let mut p = fixture_phase("measured", 128, [1000; 4]);
+                let reject: Vec<Box<dyn Fn(&mut CPhase)>> = vec![
+                    Box::new(|p| p.cells.get_mut(&Cell::HS).unwrap().serial_helper_calls -= 1),
+                    Box::new(|p| p.cells.get_mut(&Cell::HC).unwrap().serial_helper_calls = 1),
+                    Box::new(|p| p.cells.get_mut(&Cell::MS).unwrap().evidence.unmaps -= 1),
+                    Box::new(|p| p.cells.get_mut(&Cell::MC).unwrap().evidence.maps_completed -= 1),
+                    Box::new(|p| p.cells.get_mut(&Cell::MC).unwrap().evidence.source_failures = 1),
+                    Box::new(|p| p.cells.get_mut(&Cell::MS).unwrap().evidence.gpu_failures = 1),
+                    Box::new(|p| p.cells.get_mut(&Cell::HS).unwrap().evidence.fallback_reads = 1),
+                    Box::new(|p| {
+                        p.cells
+                            .get_mut(&Cell::MC)
+                            .unwrap()
+                            .evidence
+                            .mapped_direct_io_rejections = 1
+                    }),
+                    Box::new(|p| {
+                        p.cells
+                            .get_mut(&Cell::MS)
+                            .unwrap()
+                            .evidence
+                            .pointers
+                            .invalid = 1
+                    }),
+                    Box::new(|p| {
+                        p.cells
+                            .get_mut(&Cell::MC)
+                            .unwrap()
+                            .evidence
+                            .exact_read_length_failures = 1
+                    }),
+                    Box::new(|p| {
+                        p.cells
+                            .get_mut(&Cell::HC)
+                            .unwrap()
+                            .evidence
+                            .full_source_bytes -= 1
+                    }),
+                    Box::new(|p| {
+                        p.cells.get_mut(&Cell::MS).unwrap().completed_source_sets[0]
+                            .ordered_expert_ids
+                            .reverse()
+                    }),
+                    Box::new(|p| {
+                        p.execution_trace.swap(0, 1);
+                    }),
+                    Box::new(|p| {
+                        p.raw_verification[0].cells.get_mut(&Cell::MC).unwrap()[0].gpu =
+                            sha(b"wrong")
+                    }),
+                    Box::new(|p| {
+                        p.raw_verification[0].cells.get_mut(&Cell::MS).unwrap()[0].source =
+                            sha(b"wrong")
+                    }),
+                    Box::new(|p| {
+                        p.raw_verification[0].cells.get_mut(&Cell::HC).unwrap()[0].epoch = false
+                    }),
+                    Box::new(|p| {
+                        p.witnesses.get_mut(&Cell::HS).unwrap().bare_payload_sha256 = sha(b"wrong")
+                    }),
+                    Box::new(|p| p.raw_samples[0].interaction_delta_ns += 1),
+                    Box::new(|p| {
+                        p.statistics
+                            .per_width
+                            .get_mut(&2)
+                            .unwrap()
+                            .aggregate
+                            .exact
+                            .totals
+                            .hs_ns += 1
+                    }),
+                    Box::new(|p| {
+                        p.statistics
+                            .williams_order_classes
+                            .get_mut(&0)
+                            .unwrap()
+                            .exact
+                            .totals
+                            .hs_ns += 1
+                    }),
+                    Box::new(|p| p.mismatch_count = 1),
+                ];
+                for (i, f) in reject.into_iter().enumerate() {
+                    f(&mut p);
+                    assert!(!p.successful(), "mutation {i}");
+                    p = fixture_phase("measured", 128, [1000; 4]);
+                }
+                let mut v = p.raw_verification.remove(0);
+                assert!(v.valid());
+                v.cells.remove(&Cell::HS);
+                assert!(!v.valid());
+            }
+            #[test]
+            fn source_to_upload_copy_elision_c_exact_preproof_and_phase_authority() {
+                let r = fixture([1000; 4]);
+                assert!(r.authority_valid());
+                assert_eq!(r.warmup.fd_proof.source_upload_fd_proof_hits, 560);
+                assert_eq!(r.measured.fd_proof.source_upload_fd_proof_hits, 2240);
+                for mode in 0..10 {
+                    let mut r = fixture([1000; 4]);
+                    match mode {
+                        0 => r.authority.fd_cache_capacity = 127,
+                        1 => r.authority.preproof.source_upload_fd_proof_hits = 1,
+                        2 => r.authority.preproof.source_upload_fd_proof_misses -= 1,
+                        3 => {
+                            r.authority
+                                .after_warmup_telemetry_reset
+                                .source_upload_fd_proof_hits = 1
+                        }
+                        4 => r.authority.preproof_ordered_expert_ids.reverse(),
+                        5 => r.warmup.fd_proof.source_upload_fd_proof_misses = 1,
+                        6 => r.measured.fd_proof.source_upload_fd_proof_failures = 1,
+                        7 => r.measured.fd_proof.source_upload_fd_proof_hits -= 1,
+                        8 => r.measured.fd_proof.source_upload_fd_proof_requests += 1,
+                        _ => r.args.iterations = 112,
+                    }
+                    r.classify().unwrap();
+                    assert!(!r.authoritative && !r.correctness_pass, "{mode}");
+                }
+                assert!(!c_proof_hits_only(
+                    &SourceUploadFdProofSnapshot::default(),
+                    u64::MAX
+                ));
+            }
+            #[test]
+            fn source_to_upload_copy_elision_c_overflow_and_exact_large_json() {
+                assert!(signed_add(i128::MAX, 1).is_err());
+                assert!(signed_sub(i128::MIN, 1).is_err());
+                assert!(product(u128::MAX, 2).is_err());
+                assert!(median_signed(vec![i128::MAX, i128::MAX]).is_err());
+                assert!(wide_add([u64::MAX; 5], [1; 5]).is_err());
+                let set = c_schedule(128).unwrap().remove(0);
+                for times in [[0, 1, 1, 1], [1, 0, 1, 1], [1, 1, 0, 1], [1, 1, 1, 0]] {
+                    assert!(
+                        CSample::new(set.clone(), times[0], times[1], times[2], times[3]).is_err()
+                    );
+                }
+                let s = CSample::new(set, u64::MAX, u64::MAX, u64::MAX, u64::MAX).unwrap();
+                assert_eq!(s.mc_times_hs, u128::from(u64::MAX) * u128::from(u64::MAX));
+                let json = serde_json::to_string(&s).unwrap();
+                assert!(json.contains(&s.mc_times_hs.to_string()));
+                assert!(exact_stats(&[s.clone(), s]).is_err());
+                let mut s = samples([1000; 4]);
+                s[0].hc_times_ms += 1;
+                assert!(exact_stats(&s).is_err());
+                assert!(Directions {
+                    positive: u64::MAX,
+                    negative: 1,
+                    equal: 0
+                }
+                .count()
+                .is_err());
+            }
+            #[test]
+            fn source_to_upload_copy_elision_c_call_sites_and_source_only_timer() {
+                let whole = include_str!("gpu_native_source_to_upload_copy_elision.rs");
+                let c = whole
+                    .split("pub(super) mod hma1c_c {")
+                    .nth(1)
+                    .unwrap()
+                    .split("#[cfg(test)]")
+                    .next()
+                    .unwrap();
+                let timed = c
+                    .split("async fn cell_source(")
+                    .nth(1)
+                    .unwrap()
+                    .split("async fn host_cell(")
+                    .next()
+                    .unwrap();
+                assert_eq!(timed.matches("let start = Instant::now();").count(), 2);
+                let intervals: Vec<String> = timed
+                    .split("let start = Instant::now();")
+                    .skip(1)
+                    .map(|s| {
+                        s.split("let ns = elapsed(start)?;")
+                            .next()
+                            .unwrap()
+                            .split_whitespace()
+                            .collect()
+                    })
+                    .collect();
+                assert_eq!(intervals,vec!["letread=storage.read_experts_serial_into_aligned_slices(ids,destinations).await;","letread=storage.read_experts_batch_into_aligned_slices(ids,destinations).await;"]);
+                assert_eq!(
+                    c.matches(".read_experts_serial_into_aligned_slices(")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    c.matches(".read_experts_batch_into_aligned_slices(")
+                        .count(),
+                    1
+                );
+                assert!(!c.contains(".read_expert_into_aligned_slice("));
+                let host = c
+                    .split("async fn host_cell(")
+                    .nth(1)
+                    .unwrap()
+                    .split("async fn mapped_cell(")
+                    .next()
+                    .unwrap();
+                let mapped = c
+                    .split("async fn mapped_cell(")
+                    .nth(1)
+                    .unwrap()
+                    .split("fn note_arm_error(")
+                    .next()
+                    .unwrap();
+                for body in [host, mapped] {
+                    assert_eq!(body.matches("cell_source(").count(), 1);
+                    for setup in ["begin_set(", "arena_slices(", "observe_slices("] {
+                        assert!(body.find(setup).unwrap() < body.find("cell_source(").unwrap());
+                    }
+                    for after in ["streams.source(", "verify(", "prepare_destination("] {
+                        assert!(body.find(after).unwrap() > body.find("cell_source(").unwrap());
+                    }
+                }
+                for setup in ["gpu.map(", "get_mapped_range_mut()"] {
+                    assert!(mapped.find(setup).unwrap() < mapped.find("cell_source(").unwrap());
+                }
+                assert!(
+                    mapped.find("gpu.upload.unmap()").unwrap()
+                        > mapped.find("cell_source(").unwrap()
+                );
+                let phase = c
+                    .split("async fn c_phase(")
+                    .nth(1)
+                    .unwrap()
+                    .split("struct CAuthority")
+                    .next()
+                    .unwrap();
+                assert!(phase.contains("set.execution_sequence.into_iter().enumerate()"));
+                assert!(!phase.contains("% 2"));
+                assert_eq!(phase.matches("mapped_cell(").count(), 1);
+                assert_eq!(phase.matches("host_cell(").count(), 1);
+                let exec = c.split("async fn execute(").nth(1).unwrap();
+                assert_eq!(exec.matches("AlignedBuffer::new(").count(), 1);
+                assert_eq!(exec.matches("Gpu::with_upload_capacity(").count(), 1);
+                assert_eq!(
+                    exec.matches("reset_source_upload_fd_proof_telemetry()")
+                        .count(),
+                    2
+                );
+                assert!(
+                    exec.find("preprove_source_upload_fds(").unwrap()
+                        < exec.find("c_phase(&mut report.warmup").unwrap()
+                );
+                assert!(whole.contains("hma1c_b::hma1c_c::run_command(args).await"));
+            }
+            #[test]
+            fn source_to_upload_copy_elision_c_exact_arena_geometry_and_remap_alignment() {
+                assert_eq!(
+                    (FULL, ALIGN, MAX_WIDTH, HOST_ARENA, MAPPED_ARENA),
+                    (2_658_304, 4096, 8, 21_266_432, 21_270_528)
+                );
+                let mut host = AlignedBuffer::new(HOST_ARENA, ALIGN);
+                let host_base = host.as_slice().as_ptr() as usize;
+                let mut mapped = AlignedBuffer::new(MAPPED_ARENA + ALIGN, ALIGN);
+                for k in 2..=8 {
+                    let (_, slices) = arena_slices(host.as_mut_slice(), k, false).unwrap();
+                    assert_eq!(slices.len(), k);
+                    for (j, s) in slices.into_iter().enumerate() {
+                        assert_eq!(s.len(), FULL);
+                        assert_eq!(s.as_ptr() as usize, host_base + j * FULL);
+                    }
+                    for residue in (0..ALIGN).step_by(4) {
+                        let base = ALIGN * 16 + residue;
+                        let offset = arena_offset(base, MAPPED_ARENA, k, true).unwrap();
+                        assert_eq!((base + offset) % ALIGN, 0);
+                    }
+                    for start in [0, 4, 8, 4092] {
+                        let base = mapped.as_slice().as_ptr() as usize + start;
+                        let (offset, slices) = arena_slices(
+                            &mut mapped.as_mut_slice()[start..start + MAPPED_ARENA],
+                            k,
+                            true,
+                        )
+                        .unwrap();
+                        assert_eq!((base + offset) % ALIGN, 0);
+                        assert_eq!(slices.len(), k);
+                        for (j, s) in slices.into_iter().enumerate() {
+                            assert_eq!(s.len(), FULL);
+                            assert_eq!(s.as_ptr() as usize, base + offset + j * FULL);
+                        }
+                    }
+                }
+                assert!(arena_offset(usize::MAX, MAPPED_ARENA, 8, true).is_err());
+                let gpu = include_str!("gpu_native_source_to_upload_copy_elision.rs")
+                    .split("async fn with_upload_capacity(")
+                    .nth(1)
+                    .unwrap()
+                    .split("fn check(")
+                    .next()
+                    .unwrap();
+                assert!(
+                    gpu.contains("wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC")
+                );
+            }
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn source_to_upload_copy_elision_c_create_new_and_invalid_args_without_gpu() {
+                let dir = std::env::temp_dir().join(format!(
+                    "mer-hma1cc-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let mut a = args();
+                a.config = dir.join("missing.toml");
+                a.report_out = dir.join("report.json");
+                assert!(run_command(a.clone()).await.is_err());
+                let bytes = std::fs::read(&a.report_out).unwrap();
+                let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(j["schema"], C_SCHEMA);
+                assert_eq!(j["classification"], "config-failed");
+                assert_eq!(j["measured"]["expected"]["expert_slot_count"], 560);
+                assert_eq!(j["warmup"]["expected"]["expert_slot_count"], 140);
+                assert!(run_command(a.clone()).await.is_err());
+                assert_eq!(std::fs::read(&a.report_out).unwrap(), bytes);
+                a.iterations = 112;
+                a.report_out = dir.join("invalid.json");
+                assert!(run_command(a.clone()).await.is_err());
+                let j: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&a.report_out).unwrap()).unwrap();
+                assert_eq!(j["classification"], "invalid-arguments");
+                std::fs::remove_dir_all(dir).unwrap();
+            }
         }
     }
 }

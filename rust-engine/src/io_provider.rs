@@ -1368,6 +1368,64 @@ impl NvmeStorage {
         Ok(())
     }
 
+    /// Diagnostic-only HMA-1C-C serial external-destination sibling. Validation,
+    /// fd/proof ordering and per-read retry/breaker behavior mirror the batch
+    /// helper. One blocking donation reads all slots sequentially, with no
+    /// worker spawn or fallback. No production call site uses this method.
+    pub(crate) async fn read_experts_serial_into_aligned_slices(
+        &self,
+        ids: &[u32],
+        destinations: &mut [&mut [u8]],
+    ) -> io::Result<usize> {
+        if self.is_packed()
+            || ids.len() != destinations.len()
+            || self.cfg.expert_size != 2_658_304
+            || self.cfg.block_align != 4096
+            || destinations.iter().any(|dst| {
+                dst.len() != self.cfg.expert_size
+                    || dst.len() % self.cfg.block_align != 0
+                    || dst.as_ptr() as usize % self.cfg.block_align != 0
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source/upload requires unpacked full-file 4096-aligned external destinations",
+            ));
+        }
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut files: Vec<Arc<File>> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            files.push(self.fd_for(id)?);
+        }
+        // Prove the exact resolved Arc once; retain resolution and error order.
+        for (&id, file) in ids.iter().zip(&files) {
+            self.prove_source_upload_fd(id, file)?;
+        }
+        let id_vec: Vec<u32> = ids.to_vec();
+        tokio::task::block_in_place(|| -> io::Result<usize> {
+            if id_vec.len() == 1 {
+                return self.read_at_with_retries(&files[0], id_vec[0], 0, destinations[0]);
+            }
+            // Evaluate every read before propagating the first slot error,
+            // matching the concurrent helper's collection/error order.
+            let results: Vec<io::Result<usize>> = files
+                .iter()
+                .zip(destinations.iter_mut())
+                .zip(id_vec.iter())
+                .map(|((file, dst), &id)| self.read_at_with_retries(file, id, 0, dst))
+                .collect();
+            let mut total = 0usize;
+            for result in results {
+                total = total
+                    .checked_add(result?)
+                    .ok_or_else(|| io::Error::other("serial source/upload byte count overflow"))?;
+            }
+            Ok(total)
+        })
+    }
+
     /// Batched read: fill `bufs[i]` with the bytes of `ids[i]`, all in
     /// one blocking-donation. The two slices must have the same length.
     ///
@@ -3969,6 +4027,301 @@ mod source_to_upload_tests {
                 }
             }
             proof_counts(&s, 72, 72, 0, 0);
+            for (&id, file) in ids.iter().zip(&files) {
+                assert!(Arc::ptr_eq(file, &s.fd_for(id).unwrap()));
+            }
+            s.reset_source_upload_fd_proof_telemetry();
+            proof_counts(&s, 0, 0, 0, 0);
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn source_to_upload_copy_elision_c_serial_matches_parent_and_concurrent_frozen() {
+        use sha2::{Digest, Sha256};
+        let source = include_str!("io_provider.rs");
+        let concurrent = source
+            .split("    pub(crate) async fn read_experts_batch_into_aligned_slices(")
+            .nth(1)
+            .unwrap()
+            .split("    /// **Tier 2.**")
+            .next()
+            .unwrap();
+        let parent_bytes =
+            format!("    pub(crate) async fn read_experts_batch_into_aligned_slices({concurrent}");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(parent_bytes.as_bytes())),
+            "919c812e4e95eb78f6d0347545440360abd391472aa084b9d847e5073651494a"
+        );
+        let serial = source
+            .split("    pub(crate) async fn read_experts_serial_into_aligned_slices(")
+            .nth(1)
+            .unwrap()
+            .split("    /// Batched read: fill")
+            .next()
+            .unwrap();
+        assert_eq!(
+            serial
+                .split("            // Evaluate every read")
+                .next()
+                .unwrap(),
+            concurrent.split("            let results:").next().unwrap()
+        );
+        assert_eq!(serial.matches("tokio::task::block_in_place(").count(), 1);
+        for forbidden in [
+            "std::thread",
+            "scope.spawn",
+            "spawn_blocking",
+            "read_expert(",
+            "F_GETFL",
+            "metadata()",
+        ] {
+            assert!(!serial.contains(forbidden), "{forbidden}");
+        }
+        assert!(serial
+            .contains(".map(|((file, dst), &id)| self.read_at_with_retries(file, id, 0, dst))"));
+        assert!(
+            serial.find(".collect();").unwrap() < serial.find("for result in results").unwrap()
+        );
+        assert!(serial
+            .split_whitespace()
+            .collect::<String>()
+            .contains("total.checked_add(result?)"));
+        let retry = source
+            .split("    fn read_at_with_retries(")
+            .nth(1)
+            .unwrap()
+            .split("    ///")
+            .next()
+            .unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(retry.as_bytes())),
+            "5740568a302a0b31e2675fb45b204856d44163ecdcd47c2be25eaa9ca7b093f1"
+        );
+    }
+    fn c_storage(path: &Path) -> NvmeStorage {
+        NvmeStorage::new(StorageConfig {
+            base_path: path.to_path_buf(),
+            expert_size: 2_658_304,
+            block_align: 4096,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        })
+        .unwrap()
+        .with_max_open_files(128)
+    }
+    // Only the fd proof operation is injected, as in B's portable fixture.
+    // This provides no actual O_DIRECT, mapped GPU or hardware authority.
+    fn c_inject_proof(s: &NvmeStorage, id: u32) -> Arc<File> {
+        let file = s.fd_for(id).unwrap();
+        s.prove_source_upload_fd_with(id, &file, |f| {
+            validate_source_upload_fd(2_658_304, || Ok(true), || Ok(f.metadata()?.len()))
+        })
+        .unwrap();
+        file
+    }
+    #[tokio::test]
+    async fn source_to_upload_copy_elision_c_serial_validation_fd_and_proof_error_order() {
+        let path = directory();
+        let s = c_storage(&path);
+        let full = 2_658_304;
+        let mut arena = AlignedBuffer::new(full + 4096, 4096);
+        for (offset, len) in [(0, full - 1), (1, full), (0, full - 4096)] {
+            let mut dst = [&mut arena.as_mut_slice()[offset..offset + len]];
+            let serial = s
+                .read_experts_serial_into_aligned_slices(&[99], &mut dst)
+                .await
+                .unwrap_err();
+            let concurrent = s
+                .read_experts_batch_into_aligned_slices(&[99], &mut dst)
+                .await
+                .unwrap_err();
+            assert_eq!(serial.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(serial.to_string(), concurrent.to_string());
+        }
+        assert!(s.files.lock().is_empty());
+        proof_counts(&s, 0, 0, 0, 0);
+        assert_eq!(
+            s.read_experts_serial_into_aligned_slices(&[], &mut [])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            s.read_experts_serial_into_aligned_slices(&[9], &mut [])
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        for (size, align) in [(4096, 4096), (full, 512)] {
+            let wrong = NvmeStorage::new(StorageConfig {
+                base_path: path.clone(),
+                expert_size: size,
+                block_align: align,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            })
+            .unwrap();
+            assert_eq!(
+                wrong
+                    .read_experts_serial_into_aligned_slices(&[], &mut [])
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        File::create(path.join("expert_1.bin"))
+            .unwrap()
+            .set_len(full as u64)
+            .unwrap();
+        let mut arena = AlignedBuffer::new(full * 2, 4096);
+        let mut dst: Vec<_> = arena.as_mut_slice().chunks_exact_mut(full).collect();
+        // All fds resolve before any proof: missing second fd outranks the
+        // first fd's direct-proof rejection, for both schedulers.
+        for serial in [true, false] {
+            let err = if serial {
+                s.read_experts_serial_into_aligned_slices(&[1, 2], &mut dst)
+                    .await
+            } else {
+                s.read_experts_batch_into_aligned_slices(&[1, 2], &mut dst)
+                    .await
+            }
+            .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::NotFound);
+            proof_counts(&s, 0, 0, 0, 0);
+        }
+        File::create(path.join("expert_2.bin"))
+            .unwrap()
+            .set_len(full as u64)
+            .unwrap();
+        let err = s
+            .read_experts_serial_into_aligned_slices(&[1, 2], &mut dst)
+            .await
+            .unwrap_err();
+        #[cfg(target_os = "linux")]
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        proof_counts(&s, 1, 0, 1, 1);
+        assert!(s.breakers.read().is_empty());
+        assert!(s.source_upload_fd_proofs.proven.lock().is_empty());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_to_upload_copy_elision_c_serial_reads_all_first_error_existing_breakers() {
+        let path = directory();
+        let s = c_storage(&path);
+        let full = 2_658_304;
+        for id in 0..3 {
+            std::fs::write(
+                path.join(format!("expert_{id}.bin")),
+                vec![id as u8 + 1; full],
+            )
+            .unwrap();
+            c_inject_proof(&s, id);
+        }
+        for (id, len) in [(0, 1), (1, 2)] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path.join(format!("expert_{id}.bin")))
+                .unwrap()
+                .set_len(len)
+                .unwrap();
+        }
+        let mut arena = AlignedBuffer::new(full * 3, 4096);
+        let mut dst: Vec<_> = arena.as_mut_slice().chunks_exact_mut(full).collect();
+        s.reset_source_upload_fd_proof_telemetry();
+        let err = s
+            .read_experts_serial_into_aligned_slices(&[0, 1, 2], &mut dst)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("expert 0"));
+        assert_eq!((dst[0][0], dst[1][0]), (1, 2));
+        assert!(dst[2].iter().all(|b| *b == 3));
+        proof_counts(&s, 3, 3, 0, 0);
+        assert_eq!(s.breaker(0).consecutive_failures.load(Ordering::Acquire), 1);
+        assert_eq!(s.breaker(1).consecutive_failures.load(Ordering::Acquire), 1);
+        for _ in 1..STORAGE_BREAKER_THRESHOLD {
+            assert!(s
+                .read_experts_serial_into_aligned_slices(&[0], &mut [&mut *dst[0]])
+                .await
+                .is_err());
+        }
+        assert!(s.is_expert_unavailable(0));
+        let before = s.breaker(0).consecutive_failures.load(Ordering::Acquire);
+        assert!(s
+            .read_experts_serial_into_aligned_slices(&[0], &mut [&mut *dst[0]])
+            .await
+            .is_err());
+        assert_eq!(
+            s.breaker(0).consecutive_failures.load(Ordering::Acquire),
+            before
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_to_upload_copy_elision_c_four_cells_128_proofs_exact_phase_hits_and_hashes() {
+        use sha2::{Digest, Sha256};
+        let path = directory();
+        let s = c_storage(&path);
+        let full = 2_658_304;
+        let ids: Vec<u32> = (0..128).map(|i| i * 6143 / 127).collect();
+        let mut files = Vec::new();
+        for &id in &ids {
+            let file = File::create(path.join(format!("expert_{id}.bin"))).unwrap();
+            file.set_len(full as u64).unwrap();
+            file.write_at(&id.to_le_bytes(), 0).unwrap();
+            file.write_at(&id.to_le_bytes(), (full - 4) as u64).unwrap();
+            files.push(c_inject_proof(&s, id));
+        }
+        proof_counts(&s, 128, 0, 128, 0);
+        s.reset_source_upload_fd_proof_telemetry();
+        proof_counts(&s, 0, 0, 0, 0);
+        let mut arena = AlignedBuffer::new(full * 8, 4096);
+        let mut expected = vec![0u8; full];
+        for (count, requests) in [(32, 560), (128, 2240)] {
+            let mut four_cell_hashes = Vec::new();
+            for p in 0..count {
+                let k = p % 8 + 1;
+                if k == 1 {
+                    continue;
+                }
+                let indices: Vec<_> = (0..k).map(|j| (p * 17 + j * 13) % 128).collect();
+                let set: Vec<_> = indices.iter().map(|&i| ids[i]).collect();
+                for cell in [[0, 1, 3, 2], [1, 2, 0, 3], [2, 3, 1, 0], [3, 0, 2, 1]][(p / 8) % 4] {
+                    let mut dst: Vec<_> = arena.as_mut_slice()[..k * full]
+                        .chunks_exact_mut(full)
+                        .collect();
+                    let n = if cell == 0 || cell == 2 {
+                        s.read_experts_serial_into_aligned_slices(&set, &mut dst)
+                            .await
+                    } else {
+                        s.read_experts_batch_into_aligned_slices(&set, &mut dst)
+                            .await
+                    }
+                    .unwrap();
+                    assert_eq!(n, k * full);
+                    // Every full return is byte-equal, implying exact hash parity
+                    // for every ID without repeatedly hashing gigabytes in debug.
+                    for (bytes, &i) in dst.iter().zip(&indices) {
+                        expected[..4].copy_from_slice(&ids[i].to_le_bytes());
+                        expected[full - 4..].copy_from_slice(&ids[i].to_le_bytes());
+                        assert_eq!(&**bytes, expected.as_slice());
+                    }
+                    if p == 1 {
+                        four_cell_hashes.push(
+                            dst.iter()
+                                .map(|bytes| Sha256::digest(bytes))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                }
+            }
+            assert_eq!(four_cell_hashes.len(), 4);
+            assert!(four_cell_hashes.windows(2).all(|p| p[0] == p[1]));
+            proof_counts(&s, requests, requests, 0, 0);
             for (&id, file) in ids.iter().zip(&files) {
                 assert!(Arc::ptr_eq(file, &s.fd_for(id).unwrap()));
             }
