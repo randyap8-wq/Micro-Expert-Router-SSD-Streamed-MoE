@@ -1578,7 +1578,7 @@ async fn execute(report: &mut Report) -> Result<()> {
 }
 
 pub(crate) async fn run_command(args: Args) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    hma1c_b::hma1c_c::run_command(args).await
+    hma1c_b::hma1c_c::hma1c_d::run_command(args).await
 }
 
 // A's schema and runner remain version-separated test evidence. The CLI runs B.
@@ -6740,7 +6740,7 @@ mod hma1c_b {
                     exec.find("preprove_source_upload_fds(").unwrap()
                         < exec.find("c_phase(&mut report.warmup").unwrap()
                 );
-                assert!(whole.contains("hma1c_b::hma1c_c::run_command(args).await"));
+                assert!(whole.contains("hma1c_b::hma1c_c::hma1c_d::run_command(args).await"));
             }
             #[test]
             fn source_to_upload_copy_elision_c_exact_arena_geometry_and_remap_alignment() {
@@ -6821,6 +6821,2034 @@ mod hma1c_b {
                     serde_json::from_slice(&std::fs::read(&a.report_out).unwrap()).unwrap();
                 assert_eq!(j["classification"], "invalid-arguments");
                 std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        /// D owns its split-pair design and interpretation; C's cell runners,
+        /// source timer, GPU mechanics and exact rational primitives are reused.
+        pub(crate) mod hma1c_d {
+            use super::*;
+            const D_SCHEMA: &str = "mer.gpu-native-mapped-memory-odirect-split-pair-interaction.v1";
+            const MEASURED_COUNT: usize = 112;
+            const WARMUP_COUNT: usize = 28;
+            const D_UNIVERSE: usize = 256;
+            const D_SCHEDULE_CONTRACT: &str = "Universe[i]=floor(i*6143/255), i=0..255. Measured r=0..15, warmup r=16..19; K=2..8 in ascending order within each round. w=K-2; block_index=r*7+w; class=(r+5*w)%16. Bits 0/1 reverse serial/concurrent destination order; bit2 concurrent pair first; bit3 B serial/A concurrent. start_A=(block_index*17)%256; start_B=(start_A+128)%256; A/B[j]=universe[(start_A/B+13*j)%256]. Each disjoint set is read exactly twice by its assigned pair. CLI retains iterations=128/warmup_iterations=32; actual D blocks=112/28. Hash encoding: metadata [block_index,r,K,class] u64 LE, then four decoded bit values u8; IDs encode K u32 LE followed by A then B IDs u32 LE; order adds serial role, concurrent role (A=0 B=1), then four cell codes (HS=0 HC=1 MS=2 MC=3). Complete hashes metadata+IDs+roles+cells per block. Temporal quartile=measured block_index/28.";
+            const D_INTERPRETATION: &str = "Primary=sum((MC-HC)-(MS-HS)); percent denominator=sum(HC). STRONG >=5%, MATERIAL >=3%, both with exact median>0, >56 positive blocks, >=5/7 positive widths, both levels of all four binary marginal factors positive and all four temporal quartiles positive. <=-3% with analogous negative consistency is NEGATIVE_MATERIAL. AGAINST: abs aggregate<=1%, exact median ratio-of-ratios in [0.99,1.01], fewer than 5 positive widths; disagreement/reversal gates still apply. All other outcomes AMBIGUOUS, including any aggregate/median/majority disagreement, binary marginal reversal, temporal reversal, or >1% and <3%. All 16 individual design classes are descriptive only. No float or rounded percentage participates in classification.";
+            const D_SECONDARY: &str = "Serial mapped slowdown, concurrent mapped slowdown and their percentage-point difference are secondary. Retain exact raw deltas/products, exact median interaction and ratio-of-ratios, sign counts, widths, binary marginal factors, temporal quartiles and all 16 descriptive classes.";
+            const D_RETRY: &str = "Performance interpretation is conditional on an external audit of the complete FIRST log finding zero exact occurrences of the retry marker defined by the unchanged read_at_with_retries helper. Any occurrence or any measured fd-proof miss/failure makes performance non-authoritative and AMBIGUOUS. No diagnostic retry/fallback. This report does not claim to have audited its external log.";
+            #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+            enum SourceRole {
+                A,
+                B,
+            }
+            #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+            struct DSet {
+                set_index: usize,
+                round: usize,
+                width: usize,
+                design_class: usize,
+                serial_order_reversed: bool,
+                concurrent_order_reversed: bool,
+                concurrent_pair_first: bool,
+                b_serial_a_concurrent: bool,
+                a_ordered_expert_ids: Vec<u32>,
+                b_ordered_expert_ids: Vec<u32>,
+                serial_source_set: SourceRole,
+                concurrent_source_set: SourceRole,
+                execution_sequence: [Cell; 4],
+            }
+            impl DSet {
+                fn role(&self, cell: Cell) -> SourceRole {
+                    if cell.serial() {
+                        self.serial_source_set
+                    } else {
+                        self.concurrent_source_set
+                    }
+                }
+                fn b_set(&self, cell: Cell) -> SourceSet {
+                    SourceSet {
+                        set_index: self.set_index,
+                        round: self.round,
+                        width: self.width,
+                        ordered_expert_ids: match self.role(cell) {
+                            SourceRole::A => self.a_ordered_expert_ids.clone(),
+                            SourceRole::B => self.b_ordered_expert_ids.clone(),
+                        },
+                        execution_order: if if cell.serial() {
+                            self.serial_order_reversed
+                        } else {
+                            self.concurrent_order_reversed
+                        } {
+                            ExecutionOrder::TreatmentFirst
+                        } else {
+                            ExecutionOrder::ControlFirst
+                        },
+                    }
+                }
+                fn factors(&self) -> [bool; 4] {
+                    [
+                        self.serial_order_reversed,
+                        self.concurrent_order_reversed,
+                        self.concurrent_pair_first,
+                        self.b_serial_a_concurrent,
+                    ]
+                }
+            }
+            fn d_set(round: usize, width: usize, universe: &[u32]) -> Result<DSet> {
+                if round >= 20
+                    || !(2..=8).contains(&width)
+                    || universe.len() != D_UNIVERSE
+                    || universe.iter().copied().collect::<BTreeSet<_>>().len() != D_UNIVERSE
+                {
+                    return Err(Failure::accounting("invalid D schedule geometry"));
+                }
+                let w = width - 2;
+                let set_index = round
+                    .checked_mul(7)
+                    .and_then(|v| v.checked_add(w))
+                    .ok_or_else(|| Failure::accounting("D block overflow"))?;
+                let design_class = (round + 5 * w) % 16;
+                let bits = std::array::from_fn::<_, 4, _>(|i| design_class & (1 << i) != 0);
+                let start_a = (set_index * 17) % D_UNIVERSE;
+                let start_b = (start_a + 128) % D_UNIVERSE;
+                let a: Vec<_> = (0..width)
+                    .map(|j| universe[(start_a + 13 * j) % D_UNIVERSE])
+                    .collect();
+                let b: Vec<_> = (0..width)
+                    .map(|j| universe[(start_b + 13 * j) % D_UNIVERSE])
+                    .collect();
+                if a.iter().chain(&b).copied().collect::<BTreeSet<_>>().len() != 2 * width {
+                    return Err(Failure::accounting("D source sets overlap or repeat"));
+                }
+                let serial = if bits[0] {
+                    [Cell::MS, Cell::HS]
+                } else {
+                    [Cell::HS, Cell::MS]
+                };
+                let concurrent = if bits[1] {
+                    [Cell::MC, Cell::HC]
+                } else {
+                    [Cell::HC, Cell::MC]
+                };
+                let (first, last) = if bits[2] {
+                    (concurrent, serial)
+                } else {
+                    (serial, concurrent)
+                };
+                Ok(DSet {
+                    set_index,
+                    round,
+                    width,
+                    design_class,
+                    serial_order_reversed: bits[0],
+                    concurrent_order_reversed: bits[1],
+                    concurrent_pair_first: bits[2],
+                    b_serial_a_concurrent: bits[3],
+                    a_ordered_expert_ids: a,
+                    b_ordered_expert_ids: b,
+                    serial_source_set: if bits[3] {
+                        SourceRole::B
+                    } else {
+                        SourceRole::A
+                    },
+                    concurrent_source_set: if bits[3] {
+                        SourceRole::A
+                    } else {
+                        SourceRole::B
+                    },
+                    execution_sequence: [first[0], first[1], last[0], last[1]],
+                })
+            }
+            fn d_schedule(count: usize) -> Result<Vec<DSet>> {
+                let rounds = match count {
+                    0 => 0..0,
+                    WARMUP_COUNT => 16..20,
+                    MEASURED_COUNT => 0..16,
+                    _ => {
+                        return Err(Failure::accounting(
+                            "D requires 28 warmup or 112 measured blocks",
+                        ))
+                    }
+                };
+                let universe =
+                    expert_sequence(D_UNIVERSE, NAMESPACE).map_err(Failure::accounting)?;
+                rounds
+                    .flat_map(|r| (2..=8).map(move |k| (r, k)))
+                    .map(|(r, k)| d_set(r, k, &universe))
+                    .collect()
+            }
+            #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+            struct DPlan {
+                block_count: u64,
+                expert_slots_per_cell: u64,
+                source_bytes_per_cell: u64,
+                a_source_schedule: ScheduleEvidence,
+                b_source_schedule: ScheduleEvidence,
+                cell_source_schedules: BTreeMap<Cell, ScheduleEvidence>,
+                universe_sha256: String,
+                ordered_ab_ids_sha256: String,
+                execution_order_sha256: String,
+                complete_schedule_sha256: String,
+            }
+            fn plan(sets: &[DSet]) -> Result<DPlan> {
+                let universe =
+                    expert_sequence(D_UNIVERSE, NAMESPACE).map_err(Failure::accounting)?;
+                if d_schedule(sets.len())? != sets {
+                    return Err(Failure::accounting("D schedule differs from frozen plan"));
+                }
+                let mut ids = Sha256::new();
+                let mut order = Sha256::new();
+                let mut complete = Sha256::new();
+                for s in sets {
+                    let mut metadata = Vec::new();
+                    for n in [s.set_index, s.round, s.width, s.design_class] {
+                        metadata.extend_from_slice(
+                            &u64::try_from(n).map_err(Failure::accounting)?.to_le_bytes(),
+                        );
+                    }
+                    metadata.extend(s.factors().map(u8::from));
+                    order.update(&metadata);
+                    complete.update(&metadata);
+                    let mut source = Vec::new();
+                    source.extend_from_slice(&(s.width as u32).to_le_bytes());
+                    for id in s.a_ordered_expert_ids.iter().chain(&s.b_ordered_expert_ids) {
+                        source.extend_from_slice(&id.to_le_bytes());
+                    }
+                    ids.update(&source);
+                    complete.update(&source);
+                    let execution = [
+                        s.serial_source_set as u8,
+                        s.concurrent_source_set as u8,
+                        s.execution_sequence[0] as u8,
+                        s.execution_sequence[1] as u8,
+                        s.execution_sequence[2] as u8,
+                        s.execution_sequence[3] as u8,
+                    ];
+                    order.update(execution);
+                    complete.update(execution);
+                }
+                let raw_sets = |a: bool| {
+                    sets.iter()
+                        .map(|s| SourceSet {
+                            set_index: s.set_index,
+                            round: s.round,
+                            width: s.width,
+                            ordered_expert_ids: if a {
+                                s.a_ordered_expert_ids.clone()
+                            } else {
+                                s.b_ordered_expert_ids.clone()
+                            },
+                            execution_order: ExecutionOrder::ControlFirst,
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let a_source_schedule = schedule_evidence(&raw_sets(true))?;
+                Ok(DPlan {
+                    block_count: sets.len() as u64,
+                    expert_slots_per_cell: a_source_schedule.expert_slot_count,
+                    source_bytes_per_cell: a_source_schedule.source_bytes,
+                    a_source_schedule,
+                    b_source_schedule: schedule_evidence(&raw_sets(false))?,
+                    cell_source_schedules: Cell::ALL
+                        .into_iter()
+                        .map(|c| {
+                            Ok((
+                                c,
+                                schedule_evidence(
+                                    &sets.iter().map(|s| s.b_set(c)).collect::<Vec<_>>(),
+                                )?,
+                            ))
+                        })
+                        .collect::<Result<_>>()?,
+                    universe_sha256: sequence_sha(&universe),
+                    ordered_ab_ids_sha256: finish_sha(&ids),
+                    execution_order_sha256: finish_sha(&order),
+                    complete_schedule_sha256: finish_sha(&complete),
+                })
+            }
+            #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+            struct DSample {
+                #[serde(flatten)]
+                source_set: DSet,
+                hs_ns: u64,
+                ms_ns: u64,
+                hc_ns: u64,
+                mc_ns: u64,
+                serial_destination_delta_ns: i128,
+                concurrent_destination_delta_ns: i128,
+                interaction_delta_ns: i128,
+                mc_times_hs: u128,
+                hc_times_ms: u128,
+                multiplicative_interaction_direction: i8,
+            }
+            impl DSample {
+                fn new(
+                    source_set: DSet,
+                    hs_ns: u64,
+                    ms_ns: u64,
+                    hc_ns: u64,
+                    mc_ns: u64,
+                ) -> Result<Self> {
+                    if [hs_ns, ms_ns, hc_ns, mc_ns].contains(&0) {
+                        return Err(Failure::accounting("zero C source duration"));
+                    }
+                    let serial_destination_delta_ns = signed_sub(ms_ns.into(), hs_ns.into())?;
+                    let concurrent_destination_delta_ns = signed_sub(mc_ns.into(), hc_ns.into())?;
+                    let interaction_delta_ns =
+                        signed_sub(concurrent_destination_delta_ns, serial_destination_delta_ns)?;
+                    let mc_times_hs = product(mc_ns.into(), hs_ns.into())?;
+                    let hc_times_ms = product(hc_ns.into(), ms_ns.into())?;
+                    let multiplicative_interaction_direction = match mc_times_hs.cmp(&hc_times_ms) {
+                        Ordering::Less => -1,
+                        Ordering::Equal => 0,
+                        Ordering::Greater => 1,
+                    };
+                    Ok(Self {
+                        source_set,
+                        hs_ns,
+                        ms_ns,
+                        hc_ns,
+                        mc_ns,
+                        serial_destination_delta_ns,
+                        concurrent_destination_delta_ns,
+                        interaction_delta_ns,
+                        mc_times_hs,
+                        hc_times_ms,
+                        multiplicative_interaction_direction,
+                    })
+                }
+                fn valid(&self) -> bool {
+                    Self::new(
+                        self.source_set.clone(),
+                        self.hs_ns,
+                        self.ms_ns,
+                        self.hc_ns,
+                        self.mc_ns,
+                    )
+                    .is_ok_and(|s| s == *self)
+                }
+                fn times(&self) -> [u64; 4] {
+                    [self.hs_ns, self.hc_ns, self.ms_ns, self.mc_ns]
+                }
+                fn ratio(&self) -> Ratio {
+                    Ratio {
+                        numerator: self.mc_times_hs,
+                        denominator: self.hc_times_ms,
+                    }
+                }
+            }
+            #[derive(Clone, Default, Debug, PartialEq, Eq, Serialize)]
+            struct Totals {
+                samples: u64,
+                hs_ns: u64,
+                ms_ns: u64,
+                hc_ns: u64,
+                mc_ns: u64,
+                serial_destination_delta_ns: i128,
+                concurrent_destination_delta_ns: i128,
+                interaction_delta_ns: i128,
+                interaction_samples: Directions,
+                serial_destination_samples: Directions,
+                concurrent_destination_samples: Directions,
+                multiplicative_interaction_samples: Directions,
+            }
+            impl Totals {
+                fn observe(&mut self, s: &DSample) -> Result<()> {
+                    if !s.valid() {
+                        return Err(Failure::accounting("C raw arithmetic does not reconcile"));
+                    }
+                    add(&mut self.samples, 1)?;
+                    add(&mut self.hs_ns, s.hs_ns)?;
+                    add(&mut self.ms_ns, s.ms_ns)?;
+                    add(&mut self.hc_ns, s.hc_ns)?;
+                    add(&mut self.mc_ns, s.mc_ns)?;
+                    self.serial_destination_delta_ns = signed_add(
+                        self.serial_destination_delta_ns,
+                        s.serial_destination_delta_ns,
+                    )?;
+                    self.concurrent_destination_delta_ns = signed_add(
+                        self.concurrent_destination_delta_ns,
+                        s.concurrent_destination_delta_ns,
+                    )?;
+                    self.interaction_delta_ns =
+                        signed_add(self.interaction_delta_ns, s.interaction_delta_ns)?;
+                    self.interaction_samples.observe(s.interaction_delta_ns)?;
+                    self.serial_destination_samples
+                        .observe(s.serial_destination_delta_ns)?;
+                    self.concurrent_destination_samples
+                        .observe(s.concurrent_destination_delta_ns)?;
+                    self.multiplicative_interaction_samples
+                        .observe(s.multiplicative_interaction_direction.into())?;
+                    self.reconcile()
+                }
+                fn reconcile(&self) -> Result<()> {
+                    if self.serial_destination_delta_ns
+                        != signed_sub(self.ms_ns.into(), self.hs_ns.into())?
+                        || self.concurrent_destination_delta_ns
+                            != signed_sub(self.mc_ns.into(), self.hc_ns.into())?
+                        || self.interaction_delta_ns
+                            != signed_sub(
+                                self.concurrent_destination_delta_ns,
+                                self.serial_destination_delta_ns,
+                            )?
+                        || [
+                            &self.interaction_samples,
+                            &self.serial_destination_samples,
+                            &self.concurrent_destination_samples,
+                            &self.multiplicative_interaction_samples,
+                        ]
+                        .into_iter()
+                        .any(|d| d.count().ok() != Some(self.samples))
+                    {
+                        return Err(Failure::accounting("C totals do not reconcile"));
+                    }
+                    Ok(())
+                }
+                fn times(&self) -> [u64; 4] {
+                    [self.hs_ns, self.hc_ns, self.ms_ns, self.mc_ns]
+                }
+            }
+            #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+            struct ExactStats {
+                #[serde(flatten)]
+                totals: Totals,
+                mean_signed_interaction_delta_ns: Option<SignedFraction>,
+                median_signed_interaction_delta_ns: Option<SignedFraction>,
+                median_ratio_of_ratios_exact: Option<RatioMedian>,
+                serial_median_delta_ns: Option<SignedFraction>,
+                concurrent_median_delta_ns: Option<SignedFraction>,
+                serial_median_mapped_over_host_ratio_exact: Option<RatioMedian>,
+                concurrent_median_mapped_over_host_ratio_exact: Option<RatioMedian>,
+            }
+            fn exact_stats(samples: &[DSample]) -> Result<ExactStats> {
+                let mut totals = Totals::default();
+                for s in samples {
+                    totals.observe(s)?;
+                }
+                let median =
+                    |f: fn(&DSample) -> i128| median_signed(samples.iter().map(f).collect());
+                let ratios = |f: fn(&DSample) -> Ratio| {
+                    RatioMedian::new(
+                        samples
+                            .iter()
+                            .map(|s| (s.source_set.set_index, f(s)))
+                            .collect(),
+                    )
+                };
+                Ok(ExactStats {
+                    mean_signed_interaction_delta_ns: (totals.samples != 0).then(|| {
+                        SignedFraction {
+                            numerator: totals.interaction_delta_ns,
+                            denominator: totals.samples,
+                        }
+                    }),
+                    median_signed_interaction_delta_ns: median(|s| s.interaction_delta_ns)?,
+                    median_ratio_of_ratios_exact: ratios(DSample::ratio),
+                    serial_median_delta_ns: median(|s| s.serial_destination_delta_ns)?,
+                    concurrent_median_delta_ns: median(|s| s.concurrent_destination_delta_ns)?,
+                    serial_median_mapped_over_host_ratio_exact: ratios(|s| Ratio {
+                        numerator: s.ms_ns.into(),
+                        denominator: s.hs_ns.into(),
+                    }),
+                    concurrent_median_mapped_over_host_ratio_exact: ratios(|s| Ratio {
+                        numerator: s.mc_ns.into(),
+                        denominator: s.hc_ns.into(),
+                    }),
+                    totals,
+                })
+            }
+            #[derive(Debug, Serialize)]
+            struct DescriptiveStats {
+                interaction_percent_of_hc: Option<f64>,
+                serial_mapped_slowdown_percent: Option<f64>,
+                concurrent_mapped_slowdown_percent: Option<f64>,
+                slowdown_percentage_point_difference: Option<f64>,
+                mean_signed_interaction_delta_ns: Option<f64>,
+                median_signed_interaction_delta_ns: Option<f64>,
+                median_ratio_of_ratios: Option<f64>,
+                serial_median_delta_ns: Option<f64>,
+                concurrent_median_delta_ns: Option<f64>,
+                serial_median_mapped_over_host_ratio: Option<f64>,
+                concurrent_median_mapped_over_host_ratio: Option<f64>,
+            }
+            fn descriptive(e: &ExactStats) -> DescriptiveStats {
+                let t = &e.totals;
+                let pct = |d: i128, n: u64| (n != 0).then(|| d as f64 / n as f64 * 100.0);
+                let frac = |f: &Option<SignedFraction>| {
+                    f.as_ref()
+                        .map(|f| f.numerator as f64 / f.denominator as f64)
+                };
+                let serial = pct(t.serial_destination_delta_ns, t.hs_ns);
+                let concurrent = pct(t.concurrent_destination_delta_ns, t.hc_ns);
+                DescriptiveStats {
+                    interaction_percent_of_hc: pct(t.interaction_delta_ns, t.hc_ns),
+                    serial_mapped_slowdown_percent: serial,
+                    concurrent_mapped_slowdown_percent: concurrent,
+                    slowdown_percentage_point_difference: concurrent
+                        .zip(serial)
+                        .map(|(c, s)| c - s),
+                    mean_signed_interaction_delta_ns: frac(&e.mean_signed_interaction_delta_ns),
+                    median_signed_interaction_delta_ns: frac(&e.median_signed_interaction_delta_ns),
+                    median_ratio_of_ratios: e
+                        .median_ratio_of_ratios_exact
+                        .as_ref()
+                        .map(RatioMedian::descriptive),
+                    serial_median_delta_ns: frac(&e.serial_median_delta_ns),
+                    concurrent_median_delta_ns: frac(&e.concurrent_median_delta_ns),
+                    serial_median_mapped_over_host_ratio: e
+                        .serial_median_mapped_over_host_ratio_exact
+                        .as_ref()
+                        .map(RatioMedian::descriptive),
+                    concurrent_median_mapped_over_host_ratio: e
+                        .concurrent_median_mapped_over_host_ratio_exact
+                        .as_ref()
+                        .map(RatioMedian::descriptive),
+                }
+            }
+            #[derive(Debug, Serialize)]
+            struct DStats {
+                exact: ExactStats,
+                descriptive: DescriptiveStats,
+            }
+            impl DStats {
+                fn new(samples: &[DSample]) -> Result<Self> {
+                    let exact = exact_stats(samples)?;
+                    Ok(Self {
+                        descriptive: descriptive(&exact),
+                        exact,
+                    })
+                }
+            }
+            fn reconcile_partitions<'a>(
+                parts: impl Iterator<Item = &'a ExactStats>,
+                primary: &ExactStats,
+            ) -> Result<()> {
+                let mut totals = Totals::default();
+                for e in parts {
+                    let t = &e.totals;
+                    add(&mut totals.samples, t.samples)?;
+                    add(&mut totals.hs_ns, t.hs_ns)?;
+                    add(&mut totals.ms_ns, t.ms_ns)?;
+                    add(&mut totals.hc_ns, t.hc_ns)?;
+                    add(&mut totals.mc_ns, t.mc_ns)?;
+                    totals.serial_destination_delta_ns = signed_add(
+                        totals.serial_destination_delta_ns,
+                        t.serial_destination_delta_ns,
+                    )?;
+                    totals.concurrent_destination_delta_ns = signed_add(
+                        totals.concurrent_destination_delta_ns,
+                        t.concurrent_destination_delta_ns,
+                    )?;
+                    totals.interaction_delta_ns =
+                        signed_add(totals.interaction_delta_ns, t.interaction_delta_ns)?;
+                    for (a, b) in [
+                        (&mut totals.interaction_samples, &t.interaction_samples),
+                        (
+                            &mut totals.serial_destination_samples,
+                            &t.serial_destination_samples,
+                        ),
+                        (
+                            &mut totals.concurrent_destination_samples,
+                            &t.concurrent_destination_samples,
+                        ),
+                        (
+                            &mut totals.multiplicative_interaction_samples,
+                            &t.multiplicative_interaction_samples,
+                        ),
+                    ] {
+                        add(&mut a.positive, b.positive)?;
+                        add(&mut a.negative, b.negative)?;
+                        add(&mut a.equal, b.equal)?;
+                    }
+                }
+                totals.reconcile()?;
+                if totals != primary.totals {
+                    return Err(Failure::accounting("width/order partition mismatch"));
+                }
+                Ok(())
+            }
+
+            const FACTORS: [&str; 4] = [
+                "serial_destination_order",
+                "concurrent_destination_order",
+                "pair_execution_order",
+                "source_set_role",
+            ];
+            #[derive(Debug, Serialize)]
+            struct DStatistics {
+                primary_k2_through_k8: DStats,
+                per_width: BTreeMap<usize, DStats>,
+                binary_marginal_factors: BTreeMap<&'static str, BTreeMap<usize, DStats>>,
+                temporal_quartiles: BTreeMap<usize, DStats>,
+                descriptive_design_classes: BTreeMap<usize, DStats>,
+                interaction_widths: Directions,
+            }
+            fn d_statistics(samples: &[DSample]) -> Result<DStatistics> {
+                // Partial prefixes are retained on failure; only successful full
+                // phases may supply classification and exact schedule authority.
+                let mut seen = BTreeSet::new();
+                let universe =
+                    expert_sequence(D_UNIVERSE, NAMESPACE).map_err(Failure::accounting)?;
+                for s in samples {
+                    let b = &s.source_set;
+                    if !seen.insert(b.set_index)
+                        || d_set(b.round, b.width, &universe)? != *b
+                        || !s.valid()
+                    {
+                        return Err(Failure::accounting("invalid D raw block"));
+                    }
+                }
+                let partition = |n: usize,
+                                 key: &dyn Fn(&DSample) -> usize|
+                 -> Result<BTreeMap<usize, DStats>> {
+                    (0..n)
+                        .map(|i| {
+                            Ok((
+                                i,
+                                DStats::new(
+                                    &samples
+                                        .iter()
+                                        .filter(|s| key(s) == i)
+                                        .cloned()
+                                        .collect::<Vec<_>>(),
+                                )?,
+                            ))
+                        })
+                        .collect()
+                };
+                let primary_k2_through_k8 = DStats::new(samples)?;
+                let per_width = partition(7, &|s| s.source_set.width - 2)?
+                    .into_iter()
+                    .map(|(i, s)| (i + 2, s))
+                    .collect::<BTreeMap<_, _>>();
+                let mut binary_marginal_factors = BTreeMap::new();
+                for (bit, name) in FACTORS.iter().enumerate() {
+                    binary_marginal_factors.insert(
+                        *name,
+                        partition(2, &|s| usize::from(s.source_set.factors()[bit]))?,
+                    );
+                }
+                let temporal_quartiles = partition(4, &|s| (s.source_set.set_index % 112) / 28)?;
+                let descriptive_design_classes = partition(16, &|s| s.source_set.design_class)?;
+                for p in [&per_width, &temporal_quartiles, &descriptive_design_classes]
+                    .into_iter()
+                    .chain(binary_marginal_factors.values())
+                {
+                    reconcile_partitions(
+                        p.values().map(|s| &s.exact),
+                        &primary_k2_through_k8.exact,
+                    )?;
+                }
+                let mut interaction_widths = Directions::default();
+                for w in per_width.values().filter(|w| w.exact.totals.samples > 0) {
+                    interaction_widths.observe(w.exact.totals.interaction_delta_ns)?;
+                }
+                Ok(DStatistics {
+                    primary_k2_through_k8,
+                    per_width,
+                    binary_marginal_factors,
+                    temporal_quartiles,
+                    descriptive_design_classes,
+                    interaction_widths,
+                })
+            }
+            impl DStatistics {
+                fn exact_matches(&self, other: &Self) -> bool {
+                    let eq = |a: &BTreeMap<usize, DStats>, b: &BTreeMap<usize, DStats>| {
+                        a.keys().eq(b.keys()) && a.iter().all(|(k, s)| s.exact == b[k].exact)
+                    };
+                    self.primary_k2_through_k8.exact == other.primary_k2_through_k8.exact
+                        && self.interaction_widths == other.interaction_widths
+                        && eq(&self.per_width, &other.per_width)
+                        && eq(&self.temporal_quartiles, &other.temporal_quartiles)
+                        && eq(
+                            &self.descriptive_design_classes,
+                            &other.descriptive_design_classes,
+                        )
+                        && self
+                            .binary_marginal_factors
+                            .keys()
+                            .eq(other.binary_marginal_factors.keys())
+                        && self
+                            .binary_marginal_factors
+                            .iter()
+                            .all(|(k, s)| eq(s, &other.binary_marginal_factors[k]))
+                }
+            }
+            fn interaction_interpretation(s: &DStatistics) -> Result<&'static str> {
+                let e = &s.primary_k2_through_k8.exact;
+                let t = &e.totals;
+                if t.samples != 112
+                    || t.hc_ns == 0
+                    || s.per_width.len() != 7
+                    || s.per_width.values().any(|s| s.exact.totals.samples != 16)
+                    || s.binary_marginal_factors.len() != 4
+                    || FACTORS.iter().any(|name| {
+                        s.binary_marginal_factors.get(name).is_none_or(|p| {
+                            p.len() != 2
+                                || (0..2)
+                                    .any(|i| p.get(&i).is_none_or(|s| s.exact.totals.samples != 56))
+                        })
+                    })
+                    || s.temporal_quartiles.len() != 4
+                    || (0..4).any(|i| {
+                        s.temporal_quartiles
+                            .get(&i)
+                            .is_none_or(|s| s.exact.totals.samples != 28)
+                    })
+                {
+                    return Ok("INCONCLUSIVE");
+                }
+                let scaled = t
+                    .interaction_delta_ns
+                    .checked_mul(100)
+                    .ok_or_else(|| Failure::accounting("D threshold overflow"))?;
+                let threshold = |p: i128| {
+                    i128::from(t.hc_ns)
+                        .checked_mul(p)
+                        .ok_or_else(|| Failure::accounting("D threshold product overflow"))
+                };
+                let median = e
+                    .median_signed_interaction_delta_ns
+                    .as_ref()
+                    .ok_or_else(|| Failure::accounting("D missing median"))?
+                    .numerator;
+                let strata: Vec<_> = s
+                    .binary_marginal_factors
+                    .values()
+                    .flat_map(|p| p.values())
+                    .chain(s.temporal_quartiles.values())
+                    .map(|s| s.exact.totals.interaction_delta_ns)
+                    .collect();
+                let positive = median > 0
+                    && t.interaction_samples.positive > 56
+                    && s.interaction_widths.positive >= 5
+                    && strata.iter().all(|v| *v > 0);
+                let negative = median < 0
+                    && t.interaction_samples.negative > 56
+                    && s.interaction_widths.negative >= 5
+                    && strata.iter().all(|v| *v < 0);
+                if positive && scaled >= threshold(5)? {
+                    return Ok("STRONG_POSITIVE_INTERACTION");
+                }
+                if positive && scaled >= threshold(3)? {
+                    return Ok("MATERIAL_POSITIVE_INTERACTION");
+                }
+                if negative && scaled <= threshold(-3)? {
+                    return Ok("NEGATIVE_MATERIAL_INTERACTION");
+                }
+                let direction = t.interaction_delta_ns.signum();
+                let majority_disagrees = match direction {
+                    1 => t.interaction_samples.positive <= 56,
+                    -1 => t.interaction_samples.negative <= 56,
+                    _ => t.interaction_samples.positive > 56 || t.interaction_samples.negative > 56,
+                };
+                if median.signum() != direction
+                    || majority_disagrees
+                    || strata.iter().any(|v| v.signum() == -direction && *v != 0)
+                {
+                    return Ok("AMBIGUOUS");
+                }
+                let ratio = e
+                    .median_ratio_of_ratios_exact
+                    .as_ref()
+                    .ok_or_else(|| Failure::accounting("D missing ratio median"))?;
+                if scaled
+                    .checked_abs()
+                    .ok_or_else(|| Failure::accounting("D absolute overflow"))?
+                    <= threshold(1)?
+                    && ratio.compare_hundredths(99)? != Ordering::Less
+                    && ratio.compare_hundredths(101)? != Ordering::Greater
+                    && s.interaction_widths.positive < 5
+                {
+                    return Ok("EVIDENCE_AGAINST_MATERIAL_INTERACTION");
+                }
+                Ok("AMBIGUOUS")
+            }
+            #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+            struct ExecutedCell {
+                source_role: SourceRole,
+                ordered_expert_ids: Vec<u32>,
+                set_index: usize,
+                ordinal: usize,
+                cell: Cell,
+            }
+            #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+            struct CellHash {
+                source: String,
+                payload: String,
+                gpu: String,
+                epoch: bool,
+            }
+            impl From<Hashes> for CellHash {
+                fn from(h: Hashes) -> Self {
+                    Self {
+                        source: h.source,
+                        payload: h.payload,
+                        gpu: h.gpu,
+                        epoch: h.epoch,
+                    }
+                }
+            }
+            #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+            struct VerificationSet {
+                source_set: DSet,
+                cells: BTreeMap<Cell, Vec<CellHash>>,
+            }
+            impl VerificationSet {
+                fn valid(&self) -> bool {
+                    self.cells.len() == 4
+                        && Cell::ALL.into_iter().all(|cell| {
+                            self.cells.get(&cell).is_some_and(|hashes| {
+                                hashes.len() == self.source_set.width
+                                    && hashes.iter().enumerate().all(|(j, h)| {
+                                        h.epoch
+                                            && h.source.len() == 64
+                                            && h.payload.len() == 64
+                                            && h.payload == h.gpu
+                                            && self
+                                                .cells
+                                                .get(&if cell.serial() {
+                                                    Cell::HS
+                                                } else {
+                                                    Cell::HC
+                                                })
+                                                .and_then(|v| v.get(j))
+                                                .is_some_and(|host| {
+                                                    h.source == host.source
+                                                        && h.payload == host.payload
+                                                        && h.gpu == host.gpu
+                                                })
+                                    })
+                            })
+                        })
+                }
+            }
+            #[derive(Debug, Serialize)]
+            struct DPhase {
+                name: &'static str,
+                schedule_count: usize,
+                schedule: Vec<DSet>,
+                expected: DPlan,
+                execution_trace: Vec<ExecutedCell>,
+                raw_samples: Vec<DSample>,
+                raw_verification: Vec<VerificationSet>,
+                statistics: DStatistics,
+                cells: BTreeMap<Cell, CellArm>,
+                witnesses: BTreeMap<Cell, Witnesses>,
+                fd_proof: SourceUploadFdProofSnapshot,
+                fd_proof_hits_only: bool,
+                mismatch_count: u64,
+            }
+            impl DPhase {
+                fn new(name: &'static str, schedule_count: usize) -> Result<Self> {
+                    let schedule = d_schedule(schedule_count)?;
+                    Ok(Self {
+                        name,
+                        schedule_count,
+                        expected: plan(&schedule)?,
+                        schedule,
+                        execution_trace: Vec::new(),
+                        raw_samples: Vec::new(),
+                        raw_verification: Vec::new(),
+                        statistics: d_statistics(&[])?,
+                        cells: Cell::ALL
+                            .into_iter()
+                            .map(|c| Ok((c, CellArm::new(c)?)))
+                            .collect::<Result<_>>()?,
+                        witnesses: Cell::ALL
+                            .into_iter()
+                            .map(|c| (c, Witnesses::default()))
+                            .collect(),
+                        fd_proof: SourceUploadFdProofSnapshot::default(),
+                        fd_proof_hits_only: false,
+                        mismatch_count: 0,
+                    })
+                }
+                fn successful(&self) -> bool {
+                    let expected_trace: Vec<_> = self
+                        .schedule
+                        .iter()
+                        .flat_map(|s| {
+                            s.execution_sequence
+                                .iter()
+                                .enumerate()
+                                .map(|(ordinal, &cell)| ExecutedCell {
+                                    set_index: s.set_index,
+                                    source_role: s.role(cell),
+                                    ordered_expert_ids: s.b_set(cell).ordered_expert_ids,
+                                    ordinal,
+                                    cell,
+                                })
+                        })
+                        .collect();
+                    self.fd_proof_hits_only
+                        && c_proof_hits_only(&self.fd_proof, self.expected.expert_slots_per_cell)
+                        && d_schedule(self.schedule_count).is_ok_and(|s| s == self.schedule)
+                        && plan(&self.schedule).is_ok_and(|e| e == self.expected)
+                        && self.execution_trace == expected_trace
+                        && self.cells.len() == 4
+                        && self.witnesses.len() == 4
+                        && self.raw_samples.len() == self.schedule.len()
+                        && self.raw_verification.len() == self.schedule.len()
+                        && self
+                            .raw_samples
+                            .iter()
+                            .zip(&self.schedule)
+                            .all(|(s, set)| s.source_set == *set && s.valid())
+                        && self
+                            .raw_verification
+                            .iter()
+                            .zip(&self.schedule)
+                            .all(|(s, set)| s.source_set == *set && s.valid())
+                        && d_statistics(&self.raw_samples)
+                            .is_ok_and(|s| s.exact_matches(&self.statistics))
+                        && self.mismatch_count == 0
+                        && Cell::ALL.into_iter().all(|cell| {
+                            self.cells.get(&cell).is_some_and(|arm| {
+                                arm.cell == cell
+                                    && arm.completed_source_sets
+                                        == self
+                                            .schedule
+                                            .iter()
+                                            .map(|s| s.b_set(cell))
+                                            .collect::<Vec<_>>()
+                                    && arm.successful(
+                                        &self.expected.cell_source_schedules[&cell],
+                                        cell.mapped(),
+                                    )
+                                    && arm.evidence.times.source_direct_read_ns
+                                        == self
+                                            .statistics
+                                            .primary_k2_through_k8
+                                            .exact
+                                            .totals
+                                            .times()[cell.index()]
+                            }) && self.witnesses.get(&cell).is_some_and(|w| {
+                                let Some(host) = self.witnesses.get(&if cell.serial() {
+                                    Cell::HS
+                                } else {
+                                    Cell::HC
+                                }) else {
+                                    return false;
+                                };
+                                w.full_source_sha256 == host.full_source_sha256
+                                    && w.bare_payload_sha256 == host.bare_payload_sha256
+                                    && w.bare_payload_sha256 == w.gpu_destination_payload_sha256
+                                    && w.full_source_sha256.len() == 64
+                                    && w.bare_payload_sha256.len() == 64
+                            })
+                        })
+                }
+            }
+            async fn d_phase(
+                p: &mut DPhase,
+                gpu: &Gpu,
+                storage: &NvmeStorage,
+                host: &mut AlignedBuffer,
+            ) -> Result<()> {
+                let mut streams: [Streams; 4] = std::array::from_fn(|_| Streams::default());
+                let result = async {
+                    for set in p.schedule.clone() {
+                        let mut times = [0u64; 4];
+                        let mut verification = VerificationSet {
+                            source_set: set.clone(),
+                            cells: BTreeMap::new(),
+                        };
+                        for (ordinal, cell) in set.execution_sequence.into_iter().enumerate() {
+                            let b_set = set.b_set(cell);
+                            p.execution_trace.push(ExecutedCell {
+                                set_index: set.set_index,
+                                ordinal,
+                                cell,
+                                source_role: set.role(cell),
+                                ordered_expert_ids: b_set.ordered_expert_ids.clone(),
+                            });
+                            let arm = p.cells.get_mut(&cell)
+                                .ok_or_else(|| Failure::accounting("missing cell"))?;
+                            let result = if cell.mapped() {
+                                mapped_cell(gpu, storage, &b_set, arm, &mut streams[cell.index()]).await
+                            } else {
+                                host_cell(gpu, storage, host, &b_set, arm, &mut streams[cell.index()]).await
+                            };
+                            if let Err(e) = &result {
+                                note_arm_error(arm, e)?;
+                            }
+                            let (ns, hashes) = result?;
+                            times[cell.index()] = ns;
+                            verification.cells.insert(cell, hashes.into_iter().map(CellHash::from).collect());
+                        }
+                        p.raw_samples.push(DSample::new(
+                            set, times[Cell::HS.index()], times[Cell::MS.index()],
+                            times[Cell::HC.index()], times[Cell::MC.index()],
+                        )?);
+                        let valid = verification.valid();
+                        p.raw_verification.push(verification);
+                        if !valid {
+                            add(&mut p.mismatch_count, 1)?;
+                            return Err(Failure::runtime("hash-parity-failed",
+                                "split-pair source/payload/GPU/epoch mismatch; raw verification retained"));
+                        }
+                    }
+                    Ok(())
+                }.await;
+                // Both helpers return only after every attempted read has finished.
+                p.fd_proof = storage.source_upload_fd_proof_snapshot();
+                p.fd_proof_hits_only =
+                    c_proof_hits_only(&p.fd_proof, p.expected.expert_slots_per_cell);
+                for cell in Cell::ALL {
+                    let arm = p
+                        .cells
+                        .get_mut(&cell)
+                        .ok_or_else(|| Failure::accounting("missing cell"))?;
+                    arm.source_schedule = schedule_evidence(&arm.completed_source_sets)?;
+                    arm.evidence.rates();
+                    p.witnesses.insert(cell, streams[cell.index()].snapshot());
+                }
+                p.statistics = d_statistics(&p.raw_samples)?;
+                result?;
+                if !p.fd_proof_hits_only {
+                    return Err(Failure::authority(format!(
+                        "{} expected only proof hits: {:?}",
+                        p.name, p.fd_proof,
+                    )));
+                }
+                Ok(())
+            }
+            #[derive(Debug, Serialize)]
+            struct DReport {
+                schema: &'static str,
+                args: Args,
+                config_sha256: Option<String>,
+                complete: bool,
+                correctness_pass: bool,
+                authoritative: bool,
+                classification: String,
+                failure: Option<String>,
+                authority: CAuthority,
+                warmup: DPhase,
+                measured: DPhase,
+                performance_required_for_correctness: bool,
+                performance_authority: &'static str,
+                interaction_interpretation_conditional_on_zero_retry_log: &'static str,
+                primary_endpoint: &'static str,
+                schedule_contract: &'static str,
+                timing_contract: &'static str,
+                interpretation_contract: &'static str,
+                secondary_destination_endpoints: &'static str,
+                retry_evidence_contract: &'static str,
+                source_byte_evidence_contract: &'static str,
+            }
+            impl DReport {
+                fn new(args: Args) -> Result<Self> {
+                    let mut base = Report::new(args.clone()).authority;
+                    base.control_source_api = B_API;
+                    base.treatment_source_api = B_API;
+                    base.control_destination = "aligned-host-arena";
+                    base.treatment_destination = "wgpu-map-write-arena";
+                    base.upload_capacity_bytes = MAPPED_ARENA;
+                    Ok(Self {
+                        schema: D_SCHEMA,
+                        args,
+                        config_sha256: None,
+                        complete: false,
+                        correctness_pass: false,
+                        authoritative: false,
+                        classification: "not-run".into(),
+                        failure: None,
+                        authority: CAuthority {
+                            base,
+                            cell_source_apis: Cell::ALL.into_iter().map(|c| (c, c.api())).collect(),
+                            host_arena_capacity_bytes: HOST_ARENA,
+                            max_width: MAX_WIDTH,
+                            fd_preproof_completed: false,
+                            fd_cache_capacity: 0,
+                            preproof_universe_size: D_UNIVERSE,
+                            preproof_ordered_expert_ids: expert_sequence(D_UNIVERSE, NAMESPACE).map_err(Failure::accounting)?,
+                            preproof: SourceUploadFdProofSnapshot::default(),
+                            after_preproof_telemetry_reset: SourceUploadFdProofSnapshot::default(),
+                            after_warmup_telemetry_reset: SourceUploadFdProofSnapshot::default(),
+                        },
+                        warmup: DPhase::new("warmup", WARMUP_COUNT)?,
+                        measured: DPhase::new("measured", MEASURED_COUNT)?,
+                        performance_required_for_correctness: false,
+                        performance_authority: "PENDING_EXTERNAL_RETRY_LOG_AUDIT",
+                        interaction_interpretation_conditional_on_zero_retry_log: "INCONCLUSIVE",
+                        primary_endpoint: "112 K=2..8 split-pair blocks: sum((MC-HC)-(MS-HS)); percent denominator=sum(HC)",
+                        schedule_contract: D_SCHEDULE_CONTRACT,
+                        timing_contract: C_TIMER_CONTRACT,
+                        interpretation_contract: D_INTERPRETATION,
+                        secondary_destination_endpoints: D_SECONDARY,
+                        retry_evidence_contract: D_RETRY,
+                        source_byte_evidence_contract: "Each successful helper must return exactly K*FULL bytes. Failed-helper partial physical I/O is unavailable, never inferred as zero. Each cell retains ordered per-set full-source/payload/verified-GPU hashes and concatenated byte-stream witnesses. Equality is required within HS/MS and HC/MC separately; A and B are disjoint and are not compared for byte equality. Verification/reset/copy/readback are outside source timers.",
+                    })
+                }
+                fn authority_valid(&self) -> bool {
+                    let a = &self.authority;
+                    let b = &a.base;
+                    self.schema == D_SCHEMA
+                        && !self.performance_required_for_correctness
+                        && self.args.iterations == 128
+                        && self.args.warmup_iterations == 32
+                        && self.warmup.schedule_count == WARMUP_COUNT
+                        && self.measured.schedule_count == MEASURED_COUNT
+                        && a.cell_source_apis
+                            == Cell::ALL.into_iter().map(|c| (c, c.api())).collect()
+                        && a.host_arena_capacity_bytes == HOST_ARENA
+                        && a.max_width == MAX_WIDTH
+                        && b.same_source_api
+                        && b.control_source_api == B_API
+                        && b.treatment_source_api == B_API
+                        && b.control_destination == "aligned-host-arena"
+                        && b.treatment_destination == "wgpu-map-write-arena"
+                        && b.upload_capacity_bytes == MAPPED_ARENA
+                        && b.full_source_bytes == FULL
+                        && b.block_alignment == ALIGN
+                        && b.uth_prefix_bytes == PREFIX
+                        && b.bare_payload_bytes == PAYLOAD
+                        && b.physical_slot_bytes == SLOT
+                        && b.source_timer_excludes_allocation
+                        && b.source_timer_excludes_map_async_device_poll
+                        && b.source_timer_excludes_alignment_setup
+                        && b.source_timer_excludes_hashes_readback_fd_evidence
+                        && b.source_timer_excludes_gpu_copy_unmap
+                        && b.linux
+                        && b.expected_adapter_name == "NVIDIA L4"
+                        && self.args.expected_adapter_name == "NVIDIA L4"
+                        && b.adapter_authoritative
+                        && b.direct_io_requested
+                        && b.packed_storage == Some(false)
+                        && b.exact_geometry
+                        && a.fd_preproof_completed
+                        && a.fd_cache_capacity >= 256
+                        && a.preproof_universe_size == 256
+                        && expert_sequence(256, NAMESPACE)
+                            .is_ok_and(|ids| ids == a.preproof_ordered_expert_ids)
+                        && a.preproof
+                            == SourceUploadFdProofSnapshot {
+                                source_upload_fd_proof_requests: 256,
+                                source_upload_fd_proof_misses: 256,
+                                ..SourceUploadFdProofSnapshot::default()
+                            }
+                        && a.after_preproof_telemetry_reset
+                            == SourceUploadFdProofSnapshot::default()
+                        && a.after_warmup_telemetry_reset == SourceUploadFdProofSnapshot::default()
+                        && c_proof_hits_only(&self.warmup.fd_proof, 140)
+                        && c_proof_hits_only(&self.measured.fd_proof, 560)
+                }
+                fn classify(&mut self) -> Result<()> {
+                    self.complete = true;
+                    self.correctness_pass = false;
+                    self.authoritative = false;
+                    self.interaction_interpretation_conditional_on_zero_retry_log = "AMBIGUOUS";
+                    if !self.authority_valid() {
+                        self.classification = "authority-failed".into();
+                    } else if !self.warmup.successful() || !self.measured.successful() {
+                        self.classification = "evidence-reconciliation-failed".into();
+                    } else {
+                        self.correctness_pass = true;
+                        self.authoritative = true;
+                        self.classification = "split-pair-interaction-complete".into();
+                        self.interaction_interpretation_conditional_on_zero_retry_log =
+                            interaction_interpretation(&self.measured.statistics)?;
+                    }
+                    Ok(())
+                }
+                fn fail(&mut self, failure: Failure) {
+                    self.complete = failure.complete;
+                    self.correctness_pass = false;
+                    self.authoritative = false;
+                    self.classification = failure.classification.into();
+                    self.failure = Some(failure.detail);
+                    self.interaction_interpretation_conditional_on_zero_retry_log = "AMBIGUOUS";
+                }
+            }
+            async fn execute(report: &mut DReport) -> Result<()> {
+                if report.args.iterations != 128 || report.args.warmup_iterations != 32 {
+                    return Err(Failure::runtime("invalid-arguments", "D requires --iterations 128 --warmup-iterations 32 for CLI compatibility; D generates 112 measured split-pair blocks (r=0..15) and 28 warmup blocks (r=16..19)"));
+                }
+                let bytes = std::fs::read(&report.args.config)
+                    .map_err(|e| Failure::runtime("config-failed", e))?;
+                report.config_sha256 = Some(sha(&bytes));
+                let text = std::str::from_utf8(&bytes)
+                    .map_err(|e| Failure::runtime("config-failed", e))?;
+                let config: Config =
+                    toml::from_str(text).map_err(|e| Failure::runtime("config-failed", e))?;
+                config.validate().map_err(Failure::authority)?;
+                let a = &mut report.authority;
+                a.base.direct_io_requested = !config.storage.no_direct;
+                a.base.packed_storage = Some(
+                    config.storage.packed_blob.is_some()
+                        || config.storage.packed_manifest.is_some(),
+                );
+                a.base.source_data_dir = Some(config.model.data_dir.clone());
+                validate_geometry(&config)?;
+                a.base.exact_geometry = true;
+                if !a.base.linux
+                    || report.args.expected_adapter_name != "NVIDIA L4"
+                    || !a.base.direct_io_requested
+                    || a.base.packed_storage != Some(false)
+                {
+                    return Err(Failure::authority("requires Linux, exact NVIDIA L4 Vulkan, O_DIRECT, unpacked full-file Qwen geometry"));
+                }
+                let storage = NvmeStorage::new(StorageConfig {
+                    base_path: config.model.data_dir,
+                    expert_size: FULL,
+                    block_align: ALIGN,
+                    use_direct_io: true,
+                    num_experts_per_layer: Some(128),
+                })
+                .map_err(|e| Failure::runtime("source-failed", e))?;
+                if storage.is_packed() {
+                    return Err(Failure::authority("packed storage forbidden"));
+                }
+                a.fd_cache_capacity = storage.max_open_files();
+                if a.fd_cache_capacity < a.preproof_universe_size {
+                    return Err(Failure::authority(
+                        "fd cache cannot retain the complete deterministic universe",
+                    ));
+                }
+                let preproof = storage.preprove_source_upload_fds(&a.preproof_ordered_expert_ids);
+                a.preproof = storage.source_upload_fd_proof_snapshot();
+                preproof.map_err(|e| Failure::authority(format!("fd preproof: {e}")))?;
+                if a.preproof.source_upload_fd_proof_requests != a.preproof_universe_size as u64
+                    || a.preproof.source_upload_fd_proof_misses != a.preproof_universe_size as u64
+                    || a.preproof.source_upload_fd_proof_hits != 0
+                    || a.preproof.source_upload_fd_proof_failures != 0
+                {
+                    return Err(Failure::authority(
+                        "fresh universe preproof counters do not reconcile",
+                    ));
+                }
+                a.fd_preproof_completed = true;
+                storage.reset_source_upload_fd_proof_telemetry();
+                a.after_preproof_telemetry_reset = storage.source_upload_fd_proof_snapshot();
+                if a.after_preproof_telemetry_reset != SourceUploadFdProofSnapshot::default() {
+                    return Err(Failure::authority("preproof telemetry reset failed"));
+                }
+                let gpu = Gpu::with_upload_capacity(&mut a.base, MAPPED_ARENA).await?;
+                let mut host = AlignedBuffer::new(HOST_ARENA, ALIGN);
+                d_phase(&mut report.warmup, &gpu, &storage, &mut host).await?;
+                if !report.warmup.successful() {
+                    return Err(Failure::authority("warmup evidence did not reconcile"));
+                }
+                storage.reset_source_upload_fd_proof_telemetry();
+                report.authority.after_warmup_telemetry_reset =
+                    storage.source_upload_fd_proof_snapshot();
+                if report.authority.after_warmup_telemetry_reset
+                    != SourceUploadFdProofSnapshot::default()
+                {
+                    return Err(Failure::authority("warmup telemetry reset failed"));
+                }
+                d_phase(&mut report.measured, &gpu, &storage, &mut host).await?;
+                gpu.check()?;
+                report.classify()?;
+                Ok(())
+            }
+            pub(crate) async fn run_command(
+                args: Args,
+            ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+                let mut output = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&args.report_out)?;
+                let mut report = DReport::new(args).map_err(|e| io::Error::other(e.detail))?;
+                match std::panic::AssertUnwindSafe(execute(&mut report))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => report.fail(e),
+                    Err(p) => {
+                        let detail = p
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                            .unwrap_or_else(|| "non-string panic".into());
+                        report.fail(Failure::runtime(
+                            "runtime-failed",
+                            format!("D diagnostic panic: {detail}"),
+                        ));
+                    }
+                }
+                serde_json::to_writer_pretty(&mut output, &report)?;
+                output.write_all(b"\n")?;
+                output.sync_all()?;
+                if report.complete {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "{}: {}",
+                        report.classification,
+                        report.failure.as_deref().unwrap_or("incomplete")
+                    ))
+                    .into())
+                }
+            }
+
+            #[cfg(test)]
+            mod tests {
+                use super::*;
+                fn args() -> Args {
+                    Args {
+                        config: "unused.toml".into(),
+                        expected_adapter_name: "NVIDIA L4".into(),
+                        warmup_iterations: 32,
+                        iterations: 128,
+                        report_out: "unused.json".into(),
+                    }
+                }
+                fn samples(times: [u64; 4]) -> Vec<DSample> {
+                    d_schedule(112)
+                        .unwrap()
+                        .into_iter()
+                        .map(|s| DSample::new(s, times[0], times[2], times[1], times[3]).unwrap())
+                        .collect()
+                }
+                fn fixture_phase(name: &'static str, count: usize, times: [u64; 4]) -> DPhase {
+                    let mut p = DPhase::new(name, count).unwrap();
+                    let n = p.expected.expert_slots_per_cell;
+                    let sets = p.expected.block_count;
+                    p.raw_samples = p
+                        .schedule
+                        .iter()
+                        .cloned()
+                        .map(|s| DSample::new(s, times[0], times[2], times[1], times[3]).unwrap())
+                        .collect();
+                    p.statistics = d_statistics(&p.raw_samples).unwrap();
+                    p.execution_trace = p
+                        .schedule
+                        .iter()
+                        .flat_map(|s| {
+                            s.execution_sequence
+                                .iter()
+                                .enumerate()
+                                .map(|(ordinal, &cell)| ExecutedCell {
+                                    set_index: s.set_index,
+                                    source_role: s.role(cell),
+                                    ordered_expert_ids: s.b_set(cell).ordered_expert_ids,
+                                    ordinal,
+                                    cell,
+                                })
+                        })
+                        .collect();
+                    p.raw_verification = p
+                        .schedule
+                        .iter()
+                        .map(|s| VerificationSet {
+                            source_set: s.clone(),
+                            cells: Cell::ALL
+                                .into_iter()
+                                .map(|c| {
+                                    (
+                                        c,
+                                        (0..s.width)
+                                            .map(|_| CellHash {
+                                                source: sha(if c.serial() {
+                                                    b"serial"
+                                                } else {
+                                                    b"concurrent"
+                                                }),
+                                                payload: sha(b"payload"),
+                                                gpu: sha(b"payload"),
+                                                epoch: true,
+                                            })
+                                            .collect(),
+                                    )
+                                })
+                                .collect(),
+                        })
+                        .collect();
+                    for cell in Cell::ALL {
+                        let arm = p.cells.get_mut(&cell).unwrap();
+                        arm.source_sets_attempted = sets;
+                        arm.serial_helper_calls = if cell.serial() { sets } else { 0 };
+                        arm.concurrent_helper_calls = if cell.serial() { 0 } else { sets };
+                        arm.completed_source_sets =
+                            p.schedule.iter().map(|s| s.b_set(cell)).collect();
+                        arm.source_schedule = p.expected.cell_source_schedules[&cell].clone();
+                        let a = &mut arm.evidence;
+                        a.ops_attempted = n;
+                        a.source_read_attempts = n;
+                        a.source_read_ops = n;
+                        a.full_source_bytes = n * FULL as u64;
+                        a.payload_ops = n;
+                        a.payload_bytes = n * PAYLOAD as u64;
+                        a.upload_ops = n;
+                        a.gpu_copied_bytes = n * PAYLOAD as u64;
+                        a.epoch_bytes = n * 4;
+                        a.gpu_completed_ops = n;
+                        a.verified_ops = n;
+                        a.verification_readback_bytes = n * SLOT as u64;
+                        a.verification_destination_reset_ops = n;
+                        a.verification_destination_reset_bytes = n * SLOT as u64;
+                        a.pointers.observations = n;
+                        a.pointers.aligned = n;
+                        a.fd_evidence = FdEvidence {
+                            checks: n,
+                            direct_observed: n,
+                            full_file_length_observed: n,
+                            ..FdEvidence::default()
+                        };
+                        a.times.source_direct_read_ns = sets * times[cell.index()];
+                        if cell.mapped() {
+                            a.map_attempts = sets;
+                            a.maps_completed = sets;
+                            a.unmaps = sets;
+                            a.pointers.gpu_offset_checks = n;
+                            a.explicit_copy_buffer_bytes = n * PAYLOAD as u64;
+                        } else {
+                            a.cpu_payload_copy_bytes = n * PAYLOAD as u64;
+                        }
+                        p.witnesses.insert(
+                            cell,
+                            Witnesses {
+                                full_source_sha256: sha(if cell.serial() {
+                                    b"serial"
+                                } else {
+                                    b"concurrent"
+                                }),
+                                bare_payload_sha256: sha(b"payload"),
+                                gpu_destination_payload_sha256: sha(b"payload"),
+                            },
+                        );
+                    }
+                    p.fd_proof = SourceUploadFdProofSnapshot {
+                        source_upload_fd_proof_requests: n * 4,
+                        source_upload_fd_proof_hits: n * 4,
+                        ..SourceUploadFdProofSnapshot::default()
+                    };
+                    p.fd_proof_hits_only = true;
+                    assert!(p.successful());
+                    p
+                }
+                fn fixture(times: [u64; 4]) -> DReport {
+                    let mut r = DReport::new(args()).unwrap();
+                    let a = &mut r.authority;
+                    a.base.linux = true;
+                    a.base.adapter_authoritative = true;
+                    a.base.direct_io_requested = true;
+                    a.base.packed_storage = Some(false);
+                    a.base.exact_geometry = true;
+                    a.fd_cache_capacity = 256;
+                    a.fd_preproof_completed = true;
+                    a.preproof = SourceUploadFdProofSnapshot {
+                        source_upload_fd_proof_requests: 256,
+                        source_upload_fd_proof_misses: 256,
+                        ..SourceUploadFdProofSnapshot::default()
+                    };
+                    r.warmup = fixture_phase("warmup", 28, times);
+                    r.measured = fixture_phase("measured", 112, times);
+                    r
+                }
+
+                #[test]
+                fn source_to_upload_copy_elision_d_hash_pins_and_unchanged_runners() {
+                    let whole = include_str!("gpu_native_source_to_upload_copy_elision.rs");
+                    let c = whole
+                        .split("    pub(super) mod hma1c_c {")
+                        .nth(1)
+                        .unwrap()
+                        .split("        #[cfg(test)]")
+                        .next()
+                        .unwrap();
+                    assert_eq!(
+                        sha(c.as_bytes()),
+                        "77ed07c20c3a66f395d6c470dde18dbd9d18574f176f79466ca1a33ed3016422"
+                    );
+                    let io = include_str!("io_provider.rs")
+                        .split("\n// Diagnostic-only full-schedule fixture.")
+                        .next()
+                        .unwrap();
+                    assert_eq!(
+                        sha(io.as_bytes()),
+                        "e6c9148935d47e01b8ab4f498250a22d9ca0144bd899233bbfc2bfde2f9501cd"
+                    );
+                    let d = whole
+                        .split("        pub(crate) mod hma1c_d {")
+                        .nth(1)
+                        .unwrap()
+                        .split("            #[cfg(test)]")
+                        .next()
+                        .unwrap();
+                    assert!(!d.contains(".read_experts_serial_into_aligned_slices("));
+                    assert!(!d.contains(".read_experts_batch_into_aligned_slices("));
+                    let phase = d
+                        .split("async fn d_phase(")
+                        .nth(1)
+                        .unwrap()
+                        .split("struct DReport")
+                        .next()
+                        .unwrap();
+                    assert_eq!(phase.matches("host_cell(").count(), 1);
+                    assert_eq!(phase.matches("mapped_cell(").count(), 1);
+                    assert!(phase
+                        .split_whitespace()
+                        .collect::<String>()
+                        .contains("letb_set=set.b_set(cell);"));
+                    let exec = d.split("async fn execute(").nth(1).unwrap();
+                    assert_eq!(exec.matches("preprove_source_upload_fds(").count(), 1);
+                    assert_eq!(
+                        exec.matches("reset_source_upload_fd_proof_telemetry()")
+                            .count(),
+                        2
+                    );
+                    assert!(
+                        exec.find("preprove_source_upload_fds(").unwrap()
+                            < exec
+                                .find("reset_source_upload_fd_proof_telemetry()")
+                                .unwrap()
+                    );
+                    for (count, ids, order, complete) in [
+                        (
+                            28,
+                            "a9a5e7636c44f3bb6070a63e63b5532f22809262f0fc9d7c05f1886ce442a292",
+                            "57fae1360cc13bfa62c13af6e141668cb388712dbb3f5c19501707e7a5c870bb",
+                            "e0caded6746d9ccc65d416cd761c3c0c8de23a5fe130b660c0f024439d1b8e05",
+                        ),
+                        (
+                            112,
+                            "aa60ee0e4bfe50874b18d70857da221ec920e6f8f137363ebac568d83b72a802",
+                            "40e1dc2fc03f4cae91ab359e5620d960260970c0fce8f0f2bd9e1d8a20135421",
+                            "c347a06c53df847b2d7409ccbd605939625c81a899b15180eb23d7468da022dd",
+                        ),
+                    ] {
+                        let p = plan(&d_schedule(count).unwrap()).unwrap();
+                        assert_eq!(
+                            p.universe_sha256,
+                            "7a993987f13a94c6b3cc3f75a38dde55919a820d68b57e28c5f9ac599c1565b3"
+                        );
+                        assert_eq!(p.ordered_ab_ids_sha256, ids);
+                        assert_eq!(p.execution_order_sha256, order);
+                        assert_eq!(p.complete_schedule_sha256, complete);
+                    }
+                }
+                #[test]
+                fn source_to_upload_copy_elision_d_synthetic_json_for_independent_audit() {
+                    let mut r = fixture([1000, 1000, 1000, 1100]);
+                    r.classify().unwrap();
+                    let json = serde_json::to_string_pretty(&r).unwrap();
+                    assert!(json.contains("split-pair-interaction-complete"));
+                    // Optional test-only export lets the independent Python tool
+                    // verify Rust's serialization and exact stats. Never hardware evidence.
+                    if let Some(path) = std::env::var_os("MER_HMA1CD_TEST_REPORT_OUT") {
+                        std::fs::write(path, json).unwrap();
+                    }
+                }
+                #[test]
+                fn source_to_upload_copy_elision_d_exact_schedule_independent_recomputation() {
+                    for (count, rounds) in [(112, 0..16), (28, 16..20)] {
+                        let s = d_schedule(count).unwrap();
+                        let universe: Vec<u32> = (0..256).map(|i| i * 6143 / 255).collect();
+                        let mut expected = Vec::new();
+                        for r in rounds {
+                            for k in 2..=8 {
+                                let i = r * 7 + k - 2;
+                                let class = (r + 5 * (k - 2)) % 16;
+                                let a: Vec<_> =
+                                    (0..k).map(|j| universe[(i * 17 + j * 13) % 256]).collect();
+                                let b: Vec<_> = (0..k)
+                                    .map(|j| universe[(i * 17 + 128 + j * 13) % 256])
+                                    .collect();
+                                expected.push((i, r, k, class, a, b));
+                            }
+                        }
+                        for (block, (i, r, k, class, a, b)) in s.iter().zip(expected) {
+                            assert_eq!(
+                                (
+                                    block.set_index,
+                                    block.round,
+                                    block.width,
+                                    block.design_class
+                                ),
+                                (i, r, k, class)
+                            );
+                            assert_eq!(block.a_ordered_expert_ids, a);
+                            assert_eq!(block.b_ordered_expert_ids, b);
+                            assert!(a.iter().all(|id| !b.contains(id)));
+                            let mut reads = BTreeMap::new();
+                            for cell in block.execution_sequence {
+                                for id in block.b_set(cell).ordered_expert_ids {
+                                    *reads.entry(id).or_insert(0) += 1;
+                                }
+                            }
+                            assert_eq!(reads.len(), 2 * k);
+                            assert!(reads.values().all(|n| *n == 2));
+                            let serial = if class & 1 == 0 {
+                                [Cell::HS, Cell::MS]
+                            } else {
+                                [Cell::MS, Cell::HS]
+                            };
+                            let concurrent = if class & 2 == 0 {
+                                [Cell::HC, Cell::MC]
+                            } else {
+                                [Cell::MC, Cell::HC]
+                            };
+                            let expected = if class & 4 == 0 {
+                                [serial[0], serial[1], concurrent[0], concurrent[1]]
+                            } else {
+                                [concurrent[0], concurrent[1], serial[0], serial[1]]
+                            };
+                            assert_eq!(block.execution_sequence, expected);
+                            assert_eq!(
+                                block.b_set(Cell::HS).ordered_expert_ids,
+                                if class & 8 == 0 { a.clone() } else { b.clone() }
+                            );
+                            assert_eq!(
+                                block.b_set(Cell::HC).ordered_expert_ids,
+                                if class & 8 == 0 { b } else { a }
+                            );
+                        }
+                        let e = plan(&s).unwrap();
+                        assert_eq!(e.block_count, count as u64);
+                        assert_eq!(e.expert_slots_per_cell, count as u64 * 5);
+                        assert_eq!(e.source_bytes_per_cell, count as u64 * 5 * FULL as u64);
+                    }
+                    let s = d_schedule(112).unwrap();
+                    for k in 2..=8 {
+                        let classes: BTreeSet<_> = s
+                            .iter()
+                            .filter(|s| s.width == k)
+                            .map(|s| s.design_class)
+                            .collect();
+                        assert_eq!(classes, (0..16).collect());
+                        for bit in 0..4 {
+                            assert_eq!(
+                                s.iter()
+                                    .filter(|s| s.width == k && s.factors()[bit])
+                                    .count(),
+                                8
+                            );
+                        }
+                    }
+                    for count in [1, 32, 128, 111, 113] {
+                        assert!(d_schedule(count).is_err());
+                    }
+                    for mode in 0..8 {
+                        let mut bad = s.clone();
+                        match mode {
+                            0 => bad[0].a_ordered_expert_ids[0] = bad[0].b_ordered_expert_ids[0],
+                            1 => bad[0].design_class ^= 1,
+                            2 => bad[0].execution_sequence.swap(0, 1),
+                            3 => bad[0].serial_source_set = SourceRole::B,
+                            4 => bad[0].concurrent_order_reversed = true,
+                            5 => bad[0].width = 9,
+                            6 => bad[0].set_index = 1,
+                            _ => bad.swap(0, 1),
+                        }
+                        assert!(plan(&bad).is_err(), "{mode}");
+                    }
+                }
+                fn varying(mut f: impl FnMut(&DSet) -> i64) -> Vec<DSample> {
+                    d_schedule(112)
+                        .unwrap()
+                        .into_iter()
+                        .map(|s| {
+                            let d = f(&s);
+                            DSample::new(s, 10000, 10000, 10000, (10000 + d) as u64).unwrap()
+                        })
+                        .collect()
+                }
+                fn interpretation(v: &[DSample]) -> &'static str {
+                    interaction_interpretation(&d_statistics(v).unwrap()).unwrap()
+                }
+                #[test]
+                fn source_to_upload_copy_elision_d_exact_thresholds_and_descriptive_classes() {
+                    for (delta, expected) in [
+                        (500, "STRONG_POSITIVE_INTERACTION"),
+                        (499, "MATERIAL_POSITIVE_INTERACTION"),
+                        (300, "MATERIAL_POSITIVE_INTERACTION"),
+                        (299, "AMBIGUOUS"),
+                        (101, "AMBIGUOUS"),
+                        (0, "EVIDENCE_AGAINST_MATERIAL_INTERACTION"),
+                        (-299, "AMBIGUOUS"),
+                        (-300, "NEGATIVE_MATERIAL_INTERACTION"),
+                    ] {
+                        assert_eq!(interpretation(&varying(|_| delta)), expected, "{delta}");
+                    }
+                    // One class reverses, but every frozen interpretation stratum
+                    // stays positive: individual classes must remain descriptive.
+                    let v = varying(|s| if s.design_class == 0 { -100 } else { 1000 });
+                    assert_eq!(interpretation(&v), "STRONG_POSITIVE_INTERACTION");
+                    let huge = 1_000_000_000_000_000_000u64;
+                    let v: Vec<_> = d_schedule(112)
+                        .unwrap()
+                        .into_iter()
+                        .map(|s| {
+                            DSample::new(s, huge, huge, huge, huge + huge / 100 * 3 - 1).unwrap()
+                        })
+                        .collect();
+                    // Aggregate u64 totals intentionally fail closed on overflow.
+                    assert!(d_statistics(&v).is_err());
+                    let base = 100_000_000_000_000_000u64;
+                    let v: Vec<_> = d_schedule(112)
+                        .unwrap()
+                        .into_iter()
+                        .map(|s| {
+                            DSample::new(s, base, base, base, base + base / 100 * 3 - 1).unwrap()
+                        })
+                        .collect();
+                    assert_eq!(interpretation(&v), "AMBIGUOUS");
+                }
+
+                #[test]
+                fn source_to_upload_copy_elision_d_against_exact_bounds_and_width_count() {
+                    for sign in [-1, 1] {
+                        // Four widths support the majority, all marginal and
+                        // temporal signs agree, and both exact ratio bounds are inclusive.
+                        assert_eq!(
+                            interpretation(&varying(
+                                |s| sign * if s.width <= 5 { 100 } else { -100 }
+                            )),
+                            "EVIDENCE_AGAINST_MATERIAL_INTERACTION"
+                        );
+                        assert_eq!(
+                            interpretation(&varying(
+                                |s| sign * if s.width <= 5 { 101 } else { -101 }
+                            )),
+                            "AMBIGUOUS"
+                        );
+                    }
+                    let endpoint = |extra: i64| {
+                        varying(|s| {
+                            if s.set_index == 0 {
+                                9700 + extra
+                            } else if s.width <= 5 {
+                                100
+                            } else {
+                                -100
+                            }
+                        })
+                    };
+                    let v = endpoint(0);
+                    let stats = d_statistics(&v).unwrap();
+                    assert_eq!(
+                        stats
+                            .primary_k2_through_k8
+                            .exact
+                            .totals
+                            .interaction_delta_ns
+                            * 100,
+                        i128::from(stats.primary_k2_through_k8.exact.totals.hc_ns)
+                    );
+                    assert_eq!(interpretation(&v), "EVIDENCE_AGAINST_MATERIAL_INTERACTION");
+                    assert_eq!(interpretation(&endpoint(1)), "AMBIGUOUS");
+                    // Five positive widths exclude AGAINST even at tiny aggregate.
+                    assert_eq!(
+                        interpretation(&varying(|s| if s.width <= 6 { 1 } else { -1 })),
+                        "AMBIGUOUS"
+                    );
+                    let mut v = varying(|_| 0);
+                    v.pop();
+                    assert_eq!(interpretation(&v), "INCONCLUSIVE");
+                }
+                #[test]
+                fn source_to_upload_copy_elision_d_all_marginal_and_temporal_reversals_gate() {
+                    for bit in 0..4 {
+                        for level in [false, true] {
+                            for sign in [-1, 1] {
+                                // Reversed stratum has 29 small positive and 27 negative
+                                // samples: majority/median stay positive while its sum reverses.
+                                let mut seen = 0;
+                                let v = varying(|s| {
+                                    if s.factors()[bit] == level {
+                                        seen += 1;
+                                        if seen <= 29 {
+                                            sign * 100
+                                        } else {
+                                            -sign * 200
+                                        }
+                                    } else {
+                                        sign * 2000
+                                    }
+                                });
+                                assert_eq!(
+                                    interpretation(&v),
+                                    "AMBIGUOUS",
+                                    "bit={bit} level={level} sign={sign}"
+                                );
+                            }
+                        }
+                    }
+                    for q in 0..4 {
+                        for sign in [-1, 1] {
+                            let v = varying(|s| {
+                                if s.set_index / 28 == q {
+                                    -sign * 100
+                                } else {
+                                    sign * 1000
+                                }
+                            });
+                            assert_eq!(interpretation(&v), "AMBIGUOUS", "quartile {q} sign {sign}");
+                        }
+                    }
+                    // Only four widths support a large aggregate.
+                    assert_eq!(
+                        interpretation(&varying(|s| if s.width <= 5 { 2000 } else { -100 })),
+                        "AMBIGUOUS"
+                    );
+                    // Aggregate positive, median and majority negative.
+                    assert_eq!(
+                        interpretation(&varying(|s| if s.set_index < 55 { 2000 } else { -100 })),
+                        "AMBIGUOUS"
+                    );
+                    // Exactly 56 positives is not a majority.
+                    assert_eq!(
+                        interpretation(&varying(|s| if s.set_index < 56 { 2000 } else { -100 })),
+                        "AMBIGUOUS"
+                    );
+                }
+                #[test]
+                fn source_to_upload_copy_elision_d_exact_partitions_arithmetic_and_json() {
+                    let v = varying(|s| (s.set_index as i64 - 30) * 10);
+                    let stats = d_statistics(&v).unwrap();
+                    assert_eq!(
+                        stats
+                            .primary_k2_through_k8
+                            .exact
+                            .totals
+                            .interaction_delta_ns,
+                        v.iter().map(|s| s.interaction_delta_ns).sum::<i128>()
+                    );
+                    assert!(stats.exact_matches(&d_statistics(&v).unwrap()));
+                    for p in [
+                        &stats.per_width,
+                        &stats.temporal_quartiles,
+                        &stats.descriptive_design_classes,
+                    ]
+                    .into_iter()
+                    .chain(stats.binary_marginal_factors.values())
+                    {
+                        reconcile_partitions(
+                            p.values().map(|s| &s.exact),
+                            &stats.primary_k2_through_k8.exact,
+                        )
+                        .unwrap();
+                    }
+                    let mut bad = v.clone();
+                    bad[0].interaction_delta_ns += 1;
+                    assert!(d_statistics(&bad).is_err());
+                    let mut bad = v.clone();
+                    bad[0].mc_times_hs += 1;
+                    assert!(d_statistics(&bad).is_err());
+                    let mut bad = v.clone();
+                    bad[0].source_set.set_index = 1;
+                    assert!(d_statistics(&bad).is_err());
+                    assert!(signed_add(i128::MAX, 1).is_err());
+                    assert!(signed_sub(i128::MIN, 1).is_err());
+                    assert!(product(u128::MAX, 2).is_err());
+                    let large = DSample::new(
+                        v[0].source_set.clone(),
+                        u64::MAX,
+                        u64::MAX,
+                        u64::MAX,
+                        u64::MAX,
+                    )
+                    .unwrap();
+                    let json = serde_json::to_string(&large).unwrap();
+                    assert!(json.contains(&large.mc_times_hs.to_string()));
+                    assert!(exact_stats(&[large.clone(), large]).is_err());
+                    let s = DSample::new(v[0].source_set.clone(), 100, 105, 200, 212).unwrap();
+                    assert_eq!(
+                        (
+                            s.serial_destination_delta_ns,
+                            s.concurrent_destination_delta_ns,
+                            s.interaction_delta_ns,
+                            s.mc_times_hs,
+                            s.hc_times_ms,
+                            s.multiplicative_interaction_direction
+                        ),
+                        (5, 12, 7, 21200, 21000, 1)
+                    );
+                    let mut stats = d_statistics(&v).unwrap();
+                    stats
+                        .primary_k2_through_k8
+                        .descriptive
+                        .interaction_percent_of_hc = Some(f64::NAN);
+                    assert!(stats.exact_matches(&d_statistics(&v).unwrap()));
+                }
+                #[test]
+                fn source_to_upload_copy_elision_d_correctness_independent_and_fail_closed() {
+                    for times in [[1000, 1000, 1000, 1200], [1000; 4], [1000, 1000, 1000, 800]] {
+                        let mut r = fixture(times);
+                        r.classify().unwrap();
+                        assert!(r.correctness_pass && r.authoritative);
+                        assert_eq!(r.performance_authority, "PENDING_EXTERNAL_RETRY_LOG_AUDIT");
+                    }
+                    for mode in 0..27 {
+                        let mut r = fixture([1000; 4]);
+                        match mode {
+                            0 => r.authority.fd_cache_capacity = 255,
+                            1 => r.authority.preproof.source_upload_fd_proof_requests = 255,
+                            2 => r.authority.preproof.source_upload_fd_proof_hits = 1,
+                            3 => r.authority.preproof.source_upload_fd_proof_misses = 255,
+                            4 => r.authority.preproof.source_upload_fd_proof_failures = 1,
+                            5 => r.measured.fd_proof.source_upload_fd_proof_misses = 1,
+                            6 => r.measured.fd_proof.source_upload_fd_proof_failures = 1,
+                            7 => r.measured.fd_proof.source_upload_fd_proof_hits -= 1,
+                            8 => r.measured.fd_proof.source_upload_fd_proof_requests += 1,
+                            9 => {
+                                r.measured
+                                    .cells
+                                    .get_mut(&Cell::MS)
+                                    .unwrap()
+                                    .serial_helper_calls += 1
+                            }
+                            10 => r.measured.cells.get_mut(&Cell::MC).unwrap().evidence.unmaps += 1,
+                            11 => {
+                                r.measured
+                                    .cells
+                                    .get_mut(&Cell::HS)
+                                    .unwrap()
+                                    .evidence
+                                    .map_attempts = 1
+                            }
+                            12 => {
+                                r.measured
+                                    .cells
+                                    .get_mut(&Cell::MC)
+                                    .unwrap()
+                                    .evidence
+                                    .mapped_direct_io_rejections = 1
+                            }
+                            13 => {
+                                r.measured
+                                    .cells
+                                    .get_mut(&Cell::HC)
+                                    .unwrap()
+                                    .evidence
+                                    .full_source_bytes -= 1
+                            }
+                            14 => {
+                                r.measured
+                                    .cells
+                                    .get_mut(&Cell::HS)
+                                    .unwrap()
+                                    .evidence
+                                    .exact_read_length_failures = 1
+                            }
+                            15 => r
+                                .measured
+                                .cells
+                                .get_mut(&Cell::MS)
+                                .unwrap()
+                                .completed_source_sets[0]
+                                .ordered_expert_ids
+                                .reverse(),
+                            16 => r.measured.execution_trace.swap(0, 1),
+                            17 => {
+                                r.measured.raw_verification[0]
+                                    .cells
+                                    .get_mut(&Cell::MS)
+                                    .unwrap()[0]
+                                    .source = sha(b"bad")
+                            }
+                            18 => {
+                                r.measured.raw_verification[0]
+                                    .cells
+                                    .get_mut(&Cell::MC)
+                                    .unwrap()[0]
+                                    .gpu = sha(b"bad")
+                            }
+                            19 => {
+                                r.measured.raw_verification[0]
+                                    .cells
+                                    .get_mut(&Cell::HC)
+                                    .unwrap()[0]
+                                    .epoch = false
+                            }
+                            20 => {
+                                r.measured
+                                    .witnesses
+                                    .get_mut(&Cell::MS)
+                                    .unwrap()
+                                    .full_source_sha256 = sha(b"bad")
+                            }
+                            21 => r.measured.raw_samples[0].interaction_delta_ns += 1,
+                            22 => {
+                                r.measured
+                                    .statistics
+                                    .binary_marginal_factors
+                                    .get_mut(FACTORS[0])
+                                    .unwrap()
+                                    .get_mut(&0)
+                                    .unwrap()
+                                    .exact
+                                    .totals
+                                    .hs_ns += 1
+                            }
+                            23 => {
+                                r.measured
+                                    .statistics
+                                    .temporal_quartiles
+                                    .get_mut(&0)
+                                    .unwrap()
+                                    .exact
+                                    .totals
+                                    .samples += 1
+                            }
+                            24 => {
+                                r.measured
+                                    .statistics
+                                    .descriptive_design_classes
+                                    .get_mut(&0)
+                                    .unwrap()
+                                    .exact
+                                    .totals
+                                    .hs_ns += 1
+                            }
+                            25 => {
+                                r.measured
+                                    .cells
+                                    .get_mut(&Cell::MC)
+                                    .unwrap()
+                                    .evidence
+                                    .fallback_reads = 1
+                            }
+                            _ => r.measured.raw_samples[0]
+                                .source_set
+                                .a_ordered_expert_ids
+                                .reverse(),
+                        }
+                        r.classify().unwrap();
+                        assert!(!r.correctness_pass && !r.authoritative, "mutation {mode}");
+                        assert_eq!(
+                            r.interaction_interpretation_conditional_on_zero_retry_log,
+                            "AMBIGUOUS"
+                        );
+                    }
+                }
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                async fn source_to_upload_copy_elision_d_exclusive_output_and_invalid_args_without_gpu(
+                ) {
+                    let dir = std::env::temp_dir().join(format!(
+                        "mer-hma1cd-{}-{}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos()
+                    ));
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let mut a = args();
+                    a.config = dir.join("missing.toml");
+                    a.report_out = dir.join("out.json");
+                    assert!(run_command(a.clone()).await.is_err());
+                    let bytes = std::fs::read(&a.report_out).unwrap();
+                    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(json["schema"], D_SCHEMA);
+                    assert_eq!(json["classification"], "config-failed");
+                    assert_eq!(json["measured"]["expected"]["block_count"], 112);
+                    assert!(run_command(a.clone()).await.is_err());
+                    assert_eq!(std::fs::read(&a.report_out).unwrap(), bytes);
+                    a.iterations = 112;
+                    a.report_out = dir.join("invalid.json");
+                    assert!(run_command(a.clone()).await.is_err());
+                    let json: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&a.report_out).unwrap()).unwrap();
+                    assert_eq!(json["classification"], "invalid-arguments");
+                    std::fs::remove_dir_all(dir).unwrap();
+                }
             }
         }
     }

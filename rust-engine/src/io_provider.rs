@@ -4331,3 +4331,128 @@ mod source_to_upload_tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 }
+
+// Diagnostic-only full-schedule fixture. The only injected operation is fd
+// validation: this exercises actual helpers, but supplies no O_DIRECT/GPU proof.
+#[cfg(test)]
+mod hma1c_d_portable_tests {
+    use super::*;
+    use crate::aligned_buffer::AlignedBuffer;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::FileExt;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_to_upload_copy_elision_d_256_proofs_split_pairs_real_helpers() {
+        let path = std::env::temp_dir().join(format!(
+            "mer-hma1cd-io-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let full = 2_658_304;
+        let storage = NvmeStorage::new(StorageConfig {
+            base_path: path.clone(),
+            expert_size: full,
+            block_align: 4096,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        })
+        .unwrap()
+        .with_max_open_files(256);
+        let universe: Vec<u32> = (0..256).map(|i| i * 6143 / 255).collect();
+        let mut identities = Vec::new();
+        for &id in &universe {
+            let f = File::create(path.join(format!("expert_{id}.bin"))).unwrap();
+            f.set_len(full as u64).unwrap();
+            f.write_at(&id.to_le_bytes(), 0).unwrap();
+            f.write_at(&id.to_le_bytes(), (full - 4) as u64).unwrap();
+            let fd = storage.fd_for(id).unwrap();
+            storage
+                .prove_source_upload_fd_with(id, &fd, |f| {
+                    validate_source_upload_fd(full as u64, || Ok(true), || Ok(f.metadata()?.len()))
+                })
+                .unwrap();
+            identities.push(fd);
+        }
+        let counts = |requests, hits, misses| SourceUploadFdProofSnapshot {
+            source_upload_fd_proof_requests: requests,
+            source_upload_fd_proof_hits: hits,
+            source_upload_fd_proof_misses: misses,
+            ..SourceUploadFdProofSnapshot::default()
+        };
+        assert_eq!(
+            storage.source_upload_fd_proof_snapshot(),
+            counts(256, 0, 256)
+        );
+        let mut arena = AlignedBuffer::new(full * 8, 4096);
+        let mut expected = vec![0; full];
+        // Independent implementation of the frozen formulas; no D generator reuse.
+        for (rounds, requests, sets) in [(16..20, 560, 28), (0..16, 2240, 112)] {
+            storage.reset_source_upload_fd_proof_telemetry();
+            assert_eq!(storage.source_upload_fd_proof_snapshot(), counts(0, 0, 0));
+            let mut helper_calls = [0; 4];
+            for round in rounds {
+                for width in 2..=8 {
+                    let block = round * 7 + width - 2;
+                    let class = (round + 5 * (width - 2)) % 16;
+                    let a: Vec<_> = (0..width)
+                        .map(|j| universe[(block * 17 + j * 13) % 256])
+                        .collect();
+                    let b: Vec<_> = (0..width)
+                        .map(|j| universe[(block * 17 + 128 + j * 13) % 256])
+                        .collect();
+                    assert!(a.iter().all(|id| !b.contains(id)));
+                    let serial = if class & 1 == 0 { [0, 2] } else { [2, 0] };
+                    let concurrent = if class & 2 == 0 { [1, 3] } else { [3, 1] };
+                    let pairs = if class & 4 == 0 {
+                        [serial, concurrent]
+                    } else {
+                        [concurrent, serial]
+                    };
+                    let mut hashes: [Vec<[u8; 32]>; 4] = std::array::from_fn(|_| Vec::new());
+                    for cell in pairs.into_iter().flatten() {
+                        let is_serial = cell == 0 || cell == 2;
+                        let use_a = is_serial == (class & 8 == 0);
+                        let ids = if use_a { &a } else { &b };
+                        let mut dst: Vec<_> = arena.as_mut_slice()[..width * full]
+                            .chunks_exact_mut(full)
+                            .collect();
+                        helper_calls[cell] += 1;
+                        let n = if is_serial {
+                            storage
+                                .read_experts_serial_into_aligned_slices(ids, &mut dst)
+                                .await
+                        } else {
+                            storage
+                                .read_experts_batch_into_aligned_slices(ids, &mut dst)
+                                .await
+                        }
+                        .unwrap();
+                        assert_eq!(n, width * full);
+                        for (&id, bytes) in ids.iter().zip(dst) {
+                            expected[..4].copy_from_slice(&id.to_le_bytes());
+                            expected[full - 4..].copy_from_slice(&id.to_le_bytes());
+                            assert_eq!(bytes, expected.as_slice());
+                            hashes[cell].push(Sha256::digest(bytes).into());
+                        }
+                    }
+                    assert_eq!(hashes[0], hashes[2]);
+                    assert_eq!(hashes[1], hashes[3]);
+                    assert_ne!(hashes[0], hashes[1]);
+                }
+            }
+            assert_eq!(helper_calls, [sets; 4]);
+            assert_eq!(
+                storage.source_upload_fd_proof_snapshot(),
+                counts(requests, requests, 0)
+            );
+            for (&id, original) in universe.iter().zip(&identities) {
+                assert!(Arc::ptr_eq(original, &storage.fd_for(id).unwrap()));
+            }
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
